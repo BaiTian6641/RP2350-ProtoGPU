@@ -6,7 +6,11 @@
  * SceneState and writes directly to an RGB565 framebuffer with Z-buffer.
  *
  * Core 0 calls PrepareFrame() (single-threaded: transform + project + QuadTree),
- * then both cores call RasterizeRange() on non-overlapping Y bands.
+ * then both cores call RasterizeTile() on non-overlapping 16×16 tiles pulled
+ * from a shared atomic work queue (PglTileScheduler).
+ *
+ * RasterizeRange() is kept for backward compatibility and decomposes internally
+ * into full-width scanline iteration (no tile scheduling).
  */
 
 #pragma once
@@ -26,11 +30,31 @@ public:
     /// insert projected triangles into the QuadTree.
     void PrepareFrame(SceneState* scene);
 
-    /// Phase 2 (parallel, both cores):
+    /// Phase 2a — legacy (parallel, both cores):
     /// Rasterize all triangles that intersect the Y range [yStart, yEnd).
     /// Each core writes its own non-overlapping band of `framebuffer`.
     void RasterizeRange(uint16_t* framebuffer,
                         uint16_t yStart, uint16_t yEnd);
+
+    /// Phase 2b — tile-based (parallel, both cores):
+    /// Rasterize a single 16×16 tile.  The tile is identified by (tileX, tileY)
+    /// in tile-grid coordinates (0-based).  The framebuffer and Z-buffer are
+    /// full-panel-sized; the method only writes the tile's sub-region.
+    ///
+    /// Advantages over RasterizeRange:
+    ///   - QuadTree query per tile (16×16 AABB) instead of per pixel column
+    ///   - FB+Z data for tile fits in L1/TCM (512 + 1024 = 1.5 KB)
+    ///   - Amortises traversal cost across 256 pixels
+    ///
+    /// @param framebuffer  Full-panel framebuffer (128×64 RGB565)
+    /// @param zBuf         Full-panel Z-buffer (128×64 float)
+    /// @param tileX        Tile column index (0..PANEL_WIDTH/TILE_W - 1)
+    /// @param tileY        Tile row index (0..PANEL_HEIGHT/TILE_H - 1)
+    /// @param tileW        Tile width in pixels (typically 16)
+    /// @param tileH        Tile height in pixels (typically 16)
+    void RasterizeTile(uint16_t* framebuffer, float* zBuf,
+                       uint16_t tileX, uint16_t tileY,
+                       uint16_t tileW, uint16_t tileH);
 
     /// Total projected triangles this frame (diagnostic).
     uint32_t GetTriangleCount() const { return projectedTriCount; }
@@ -40,7 +64,7 @@ public:
     bool IsFrameSkipped() const { return frameSkipped; }
 
     /// Set the accumulated wall time (seconds) for animated materials.
-    /// Call BEFORE RasterizeRange on each frame.
+    /// Call BEFORE RasterizeRange/RasterizeTile on each frame.
     void SetElapsedTime(float t) { elapsedTimeS = t; }
 
 private:

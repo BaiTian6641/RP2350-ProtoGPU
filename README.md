@@ -91,8 +91,8 @@ Core 0                          Core 1
 │       ↓          │            │                  │
 │ QuadTree Rebuild │            │                  │
 │       ↓          │            │       ↓          │
-│ Raster top half  │──FIFO──→  │ Raster bot half  │
-│       ↓          │            │       ↓          │
+│ Tile Raster      │──FIFO──→  │ Tile Raster      │
+│ (work-stealing)  │            │ (work-stealing)  │
 │   ← barrier ←   │←──FIFO──── │   → barrier →    │
 │       ↓          │            │                  │
 │ Framebuf swap    │            │                  │
@@ -142,10 +142,11 @@ only for expanding texture, material, and mesh capacity without degrading render
 │  ├── Material parameter banks                                               │
 │  └── DMA-prefetched into SRAM cache before rasterization                   │
 │                                                                             │
-│  Tier 2 ─ QSPI PSRAM via QMI CS1 (4–16 MB, ~75 MB/s, XIP cached)         │
+│  Tier 2 ─ QSPI MRAM via QMI CS1 (MR10Q010, 128 KB, ~52 MB/s, XIP)      │
 │  ├── Lookup tables (gamma, CIE, noise permutation)                         │
 │  ├── Font atlases                                                           │
-│  ├── Animation keyframe data                                                │
+│  ├── Material parameter banks, small textures                              │
+│  ┬── Animation keyframe data                                                │
 │  └── Read via normal pointers — QMI HW cache (4 KB) handles caching       │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -216,10 +217,10 @@ Parse commands → Scan draw list → DMA prefetch OPI → QuadTree rebuild → 
 | OPI PSRAM CS# | GPIO 11 | Output | Active low |
 | OPI PSRAM CLK | GPIO 12 | Output | Up to 150 MHz |
 | OPI PSRAM DQ0–DQ7 | GPIO 34–41 | Bidir | QFN-80 package required |
-| QSPI PSRAM | QMI CS1 pins | — | Built into RP2350 QFN-60/80 |
+| QSPI MRAM | QMI CS1 pins | — | MR10Q010 (128 KB, dual-supply 3.3V/1.8V) |
 
 > **Note:** GPIO 34+ requires the RP2350 QFN-80 package. The QFN-60 (Pico 2 default)
-> only exposes GPIO 0–29 + QSPI pins. For QFN-60, use QSPI PSRAM only (no OPI PIO2).
+> only exposes GPIO 0–29 + QSPI pins. For QFN-60, use QSPI MRAM only (no OPI PIO2).
 
 ### Graceful Degradation
 
@@ -229,16 +230,16 @@ and adjusts limits accordingly:
 | Configuration | Total Resources | Notes |
 |---|---|---|
 | SRAM only (default) | 256 meshes, 64 textures | Current Phase 1 target |
-| SRAM + QSPI 8 MB | + large lookup tables, fonts | Pico 2 Plus (stock 8 MB PSRAM on CS1) |
+| SRAM + QSPI MRAM 128 KB | + LUTs, fonts, material params, small textures | Custom board with MR10Q010 on CS1 |
 | SRAM + OPI 8 MB | + large textures, cold meshes | Custom board with PIO2 PSRAM |
-| SRAM + QSPI + OPI | Full expanded mode | Maximum capacity custom board |
+| SRAM + QSPI MRAM + OPI | Full expanded mode | Maximum capacity custom board |
 
 ### Host Memory Access
 
 The host can directly read/write GPU device memory across all tiers via **7 SPI commands**
 (0x30–0x3F) and **4 I2C registers** (0x0C–0x0F). This enables:
 
-- Bulk texture/data upload to PSRAM (bypassing the resource command path)
+- Bulk texture/data upload to MRAM/OPI (bypassing the resource command path)
 - Framebuffer capture for screenshots (via I2C readback, ~0.33 s for 16 KB at 400 kHz)
 - Runtime memory pressure monitoring (per-tier capacity/usage/cache hit rate)
 - Explicit resource tier placement and pinning

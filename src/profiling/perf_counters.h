@@ -44,8 +44,8 @@ enum class PerfStage : uint8_t {
     SpiReceive    = 0,  // Ring buffer drain → frame extraction
     Parse         = 1,  // Command parser
     Transform     = 2,  // PrepareFrame: vertex transform + project + QuadTree build
-    RasterTop     = 3,  // Core 0 RasterizeRange (top half)
-    RasterBottom  = 4,  // Core 1 RasterizeRange (bottom half)
+    RasterTop     = 3,  // Tile rasterisation (both cores, work-stealing)
+    RasterBottom  = 4,  // (reserved — was Core 1 Y-band, now unused)
     Shaders       = 5,  // Screen-space post-processing
     Swap          = 6,  // Framebuffer swap + I2C status update
     FrameTotal    = 7,  // Full frame (SPI receive → swap)
@@ -56,8 +56,8 @@ static constexpr const char* PerfStageNames[] = {
     "SPI Recv",
     "Parse",
     "Transform",
-    "Raster Top",
-    "Raster Bot",
+    "Raster Tiles",
+    "(reserved)",
     "Shaders",
     "Swap",
     "Frame Total"

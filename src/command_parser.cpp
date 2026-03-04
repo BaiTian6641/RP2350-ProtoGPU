@@ -9,15 +9,62 @@
 #include "command_parser.h"
 #include "scene_state.h"
 #include "gpu_config.h"
+#include "memory/mem_opi_psram.h"
+#include "memory/mem_qspi_psram.h"
+#include "memory/mem_tier.h"
 
 // Shared ProtoGL headers (from lib/ProtoGL/src/)
 #include <PglTypes.h>
 #include <PglOpcodes.h>
 #include <PglParser.h>
 #include <PglCRC16.h>
+#include <PglShaderBytecode.h>
 
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
+
+// ─── Memory Subsystem State (set via InitMemory) ────────────────────────────
+
+static OpiPsramDriver*  s_opi   = nullptr;
+static QspiPsramDriver* s_qspi  = nullptr;
+static MemTierManager*  s_tier  = nullptr;
+
+static const uint16_t*  s_frontBuffer = nullptr;
+static const uint16_t*  s_backBuffer  = nullptr;
+static uint32_t         s_fbPixels    = 0;
+
+/// Simple handle-based allocation table for CMD_MEM_ALLOC / CMD_MEM_FREE.
+struct MemAllocEntry {
+    bool         active;
+    uint8_t      tier;
+    uint32_t     address;
+    uint32_t     size;
+    uint16_t     tag;
+};
+static MemAllocEntry s_allocTable[PGL_MAX_MEM_ALLOCATIONS];
+static uint16_t      s_nextHandle = 0;
+
+void CommandParser::InitMemory(OpiPsramDriver* opi, QspiPsramDriver* qspi,
+                                MemTierManager* tier,
+                                const uint16_t* frontBuf,
+                                const uint16_t* backBuf,
+                                uint32_t fbPixels) {
+    s_opi   = opi;
+    s_qspi  = qspi;
+    s_tier  = tier;
+    s_frontBuffer = frontBuf;
+    s_backBuffer  = backBuf;
+    s_fbPixels    = fbPixels;
+    s_nextHandle  = 0;
+    std::memset(s_allocTable, 0, sizeof(s_allocTable));
+}
+
+void CommandParser::UpdateFramebufferPtrs(const uint16_t* frontBuf,
+                                          const uint16_t* backBuf) {
+    s_frontBuffer = frontBuf;
+    s_backBuffer  = backBuf;
+}
 
 // ─── Opcode Handlers (forward declarations) ─────────────────────────────────
 
@@ -45,6 +92,12 @@ static void HandleMemAlloc(const uint8_t*& ptr, SceneState* scene);
 static void HandleMemFree(const uint8_t*& ptr, SceneState* scene);
 static void HandleFramebufferCapture(const uint8_t*& ptr, SceneState* scene);
 static void HandleMemCopy(const uint8_t*& ptr, SceneState* scene);
+
+// Programmable shader handlers (0x84 – 0x87)
+static void HandleCreateShaderProgram(const uint8_t*& ptr, uint16_t payloadLen, SceneState* scene);
+static void HandleDestroyShaderProgram(const uint8_t*& ptr, SceneState* scene);
+static void HandleBindShaderProgram(const uint8_t*& ptr, SceneState* scene);
+static void HandleSetShaderUniform(const uint8_t*& ptr, uint16_t payloadLen, SceneState* scene);
 
 // ─── Main Parser ────────────────────────────────────────────────────────────
 
@@ -157,6 +210,20 @@ CommandParser::ParseResult CommandParser::Parse(
                 break;
             case PGL_CMD_MEM_COPY:
                 HandleMemCopy(ptr, scene);
+                break;
+
+            // Programmable shader commands (0x84 – 0x87)
+            case PGL_CMD_CREATE_SHADER_PROGRAM:
+                HandleCreateShaderProgram(ptr, cmdHdr.payloadLength, scene);
+                break;
+            case PGL_CMD_DESTROY_SHADER_PROGRAM:
+                HandleDestroyShaderProgram(ptr, scene);
+                break;
+            case PGL_CMD_BIND_SHADER_PROGRAM:
+                HandleBindShaderProgram(ptr, scene);
+                break;
+            case PGL_CMD_SET_SHADER_UNIFORM:
+                HandleSetShaderUniform(ptr, cmdHdr.payloadLength, scene);
                 break;
 
             default:
@@ -558,57 +625,357 @@ static void HandleSetShader(const uint8_t*& ptr, SceneState* scene) {
     std::memcpy(slot.params, cmd.params, sizeof(slot.params));
 }
 
+// ─── Programmable Shader Handlers (0x84 – 0x87) ────────────────────────────
+
+static void HandleCreateShaderProgram(const uint8_t*& ptr, uint16_t payloadLen,
+                                       SceneState* scene) {
+    PglCmdCreateShaderProgramHeader cmd;
+    PglReadStruct(ptr, cmd);
+
+    if (cmd.programId >= PGL_MAX_SHADER_PROGRAMS) {
+        // Skip the bytecode blob
+        ptr += cmd.bytecodeSize;
+        return;
+    }
+
+    // Validate bytecode blob size
+    if (cmd.bytecodeSize < sizeof(PglShaderProgramHeader)) {
+        ptr += cmd.bytecodeSize;
+        return;
+    }
+
+    // Read PSB header from the bytecode blob
+    const uint8_t* blobStart = ptr;
+    PglShaderProgramHeader psbHdr;
+    std::memcpy(&psbHdr, ptr, sizeof(psbHdr));
+    ptr += sizeof(psbHdr);
+
+    // Validate magic and version
+    if (psbHdr.magic != PSB_MAGIC || psbHdr.version != PSB_VERSION) {
+        ptr = blobStart + cmd.bytecodeSize;
+        return;
+    }
+
+    // Validate counts
+    if (psbHdr.uniformCount > PSB_MAX_UNIFORMS ||
+        psbHdr.constCount > PSB_MAX_CONSTANTS ||
+        psbHdr.instrCount > PSB_MAX_INSTRUCTIONS) {
+        ptr = blobStart + cmd.bytecodeSize;
+        return;
+    }
+
+    ShaderProgram& prog = scene->shaderPrograms[cmd.programId];
+    std::memset(&prog, 0, sizeof(prog));
+    prog.active       = true;
+    prog.programId    = cmd.programId;
+    prog.uniformCount = psbHdr.uniformCount;
+    prog.constCount   = psbHdr.constCount;
+    prog.instrCount   = psbHdr.instrCount;
+    prog.flags        = psbHdr.flags;
+
+    // Read uniform descriptor table
+    for (uint8_t i = 0; i < psbHdr.uniformCount; ++i) {
+        PglUniformDescriptor desc;
+        std::memcpy(&desc, ptr, sizeof(desc));
+        ptr += sizeof(desc);
+        prog.uniformNameHashes[desc.slot] = desc.nameHash;
+        prog.uniformTypes[desc.slot]      = desc.type;
+    }
+
+    // Read constants pool
+    if (psbHdr.constCount > 0) {
+        std::memcpy(prog.constants, ptr, psbHdr.constCount * sizeof(float));
+        ptr += psbHdr.constCount * sizeof(float);
+    }
+
+    // Read instructions
+    if (psbHdr.instrCount > 0) {
+        std::memcpy(prog.instructions, ptr, psbHdr.instrCount * sizeof(uint32_t));
+        ptr += psbHdr.instrCount * sizeof(uint32_t);
+    }
+
+    printf("[Parser] Created shader program %u: %u uniforms, %u consts, %u instrs\n",
+           cmd.programId, psbHdr.uniformCount, psbHdr.constCount, psbHdr.instrCount);
+}
+
+static void HandleDestroyShaderProgram(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdDestroyShaderProgram cmd;
+    PglReadStruct(ptr, cmd);
+
+    if (cmd.programId >= PGL_MAX_SHADER_PROGRAMS) return;
+
+    ShaderProgram& prog = scene->shaderPrograms[cmd.programId];
+    std::memset(&prog, 0, sizeof(prog));
+
+    printf("[Parser] Destroyed shader program %u\n", cmd.programId);
+}
+
+static void HandleBindShaderProgram(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdBindShaderProgram cmd;
+    PglReadStruct(ptr, cmd);
+
+    if (cmd.cameraId >= PGL_MAX_CAMERAS) return;
+    CameraSlot& cam = scene->cameras[cmd.cameraId];
+    if (!cam.active) return;
+    if (cmd.shaderSlot >= PGL_MAX_SHADERS_PER_CAMERA) return;
+
+    ShaderSlot& slot = cam.shaders[cmd.shaderSlot];
+    if (cmd.programId == 0xFFFF) {
+        // Unbind — clear the slot
+        slot.active      = false;
+        slot.shaderClass = PGL_SHADER_NONE;
+        slot.intensity   = 0.0f;
+        slot.programId   = 0;
+    } else {
+        slot.active      = true;
+        slot.shaderClass = PGL_SHADER_PROGRAM;
+        slot.intensity   = cmd.intensity;
+        slot.programId   = cmd.programId;
+    }
+}
+
+static void HandleSetShaderUniform(const uint8_t*& ptr, uint16_t payloadLen,
+                                    SceneState* scene) {
+    PglCmdSetShaderUniformHeader cmd;
+    PglReadStruct(ptr, cmd);
+
+    if (cmd.programId >= PGL_MAX_SHADER_PROGRAMS) {
+        // Skip value data
+        if (cmd.componentCount > 0 && cmd.componentCount <= 4) {
+            ptr += cmd.componentCount * sizeof(float);
+        }
+        return;
+    }
+
+    ShaderProgram& prog = scene->shaderPrograms[cmd.programId];
+    if (!prog.active) {
+        if (cmd.componentCount > 0 && cmd.componentCount <= 4) {
+            ptr += cmd.componentCount * sizeof(float);
+        }
+        return;
+    }
+
+    if (cmd.uniformSlot >= PSB_MAX_UNIFORMS || cmd.componentCount == 0 || cmd.componentCount > 4) {
+        if (cmd.componentCount > 0 && cmd.componentCount <= 4) {
+            ptr += cmd.componentCount * sizeof(float);
+        }
+        return;
+    }
+
+    // Read the uniform value(s) directly into the program's uniform table.
+    // Multi-component uniforms occupy consecutive slots.
+    for (uint8_t c = 0; c < cmd.componentCount; ++c) {
+        uint8_t slot = cmd.uniformSlot + c;
+        if (slot < PSB_MAX_UNIFORMS) {
+            float val;
+            std::memcpy(&val, ptr, sizeof(float));
+            prog.uniforms[slot] = val;
+        }
+        ptr += sizeof(float);
+    }
+}
+
 // ─── Memory Access Handlers (0x30 – 0x3F) ──────────────────────────────────
-// These are M8 stubs. Full implementation requires MemTierManager and the
-// OPI/QSPI PSRAM drivers. Currently they parse the wire payload, log the
-// request, and update minimal scene state or staging buffers.
+// Route memory commands to the appropriate tier driver (OPI PSRAM, QSPI, or
+// SRAM).  These were formerly M8 stubs — now fully implemented.
+
+/// Helper: read bytes from a given tier into a buffer.
+static bool TierReadInto(uint8_t tier, uint32_t address, void* dst,
+                         uint32_t size) {
+    switch (tier) {
+        case PGL_TIER_SRAM:
+            // Direct SRAM read — address is treated as a byte offset within
+            // the scene state's staging buffer (for I2C readback flows).
+            // The caller handles the actual pointer arithmetic.
+            return false;  // Handled at call site
+
+        case PGL_TIER_OPI_PSRAM:
+            if (s_opi && s_opi->IsInitialized()) {
+                return s_opi->ReadSync(address, dst, size);
+            }
+            return false;
+
+        case PGL_TIER_QSPI_PSRAM:
+            if (s_qspi && s_qspi->IsInitialized()) {
+                s_qspi->Read(address, dst, size);
+                return true;
+            }
+            return false;
+
+        default:
+            return false;
+    }
+}
+
+/// Helper: write bytes from a buffer to a given tier.
+static bool TierWriteTo(uint8_t tier, uint32_t address, const void* src,
+                        uint32_t size) {
+    switch (tier) {
+        case PGL_TIER_SRAM:
+            return false;  // Caller must handle SRAM writes directly
+
+        case PGL_TIER_OPI_PSRAM:
+            if (s_opi && s_opi->IsInitialized()) {
+                return s_opi->WriteSync(address, src, size);
+            }
+            return false;
+
+        case PGL_TIER_QSPI_PSRAM:
+            if (s_qspi && s_qspi->IsInitialized()) {
+                s_qspi->Write(address, src, size);
+                return true;
+            }
+            return false;
+
+        default:
+            return false;
+    }
+}
 
 static void HandleMemWrite(const uint8_t*& ptr, uint16_t payloadLen,
                            SceneState* scene) {
     PglCmdMemWriteHeader hdr;
     PglReadStruct(ptr, hdr);
 
-    printf("[Parser] MemWrite: tier=%u addr=0x%08lX size=%lu\n",
-           hdr.tier, (unsigned long)hdr.address, (unsigned long)hdr.size);
+    const uint8_t* dataPtr = ptr;
+    PglSkip(ptr, hdr.size);  // advance ptr past the data payload
 
-    // TODO(M8): Route to appropriate memory tier driver:
-    //   PGL_TIER_SRAM     → direct memcpy (if address within arena)
-    //   PGL_TIER_OPI_PSRAM → OpiPsramDriver::Write(addr, ptr, size)
-    //   PGL_TIER_QSPI_PSRAM → QspiPsramDriver::Write(addr, ptr, size)
-    // For now, skip the data payload.
-    PglSkip(ptr, hdr.size);
+    switch (hdr.tier) {
+        case PGL_TIER_SRAM: {
+            // SRAM write: treat address as offset into the staging buffer.
+            // This allows the host to pre-fill staging data for readback or
+            // write directly to a known SRAM region.
+            uint32_t maxBytes = SceneState::MEM_STAGING_SIZE;
+            if (hdr.address < maxBytes) {
+                uint32_t copyLen = std::min(hdr.size, maxBytes - hdr.address);
+                std::memcpy(scene->memStagingBuffer + hdr.address, dataPtr, copyLen);
+            }
+            break;
+        }
+        case PGL_TIER_OPI_PSRAM:
+            if (s_opi && s_opi->IsInitialized()) {
+                if (!s_opi->WriteSync(hdr.address, dataPtr, hdr.size)) {
+                    printf("[Parser] MemWrite: OPI WriteSync failed\n");
+                }
+            } else {
+                printf("[Parser] MemWrite: OPI tier not available\n");
+            }
+            break;
 
-    (void)scene;
+        case PGL_TIER_QSPI_PSRAM:
+            if (s_qspi && s_qspi->IsInitialized()) {
+                s_qspi->Write(hdr.address, dataPtr, hdr.size);
+            } else {
+                printf("[Parser] MemWrite: QSPI tier not available\n");
+            }
+            break;
+
+        default:
+            printf("[Parser] MemWrite: invalid tier %u\n", hdr.tier);
+            break;
+    }
 }
 
 static void HandleMemReadRequest(const uint8_t*& ptr, SceneState* scene) {
     PglCmdMemReadRequest cmd;
     PglReadStruct(ptr, cmd);
 
-    printf("[Parser] MemReadRequest: tier=%u addr=0x%08lX size=%u\n",
-           cmd.tier, (unsigned long)cmd.address, cmd.size);
+    // Clamp to staging buffer size
+    uint16_t stageLen = cmd.size;
+    if (stageLen > SceneState::MEM_STAGING_SIZE) {
+        stageLen = static_cast<uint16_t>(SceneState::MEM_STAGING_SIZE);
+    }
 
-    // TODO(M8): Stage the requested memory region into the I2C readback buffer.
-    //   1. Validate tier is enabled and address is in range.
-    //   2. Copy `size` bytes from tier memory into staging buffer.
-    //   3. Set staging buffer metadata so I2C handler can serve it via
-    //      PGL_REG_MEM_READ_DATA.
-    // Staging buffer lives in SceneState or a dedicated MemoryAccessState.
+    bool ok = false;
+    switch (cmd.tier) {
+        case PGL_TIER_SRAM:
+            // SRAM read-request: the "address" is an offset within the
+            // staging buffer itself (for round-trip verification) or a
+            // known SRAM region. For safety, copy from staging.
+            if (cmd.address + stageLen <= SceneState::MEM_STAGING_SIZE) {
+                // Data is already in the staging buffer (identity read).
+                // Just adjust the staging metadata.
+                ok = true;
+            }
+            break;
 
-    (void)scene;
+        case PGL_TIER_OPI_PSRAM:
+            if (s_opi && s_opi->IsInitialized()) {
+                ok = s_opi->ReadSync(cmd.address, scene->memStagingBuffer, stageLen);
+            }
+            break;
+
+        case PGL_TIER_QSPI_PSRAM:
+            if (s_qspi && s_qspi->IsInitialized()) {
+                s_qspi->Read(cmd.address, scene->memStagingBuffer, stageLen);
+                ok = true;
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    if (ok) {
+        scene->memStagingLength  = stageLen;
+        scene->memStagingReadPos = 0;
+    } else {
+        printf("[Parser] MemReadRequest: tier %u not available\n", cmd.tier);
+        scene->memStagingLength  = 0;
+        scene->memStagingReadPos = 0;
+    }
 }
 
 static void HandleMemSetResourceTier(const uint8_t*& ptr, SceneState* scene) {
     PglCmdSetResourceTier cmd;
     PglReadStruct(ptr, cmd);
 
-    printf("[Parser] SetResourceTier: class=%u id=%u tier=%u flags=0x%02X\n",
-           cmd.resourceClass, cmd.resourceId, cmd.preferredTier, cmd.flags);
+    if (!s_tier) {
+        printf("[Parser] SetResourceTier: tier manager not initialized\n");
+        return;
+    }
 
-    // TODO(M8): Forward to MemTierManager::SetResourceTierHint().
-    //   The tier manager records the preferred tier and pinned flag,
-    //   then may initiate an async migration if the resource is currently
-    //   in a different tier.
+    // Map PglMemResourceClass → internal ResClass
+    ResClass rc;
+    switch (cmd.resourceClass) {
+        case PGL_RES_CLASS_MESH:     rc = ResClass::VERTEX_DATA;    break;
+        case PGL_RES_CLASS_MATERIAL: rc = ResClass::MATERIAL_PARAM; break;
+        case PGL_RES_CLASS_TEXTURE:  rc = ResClass::TEXTURE;        break;
+        case PGL_RES_CLASS_LAYOUT:   rc = ResClass::LAYOUT_COORDS;  break;
+        default:                     rc = ResClass::COLD_MESH;      break;
+    }
+
+    // Ensure the resource is registered with the tier manager
+    MemRecord* rec = s_tier->FindRecord(cmd.resourceId);
+    if (!rec) {
+        // Auto-register with default data size (0 — will be updated on first write)
+        s_tier->Register(cmd.resourceId, rc, 0);
+        rec = s_tier->FindRecord(cmd.resourceId);
+    }
+
+    if (rec) {
+        // Apply pinned flag
+        rec->pinned = (cmd.flags & PGL_TIER_FLAG_PINNED) != 0;
+
+        // If a preferred tier is specified (not AUTO), initiate migration
+        if (cmd.preferredTier != PGL_TIER_AUTO) {
+            MemTier targetTier;
+            switch (cmd.preferredTier) {
+                case PGL_TIER_SRAM:       targetTier = MemTier::SRAM;      break;
+                case PGL_TIER_OPI_PSRAM:  targetTier = MemTier::OPI_PSRAM; break;
+                case PGL_TIER_QSPI_PSRAM: targetTier = MemTier::QSPI_XIP;  break;
+                default:                  targetTier = MemTier::SRAM;      break;
+            }
+
+            if (static_cast<uint8_t>(targetTier) <
+                static_cast<uint8_t>(rec->currentTier)) {
+                s_tier->Promote(*rec, targetTier);
+            } else if (static_cast<uint8_t>(targetTier) >
+                       static_cast<uint8_t>(rec->currentTier)) {
+                s_tier->Demote(*rec, targetTier);
+            }
+        }
+    }
 
     (void)scene;
 }
@@ -617,29 +984,106 @@ static void HandleMemAlloc(const uint8_t*& ptr, SceneState* scene) {
     PglCmdMemAlloc cmd;
     PglReadStruct(ptr, cmd);
 
-    printf("[Parser] MemAlloc: tier=%u size=%lu tag=0x%04X\n",
-           cmd.tier, (unsigned long)cmd.size, cmd.tag);
+    // Validate tier
+    if (cmd.tier == PGL_TIER_AUTO || cmd.tier > PGL_TIER_QSPI_PSRAM) {
+        scene->lastAllocResult.handle  = PGL_INVALID_MEM_HANDLE;
+        scene->lastAllocResult.address = 0;
+        scene->lastAllocResult.status  = PGL_ALLOC_INVALID_TIER;
+        return;
+    }
 
-    // TODO(M8): Route to tier allocator:
-    //   PGL_TIER_SRAM     → arena_alloc(sram_arena, size)
-    //   PGL_TIER_OPI_PSRAM → opi_psram_alloc(size)
-    //   PGL_TIER_QSPI_PSRAM → qspi_psram_alloc(size)
-    // Write result to scene->lastAllocResult (PglMemAllocResult)
-    // so it's available via PGL_REG_MEM_ALLOC_RESULT I2C read.
+    // Find a free handle slot
+    PglMemHandle handle = PGL_INVALID_MEM_HANDLE;
+    for (uint16_t i = 0; i < PGL_MAX_MEM_ALLOCATIONS; ++i) {
+        uint16_t idx = (s_nextHandle + i) % PGL_MAX_MEM_ALLOCATIONS;
+        if (!s_allocTable[idx].active) {
+            handle = idx;
+            s_nextHandle = (idx + 1) % PGL_MAX_MEM_ALLOCATIONS;
+            break;
+        }
+    }
 
-    scene->lastAllocResult.handle  = PGL_INVALID_MEM_HANDLE;
-    scene->lastAllocResult.address = 0;
-    scene->lastAllocResult.status  = PGL_ALLOC_TIER_DISABLED;  // stub: tier not yet implemented
+    if (handle == PGL_INVALID_MEM_HANDLE) {
+        scene->lastAllocResult.handle  = PGL_INVALID_MEM_HANDLE;
+        scene->lastAllocResult.address = 0;
+        scene->lastAllocResult.status  = PGL_ALLOC_HANDLE_EXHAUSTED;
+        return;
+    }
+
+    // Route to tier allocator
+    uint32_t allocAddr = 0;
+    bool ok = false;
+
+    switch (cmd.tier) {
+        case PGL_TIER_SRAM:
+            // SRAM allocation: not supported via this command path.
+            // SRAM resources are managed through the SceneState pools.
+            scene->lastAllocResult.handle  = PGL_INVALID_MEM_HANDLE;
+            scene->lastAllocResult.address = 0;
+            scene->lastAllocResult.status  = PGL_ALLOC_TIER_DISABLED;
+            return;
+
+        case PGL_TIER_OPI_PSRAM:
+            if (s_opi && s_opi->IsInitialized()) {
+                allocAddr = s_opi->Alloc(cmd.size, 4);
+                ok = (allocAddr != 0xFFFFFFFF);
+            }
+            break;
+
+        case PGL_TIER_QSPI_PSRAM:
+            if (s_qspi && s_qspi->IsInitialized()) {
+                allocAddr = s_qspi->Alloc(cmd.size, 4);
+                ok = (allocAddr != 0xFFFFFFFF);
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    if (!ok) {
+        // Check if tier is disabled vs out-of-memory
+        bool tierEnabled = false;
+        if (cmd.tier == PGL_TIER_OPI_PSRAM && s_opi && s_opi->IsInitialized())
+            tierEnabled = true;
+        if (cmd.tier == PGL_TIER_QSPI_PSRAM && s_qspi && s_qspi->IsInitialized())
+            tierEnabled = true;
+
+        scene->lastAllocResult.handle  = PGL_INVALID_MEM_HANDLE;
+        scene->lastAllocResult.address = 0;
+        scene->lastAllocResult.status  = tierEnabled
+                                       ? PGL_ALLOC_OUT_OF_MEMORY
+                                       : PGL_ALLOC_TIER_DISABLED;
+        return;
+    }
+
+    // Record the allocation
+    s_allocTable[handle].active  = true;
+    s_allocTable[handle].tier    = cmd.tier;
+    s_allocTable[handle].address = allocAddr;
+    s_allocTable[handle].size    = cmd.size;
+    s_allocTable[handle].tag     = cmd.tag;
+
+    scene->lastAllocResult.handle  = handle;
+    scene->lastAllocResult.address = allocAddr;
+    scene->lastAllocResult.status  = PGL_ALLOC_OK;
 }
 
 static void HandleMemFree(const uint8_t*& ptr, SceneState* scene) {
     PglCmdMemFree cmd;
     PglReadStruct(ptr, cmd);
 
-    printf("[Parser] MemFree: handle=%u\n", cmd.handle);
+    if (cmd.handle >= PGL_MAX_MEM_ALLOCATIONS ||
+        !s_allocTable[cmd.handle].active) {
+        printf("[Parser] MemFree: invalid handle %u\n", cmd.handle);
+        return;
+    }
 
-    // TODO(M8): Look up handle in allocation table, free the memory region,
-    // and release the handle slot.
+    // Mark the handle as free.
+    // Note: With bump allocators, individual deallocation doesn't return memory
+    // to the pool. The space is reclaimed only on FreeAll(). This is acceptable
+    // for the GPU's allocation pattern (bulk load → render → reset).
+    s_allocTable[cmd.handle].active = false;
 
     (void)scene;
 }
@@ -648,31 +1092,95 @@ static void HandleFramebufferCapture(const uint8_t*& ptr, SceneState* scene) {
     PglCmdFramebufferCapture cmd;
     PglReadStruct(ptr, cmd);
 
-    printf("[Parser] FramebufferCapture: buffer=%u format=%u\n",
-           cmd.bufferSelect, cmd.format);
+    // Select source buffer
+    const uint16_t* srcBuf = (cmd.bufferSelect == 0) ? s_frontBuffer
+                                                      : s_backBuffer;
+    if (!srcBuf) {
+        printf("[Parser] FramebufferCapture: buffer not available\n");
+        scene->memStagingLength = 0;
+        return;
+    }
 
-    // TODO(M8): Copy the selected framebuffer into the I2C staging buffer.
-    //   bufferSelect 0 = front (displayed), 1 = back (in-progress)
-    //   format 0 = RGB565 (native, no conversion), 1 = RGB888 (expand)
-    // After staging, host reads via PGL_REG_MEM_READ_DATA.
+    uint32_t fbBytes = s_fbPixels * sizeof(uint16_t);  // RGB565
 
-    (void)scene;
+    if (cmd.format == 0) {
+        // RGB565 native — direct copy
+        uint32_t copyLen = std::min(fbBytes,
+                                    static_cast<uint32_t>(SceneState::MEM_STAGING_SIZE));
+        std::memcpy(scene->memStagingBuffer, srcBuf, copyLen);
+        scene->memStagingLength  = copyLen;
+        scene->memStagingReadPos = 0;
+    } else {
+        // RGB888 expansion: 2 bytes → 3 bytes per pixel
+        uint32_t maxPixels = SceneState::MEM_STAGING_SIZE / 3;
+        uint32_t pixelCount = std::min(s_fbPixels, maxPixels);
+        uint8_t* dst = scene->memStagingBuffer;
+
+        for (uint32_t i = 0; i < pixelCount; ++i) {
+            uint16_t c = srcBuf[i];
+            // RGB565 → RGB888 (5-6-5 → 8-8-8)
+            dst[0] = static_cast<uint8_t>(((c >> 11) & 0x1F) * 255 / 31);
+            dst[1] = static_cast<uint8_t>(((c >>  5) & 0x3F) * 255 / 63);
+            dst[2] = static_cast<uint8_t>(((c      ) & 0x1F) * 255 / 31);
+            dst += 3;
+        }
+
+        scene->memStagingLength  = pixelCount * 3;
+        scene->memStagingReadPos = 0;
+    }
 }
 
 static void HandleMemCopy(const uint8_t*& ptr, SceneState* scene) {
     PglCmdMemCopy cmd;
     PglReadStruct(ptr, cmd);
 
-    printf("[Parser] MemCopy: src=tier%u@0x%08lX → dst=tier%u@0x%08lX size=%lu\n",
-           cmd.srcTier, (unsigned long)cmd.srcAddress,
-           cmd.dstTier, (unsigned long)cmd.dstAddress,
-           (unsigned long)cmd.size);
+    if (cmd.size == 0) return;
 
-    // TODO(M8): Execute GPU-internal copy:
-    //   1. Read `size` bytes from srcTier:srcAddress
-    //   2. Write to dstTier:dstAddress
-    //   For same-tier SRAM copies, use memcpy.
-    //   For cross-tier copies, use DMA where available.
+    // Use the staging buffer as a temporary transfer buffer for cross-tier copies.
+    // We process in chunks of MEM_STAGING_SIZE.
+    uint32_t remaining = cmd.size;
+    uint32_t srcOff = cmd.srcAddress;
+    uint32_t dstOff = cmd.dstAddress;
 
-    (void)scene;
+    while (remaining > 0) {
+        uint32_t chunk = std::min(remaining,
+                                  static_cast<uint32_t>(SceneState::MEM_STAGING_SIZE));
+
+        // Read from source tier into staging buffer
+        bool readOk = false;
+        if (cmd.srcTier == PGL_TIER_SRAM) {
+            // SRAM source is not supported for cross-tier copy
+            // (SRAM addresses are managed by scene state pools, not this path)
+            printf("[Parser] MemCopy: SRAM source not supported\n");
+            break;
+        } else {
+            readOk = TierReadInto(cmd.srcTier, srcOff,
+                                  scene->memStagingBuffer, chunk);
+        }
+
+        if (!readOk) {
+            printf("[Parser] MemCopy: read failed (srcTier=%u)\n", cmd.srcTier);
+            break;
+        }
+
+        // Write from staging buffer to destination tier
+        bool writeOk = false;
+        if (cmd.dstTier == PGL_TIER_SRAM) {
+            // SRAM destination: data is now in staging buffer for host readback.
+            // (No further copy needed — staging IS the SRAM buffer.)
+            writeOk = true;
+        } else {
+            writeOk = TierWriteTo(cmd.dstTier, dstOff,
+                                  scene->memStagingBuffer, chunk);
+        }
+
+        if (!writeOk) {
+            printf("[Parser] MemCopy: write failed (dstTier=%u)\n", cmd.dstTier);
+            break;
+        }
+
+        remaining -= chunk;
+        srcOff += chunk;
+        dstOff += chunk;
+    }
 }

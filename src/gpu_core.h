@@ -3,8 +3,12 @@
  * @brief GPU core lifecycle — initialization, Core 0 loop, Core 1 loop.
  *
  * Core 0: owns SPI receive, command parsing, scene state, QuadTree build,
- *         rasterizes top half of screen, performs framebuffer swap.
- * Core 1: waits for FIFO signal, rasterizes bottom half, signals completion.
+ *         tile rasterisation (work-stealing), performs framebuffer swap.
+ * Core 1: tile rasterisation (work-stealing, FIFO-triggered).
+ *
+ * Inter-core dispatch is handled by PglTileScheduler, which uses the
+ * multicore FIFO for start/stop signalling and a lock-free atomic counter
+ * for tile work-stealing between the two cores.
  */
 
 #pragma once
@@ -12,10 +16,6 @@
 #include <cstdint>
 
 namespace GpuCore {
-
-/// Multi-core FIFO command words
-static constexpr uint32_t FIFO_CMD_START_RENDER = 0x52454E44;  // "REND"
-static constexpr uint32_t FIFO_CMD_RENDER_DONE  = 0x444F4E45;  // "DONE"
 
 /**
  * @brief Initialize all GPU subsystems (called on Core 0 before Core 1 launch).
@@ -27,6 +27,7 @@ static constexpr uint32_t FIFO_CMD_RENDER_DONE  = 0x444F4E45;  // "DONE"
  *  - RDY GPIO (flow control)
  *  - Framebuffers (double-buffered RGB565)
  *  - Scene state (resource tables)
+ *  - Tile scheduler (PglTileScheduler)
  *
  * @return true on success.
  */
@@ -39,9 +40,9 @@ bool Initialize();
  *  1. Check SPI ring buffer for new frame data
  *  2. Parse command buffer → update scene state
  *  3. Transform vertices → project → build QuadTree
- *  4. Signal Core 1 to start rasterizing bottom half
- *  5. Rasterize top half (Y = 0 to PANEL_HEIGHT/2 - 1)
- *  6. Wait for Core 1 completion
+ *  4. Dispatch tile rasterisation (32 tiles, work-stealing between cores)
+ *  5. Wait for both cores to finish (polling HUB75 refresh while idle)
+ *  6. Apply screen-space post-processing shaders
  *  7. Swap framebuffer pointers
  *  8. Update RDY pin / FPS counter
  */
@@ -50,10 +51,9 @@ void Core0Main();
 /**
  * @brief Core 1 main loop (never returns).
  *
- * Spins on multicore FIFO waiting for FIFO_CMD_START_RENDER.
- * When received:
- *  1. Rasterize bottom half (Y = PANEL_HEIGHT/2 to PANEL_HEIGHT - 1)
- *  2. Push FIFO_CMD_RENDER_DONE back to Core 0
+ * Delegates to PglTileScheduler::Core1Main(), which waits on the multicore
+ * FIFO for tile-pass or pair commands.  During a tile pass, Core 1 pulls
+ * tiles from the shared atomic counter and rasterises them.
  */
 void Core1Main();
 

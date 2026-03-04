@@ -2,8 +2,8 @@
  * @file main.cpp
  * @brief ProtoGL GPU firmware entry point — RP2350 (ARM Cortex-M33 dual-core).
  *
- * Core 0: SPI receive → command parse → scene update → QuadTree build → raster top half
- * Core 1: Raster bottom half (launched after QuadTree is ready)
+ * Core 0: SPI receive → command parse → scene update → QuadTree build → tile raster (work-stealing)
+ * Core 1: Tile raster (work-stealing, FIFO-triggered)
  *
  * The PIO HUB75 driver runs entirely in hardware, consuming the framebuffer
  * via DMA with zero CPU intervention.

@@ -2,8 +2,12 @@
  * @file gpu_core.cpp
  * @brief GPU core lifecycle implementation — RP2350 dual-core.
  *
- * Core 0: SPI receive → parse → prepare frame → rasterize top half → swap → HUB75 refresh
- * Core 1: Rasterize bottom half (FIFO-triggered)
+ * Core 0: SPI receive → parse → prepare frame → tile raster (work-stealing) → swap → HUB75 refresh
+ * Core 1: Tile raster (work-stealing, Morton Z-order, FIFO-triggered)
+ *
+ * Rasterisation is tile-based: the 128×64 panel is divided into 32 tiles of
+ * 16×16 pixels, dispatched via PglTileScheduler.  Both cores pull tiles from
+ * a lock-free atomic counter, giving natural load balancing.
  */
 
 #include "gpu_core.h"
@@ -16,14 +20,19 @@
 #include "render/rasterizer.h"
 #include "render/screenspace_effects.h"
 #include "profiling/perf_counters.h"
+#include "memory/mem_opi_psram.h"
+#include "memory/mem_qspi_psram.h"
+#include "memory/mem_tier.h"
+#include "scheduler/pgl_tile_scheduler.h"
+
+// Free function defined in i2c_slave.cpp — returns the auto-detected CS1 chip profile
+extern const GpuConfig::QspiChipProfile& GetQspiChipProfile();
 
 #include "pico/stdlib.h"
-#include "pico/multicore.h"
 #include "hardware/gpio.h"
 
 #include <cstdio>
 #include <cstring>
-#include <cmath>
 
 // ─── GPU State ──────────────────────────────────────────────────────────────
 
@@ -35,7 +44,7 @@ static uint16_t framebufferB[GpuConfig::FRAMEBUF_PIXELS];
 static uint16_t* frontBuffer = framebufferA;
 static uint16_t* backBuffer  = framebufferB;
 
-/// Z-buffer (shared between cores — each core writes distinct Y ranges)
+/// Z-buffer (shared between cores — each core writes distinct tiles)
 static float zBuffer[GpuConfig::FRAMEBUF_PIXELS];
 
 /// Scene and render state
@@ -46,6 +55,14 @@ static uint32_t     droppedFrames = 0;
 static uint32_t     lastFpsTimeUs = 0;
 static uint16_t     measuredFps = 0;
 static float        elapsedTimeS = 0.0f;   // accumulated wall time for animated effects
+
+/// Memory subsystem
+static OpiPsramDriver  opiDriver;
+static QspiPsramDriver qspiDriver;
+static MemTierManager  memTierManager;
+
+/// Tile-based dual-core scheduler (bare-metal, work-stealing)
+static PglTileScheduler tileScheduler;
 
 // ─── Initialization ─────────────────────────────────────────────────────────
 
@@ -101,7 +118,107 @@ bool GpuCore::Initialize() {
     // 9. Performance counters (DWT cycle counter)
     PerfCounters::Initialize();
 
-    // 10. Assert RDY — we're ready to receive data
+    // 10. Tile scheduler (bare-metal, work-stealing, dual-core)
+    tileScheduler.Initialize();
+
+    // 11. Memory subsystem (PIO2 external + QSPI CS1 + tier manager)
+    {
+        // Initialize PIO2 external memory driver (if configured)
+        OpiPsramDriver* opiPtr = nullptr;
+        if (GpuConfig::PIO2_MEM_MODE != GpuConfig::Pio2MemMode::NONE) {
+            OpiPsramConfig opiCfg = {};
+            opiCfg.mode           = static_cast<Pio2MemMode>(
+                                        static_cast<uint8_t>(GpuConfig::PIO2_MEM_MODE));
+            opiCfg.pioInstance    = 2;  // PIO2
+            opiCfg.dataBasePin    = GpuConfig::PIO2_MEM_DATA_BASE_PIN;
+            opiCfg.dataPinCount   = GpuConfig::Pio2DataPinCount();
+            opiCfg.clkPin         = GpuConfig::PIO2_MEM_CLK_PIN;
+            opiCfg.cs0Pin         = GpuConfig::PIO2_MEM_CS0_PIN;
+            opiCfg.cs1Pin         = GpuConfig::QSPI_MRAM_CS1_PIN;
+            opiCfg.readLatency    = GpuConfig::Pio2IsMram()
+                                  ? GpuConfig::QSPI_MRAM_PIO_READ_LAT
+                                  : GpuConfig::OPI_PSRAM_READ_LATENCY;
+            opiCfg.clockMHz       = GpuConfig::Pio2IsMram()
+                                  ? GpuConfig::QSPI_MRAM_PIO_CLOCK_MHZ
+                                  : GpuConfig::OPI_PSRAM_CLOCK_MHZ;
+            opiCfg.capacityBytes  = GpuConfig::Pio2MemCapacity();
+            opiCfg.chipCapacity   = GpuConfig::Pio2IsMram()
+                                  ? GpuConfig::QSPI_MRAM_CHIP_CAPACITY : 0;
+            opiCfg.chipCount      = (GpuConfig::PIO2_MEM_MODE ==
+                                     GpuConfig::Pio2MemMode::DUAL_QSPI_MRAM) ? 2 : 1;
+            opiCfg.isMram              = GpuConfig::Pio2IsMram();
+            opiCfg.hasRandomAccessPenalty = !GpuConfig::Pio2IsMram();
+            opiCfg.isNonVolatile       = GpuConfig::Pio2IsMram();
+            opiCfg.needsWrenBeforeWrite = GpuConfig::Pio2IsMram();
+            opiCfg.expectedRdid        = GpuConfig::Pio2IsMram()
+                                       ? GpuConfig::QSPI_MRAM_PIO_RDID : 0;
+
+            if (opiDriver.Initialize(opiCfg)) {
+                opiPtr = &opiDriver;
+                printf("[GpuCore] PIO2 external memory initialized (%lu KB, %s)\n",
+                       (unsigned long)(opiCfg.capacityBytes / 1024),
+                       opiCfg.isMram ? "MRAM" : "PSRAM");
+            } else {
+                printf("[GpuCore] WARNING: PIO2 external memory init failed\n");
+            }
+        }
+
+        // Initialize QSPI CS1 driver (if auto-detected by ProbeQspiCs1)
+        QspiPsramDriver* qspiPtr = nullptr;
+        {
+            const auto& chipProfile = GetQspiChipProfile();
+            if (chipProfile.type != GpuConfig::QspiChipType::NONE) {
+                QspiPsramConfig qspiCfg = {};
+                qspiCfg.xipBase        = GpuConfig::QSPI_CS1_XIP_BASE;
+                qspiCfg.capacityBytes  = chipProfile.capacityBytes;
+                qspiCfg.clockMHz       = chipProfile.maxClockMHz;
+                qspiCfg.readLatency    = chipProfile.readLatencyDummy;
+                qspiCfg.chipType       = static_cast<uint8_t>(chipProfile.type);
+                qspiCfg.hasRandomAccessPenalty = chipProfile.hasRandomAccessPenalty;
+                qspiCfg.isNonVolatile  = chipProfile.isNonVolatile;
+                qspiCfg.needsWrenBeforeWrite = chipProfile.needsWrenBeforeWrite;
+                qspiCfg.needsRefresh   = chipProfile.needsRefresh;
+                qspiCfg.expectedRdid   = chipProfile.deviceId;
+
+                if (qspiDriver.Initialize(qspiCfg)) {
+                    qspiPtr = &qspiDriver;
+                    printf("[GpuCore] QSPI CS1 memory initialized (%lu KB, %s)\n",
+                           (unsigned long)(qspiCfg.capacityBytes / 1024),
+                           chipProfile.hasRandomAccessPenalty ? "PSRAM" : "MRAM");
+                } else {
+                    printf("[GpuCore] WARNING: QSPI CS1 memory init failed\n");
+                }
+            }
+        }
+
+        // Initialize tier manager
+        MemTierConfig tierCfg = {};
+        tierCfg.sramCacheBudget     = GpuConfig::MEM_TIER_SRAM_CACHE_BUDGET;
+        tierCfg.cacheLineSize       = GpuConfig::MEM_TIER_CACHE_LINE_SIZE;
+        tierCfg.alphaWeight         = GpuConfig::MEM_TIER_ALPHA_WEIGHT;
+        tierCfg.betaScore           = GpuConfig::MEM_TIER_BETA_SCORE;
+        tierCfg.demotionThreshold   = GpuConfig::MEM_TIER_DEMOTION_THRESHOLD;
+        tierCfg.promotionHysteresis = GpuConfig::MEM_TIER_PROMOTION_HYSTERESIS;
+        tierCfg.opiCapacity  = opiPtr  ? opiPtr->GetCapacity()  : 0;
+        tierCfg.pio2IsMram   = opiPtr  ? opiPtr->IsMram()       : false;
+        tierCfg.pio2HasRandomAccessPenalty = opiPtr ? opiPtr->HasRandomAccessPenalty() : true;
+        tierCfg.qspiCapacity = qspiPtr ? qspiPtr->GetCapacity() : 0;
+        tierCfg.qspiXipBase  = GpuConfig::QSPI_CS1_XIP_BASE;
+        tierCfg.qspiHasRandomAccessPenalty = qspiPtr ? qspiPtr->HasRandomAccessPenalty() : true;
+        tierCfg.qspiIsNonVolatile          = qspiPtr ? qspiPtr->IsNonVolatile()          : false;
+
+        memTierManager.Initialize(tierCfg, opiPtr, qspiPtr);
+
+        // Wire memory subsystem into the command parser
+        CommandParser::InitMemory(
+            opiPtr, qspiPtr, &memTierManager,
+            frontBuffer, backBuffer,
+            GpuConfig::FRAMEBUF_PIXELS);
+
+        printf("[GpuCore] Memory subsystem initialized\n");
+    }
+
+    // 12. Assert RDY — we're ready to receive data
     gpio_put(GpuConfig::RDY_PIN, 1);
     printf("[GpuCore] GPU ready. RDY pin asserted.\n");
 
@@ -186,6 +303,10 @@ void GpuCore::Core0Main() {
             continue;
         }
 
+        // ── Memory tier: begin-of-frame bookkeeping ──
+        // Decay access scores, evaluate promotion/demotion.
+        memTierManager.BeginFrame();
+
         // ── Transform + project + build QuadTree (single-threaded) ──
         PerfCounters::Begin(PerfStage::Transform);
         rasterizer.PrepareFrame(&sceneState);
@@ -208,32 +329,39 @@ void GpuCore::Core0Main() {
             continue;
         }
 
-        // ── Signal Core 1: start rasterizing bottom half ──
-        // Set elapsed time for animated material evaluation (noise, rainbow).
+        // ── Set elapsed time for animated material evaluation (noise, rainbow) ──
         rasterizer.SetElapsedTime(elapsedTimeS);
-        multicore_fifo_push_blocking(FIFO_CMD_START_RENDER);
 
-        // ── Rasterize top half (Y = 0 to H/2 - 1) ──
-        PerfCounters::Begin(PerfStage::RasterTop);
-        const uint16_t halfHeight = GpuConfig::PANEL_HEIGHT / 2;
-        rasterizer.RasterizeRange(backBuffer, 0, halfHeight);
-        PerfCounters::End(PerfStage::RasterTop);
-
-        // ── Wait for Core 1 to finish bottom half ──
-        // Poll instead of blocking so we can keep refreshing the HUB75 display.
-        // multicore_fifo_rvalid() returns true when data is available in the FIFO.
-        while (!multicore_fifo_rvalid()) {
-            Hub75Driver::PollRefresh();
+        // ── Memory tier: prefetch PIO2-resident data into SRAM cache ──
+        // Build ID arrays from the draw list for prefetch.
+        // (Lightweight — just indexes into the existing draw list.)
+        {
+            static uint16_t meshIds[GpuConfig::MAX_DRAW_CALLS];
+            static uint16_t matIds[GpuConfig::MAX_DRAW_CALLS];
+            for (uint16_t i = 0; i < sceneState.drawCallCount; ++i) {
+                meshIds[i] = sceneState.drawList[i].meshId;
+                matIds[i]  = sceneState.drawList[i].materialId;
+            }
+            memTierManager.PrefetchForDrawList(
+                meshIds, matIds, nullptr, sceneState.drawCallCount);
         }
-        uint32_t response = multicore_fifo_pop_blocking();
-        (void)response;  // should be FIFO_CMD_RENDER_DONE
+
+        // ── Rasterize via tile scheduler (32 tiles, work-stealing) ──
+        // Both cores pull 16×16 tiles from an atomic counter in Morton order.
+        // Each tile queries the QuadTree once (256-pixel amortisation).
+        PerfCounters::Begin(PerfStage::RasterTop);   // reuse stage for "raster total"
+        tileScheduler.DispatchTilePass(
+            &rasterizer, backBuffer, zBuffer,
+            GpuConfig::PANEL_WIDTH, GpuConfig::PANEL_HEIGHT,
+            Hub75Driver::PollRefresh);
+        PerfCounters::End(PerfStage::RasterTop);
 
         // ── Accumulate elapsed time for animated shaders ──
         // Wrap at 3600 s (1 hour) to prevent float32 precision loss.
         // Animated shaders use periodic functions (sin/cos), so wrapping is safe.
         elapsedTimeS += sceneState.frameTimeUs / 1000000.0f;
         if (elapsedTimeS > 3600.0f) {
-            elapsedTimeS = fmodf(elapsedTimeS, 3600.0f);
+            elapsedTimeS -= 3600.0f;
         }
 
         // ── Apply screen-space post-processing shaders ──
@@ -254,6 +382,13 @@ void GpuCore::Core0Main() {
         frontBuffer = backBuffer;
         backBuffer = temp;
         Hub75Driver::SetFramebuffer(frontBuffer);
+
+        // ── Update command parser's framebuffer pointers after swap ──
+        CommandParser::UpdateFramebufferPtrs(frontBuffer, backBuffer);
+
+        // ── Memory tier: end-of-frame flush ──
+        // Write back dirty SRAM cache lines to external memory.
+        memTierManager.EndFrame();
 
         // ── Update flow control (RDY pin) with hysteresis ──
         uint32_t freeBytes = OctalSpiRx::GetFreeBytes();
@@ -289,6 +424,29 @@ void GpuCore::Core0Main() {
             false // renderBusy: cleared after render complete
         );
 
+        // ── Update memory tier info for I2C readback ──
+        {
+            PglMemTierInfoResponse& ti = sceneState.memTierInfo;
+            // Tier 0 — SRAM
+            ti.sramTotalKB = 520;  // RP2350 has 520 KB SRAM
+            ti.sramFreeKB  = static_cast<uint16_t>(
+                520 - (memTierManager.GetSramCacheUsed() / 1024));
+            // Tier 1 — PIO2
+            ti.opiTotalKB = static_cast<uint16_t>(
+                opiDriver.IsInitialized() ? opiDriver.GetCapacity() / 1024 : 0);
+            ti.opiFreeKB  = static_cast<uint16_t>(
+                opiDriver.IsInitialized() ? opiDriver.Available() / 1024 : 0);
+            ti.opiEnabled = opiDriver.IsInitialized() ? 1 : 0;
+            // Tier 2 — QSPI CS1
+            ti.qspiTotalKB = static_cast<uint16_t>(
+                qspiDriver.IsInitialized() ? qspiDriver.GetCapacity() / 1024 : 0);
+            ti.qspiFreeKB  = static_cast<uint16_t>(
+                qspiDriver.IsInitialized() ? qspiDriver.Available() / 1024 : 0);
+            ti.qspiEnabled = qspiDriver.IsInitialized() ? 1 : 0;
+            // Cache stats
+            // (cachedEntries, cacheHitRate left as-is for now)
+        }
+
         // ── Periodic profiling report ──
         lastPerfReportFrameCount++;
         if (lastPerfReportFrameCount >= PERF_REPORT_INTERVAL) {
@@ -302,22 +460,6 @@ void GpuCore::Core0Main() {
 // ─── Core 1 Main Loop ──────────────────────────────────────────────────────
 
 void GpuCore::Core1Main() {
-    const uint16_t halfHeight = GpuConfig::PANEL_HEIGHT / 2;
-    printf("[GpuCore] Core 1 entering render loop\n");
-
-    while (true) {
-        // Wait for Core 0 to signal: QuadTree is ready, start rasterizing
-        uint32_t cmd = multicore_fifo_pop_blocking();
-
-        if (cmd == FIFO_CMD_START_RENDER) {
-            // Rasterize bottom half (Y = H/2 to H-1)
-            PerfCounters::Begin(PerfStage::RasterBottom);
-            rasterizer.RasterizeRange(backBuffer, halfHeight,
-                                      GpuConfig::PANEL_HEIGHT);
-            PerfCounters::End(PerfStage::RasterBottom);
-
-            // Signal completion to Core 0
-            multicore_fifo_push_blocking(FIFO_CMD_RENDER_DONE);
-        }
-    }
+    printf("[GpuCore] Core 1 entering tile scheduler loop\n");
+    tileScheduler.Core1Main();  // never returns — work-stealing tile loop
 }

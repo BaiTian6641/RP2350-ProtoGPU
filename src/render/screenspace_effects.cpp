@@ -14,7 +14,7 @@
  *
  * Performance notes (128×64 panel, Cortex-M33 @ 150 MHz):
  *   - Convolution:   O(pixels × radius), ~0.05-0.3 ms
- *   - Displacement:  O(pixels), ~0.1-0.3 ms (sinf via hardware FPU)
+ *   - Displacement:  O(pixels), ~0.1-0.3 ms (sin via PglShaderBackend)
  *   - ColorAdjust:   O(pixels), ~0.05-0.15 ms
  *   - Worst case (4 shaders): < 1.0 ms, well within 16.6 ms budget
  */
@@ -22,29 +22,32 @@
 #include "screenspace_effects.h"
 #include "../scene_state.h"
 #include "../gpu_config.h"
+#include "pgl_shader_vm.h"
 
 #include <PglTypes.h>
+#include <PglShaderBytecode.h>
+#include <PglShaderBackend.h>
 
-#include <cmath>
 #include <cstring>
 #include <cstdio>
 
-// ─── RGB565 Helpers ─────────────────────────────────────────────────────────
+// ─── Backend alias ──────────────────────────────────────────────────────────
+namespace BE = PglShaderBackend;
 
-static inline uint8_t R5(uint16_t c) { return (c >> 11) & 0x1F; }
-static inline uint8_t G6(uint16_t c) { return (c >>  5) & 0x3F; }
-static inline uint8_t B5(uint16_t c) { return  c        & 0x1F; }
+// ─── RGB565 Helpers (thin delegates to backend) ─────────────────────────────
+
+static inline uint8_t  R5(uint16_t c) { return BE::R5(c); }
+static inline uint8_t  G6(uint16_t c) { return BE::G6(c); }
+static inline uint8_t  B5(uint16_t c) { return BE::B5(c); }
 
 static inline uint16_t PackRGB565(uint8_t r5, uint8_t g6, uint8_t b5) {
-    return (static_cast<uint16_t>(r5) << 11)
-         | (static_cast<uint16_t>(g6) << 5)
-         | static_cast<uint16_t>(b5);
+    return BE::PackRGB565i(r5, g6, b5);
 }
 
-static inline uint8_t Clamp5(int v) { return static_cast<uint8_t>(v < 0 ? 0 : (v > 31 ? 31 : v)); }
-static inline uint8_t Clamp6(int v) { return static_cast<uint8_t>(v < 0 ? 0 : (v > 63 ? 63 : v)); }
-static inline int     ClampI(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
-static inline float   ClampF(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static inline uint8_t  Clamp5(int v) { return BE::Clamp5(v); }
+static inline uint8_t  Clamp6(int v) { return BE::Clamp6(v); }
+static inline int      ClampI(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static inline float    ClampF(float v, float lo, float hi) { return BE::Clamp(v, lo, hi); }
 
 static inline float MapF(float value, float inMin, float inMax, float outMin, float outMax) {
     return outMin + (value - inMin) * (outMax - outMin) / (inMax - inMin);
@@ -56,17 +59,17 @@ static constexpr float MPI = 3.14159265f;
 
 static inline float OscSawtooth(float time, float period) {
     if (period <= 0.0001f) return 0.0f;
-    return fmodf(time, period) / period;
+    return BE::Mod(time, period) / period;
 }
 
 /// General oscillator — returns value in [0,1] based on waveform type.
 static inline float Oscillate(float time, float period, uint8_t waveform) {
     if (period <= 0.0001f) return 0.0f;
-    float t = fmodf(time, period) / period;  // [0,1)
+    float t = BE::Mod(time, period) / period;  // [0,1)
     switch (waveform) {
         default:
         case PGL_WAVE_SAWTOOTH: return t;
-        case PGL_WAVE_SINE:     return 0.5f + 0.5f * sinf(2.0f * MPI * t);
+        case PGL_WAVE_SINE:     return 0.5f + 0.5f * BE::Sin(2.0f * MPI * t);
         case PGL_WAVE_TRIANGLE: return t < 0.5f ? (2.0f * t) : (2.0f - 2.0f * t);
         case PGL_WAVE_SQUARE:   return t < 0.5f ? 0.0f : 1.0f;
     }
@@ -90,7 +93,7 @@ static inline float KernelWeight(int d, uint8_t shape, float sigma) {
         case PGL_KERNEL_GAUSSIAN: {
             float s = (sigma > 0.01f) ? sigma : 1.0f;
             float fd = static_cast<float>(d);
-            return expf(-(fd * fd) / (2.0f * s * s));
+            return BE::Exp(-(fd * fd) / (2.0f * s * s));
         }
         case PGL_KERNEL_TRIANGLE: {
             // Linearly decreasing — but we pass radius externally, so just use
@@ -155,12 +158,12 @@ static void ApplyConvolution(uint16_t* fb, uint16_t* scratch,
                              0.0f, 360.0f);
     }
     float angleRad = angleDeg * (MPI / 180.0f);
-    float dirX = cosf(angleRad);
-    float dirY = sinf(angleRad);
+    float dirX = BE::Cos(angleRad);
+    float dirY = BE::Sin(angleRad);
 
     // Simple axis-aligned fast path (no trig per-pixel)
-    bool isHorizontal = (fabsf(dirY) < 0.001f);
-    bool isVertical   = (fabsf(dirX) < 0.001f);
+    bool isHorizontal = (BE::Abs(dirY) < 0.001f);
+    bool isVertical   = (BE::Abs(dirX) < 0.001f);
 
     if (isHorizontal) {
         // ── Horizontal blur fast path ───────────────────────────────────
@@ -236,9 +239,9 @@ static void ApplyConvolution(uint16_t* fb, uint16_t* scratch,
                 if (cp.anglePeriod > 0.001f) {
                     float dx = static_cast<float>(x) - cx;
                     float dy = static_cast<float>(y) - cy;
-                    float len = sqrtf(dx * dx + dy * dy);
+                    float len = BE::Len2(dx, dy);
                     if (len > 0.001f) {
-                        float cosA = cosf(angleRad), sinA = sinf(angleRad);
+                        float cosA = BE::Cos(angleRad), sinA = BE::Sin(angleRad);
                         rx = (dx * cosA - dy * sinA) / len;
                         ry = (dx * sinA + dy * cosA) / len;
                     }
@@ -312,9 +315,9 @@ static void ApplyDisplacement(uint16_t* fb, uint16_t* scratch,
                 uint32_t idx = row + x;
 
                 if (chromatic) {
-                    float sR = sinf(coordY + oscPhase * 8.0f);
-                    float sG = sinf(coordY + oscPhase * 8.0f + PI2_OVER3);
-                    float sB = sinf(coordY + oscPhase * 8.0f + PI4_OVER3);
+                    float sR = BE::Sin(coordY + oscPhase * 8.0f);
+                    float sG = BE::Sin(coordY + oscPhase * 8.0f + PI2_OVER3);
+                    float sB = BE::Sin(coordY + oscPhase * 8.0f + PI4_OVER3);
 
                     int oR = ClampI(static_cast<int>(MapF(sR, -1.f, 1.f, 1.f, range)), 1, static_cast<int>(range));
                     int oG = ClampI(static_cast<int>(MapF(sG, -1.f, 1.f, 1.f, range)), 1, static_cast<int>(range));
@@ -329,7 +332,7 @@ static void ApplyDisplacement(uint16_t* fb, uint16_t* scratch,
                     uint8_t b = (xB >= 0 && xB < w) ? B5(fb[row + xB]) : 0;
                     scratch[idx] = PackRGB565(r, g, b);
                 } else {
-                    float s = sinf(coordY + oscPhase * 8.0f);
+                    float s = BE::Sin(coordY + oscPhase * 8.0f);
                     int off = ClampI(static_cast<int>(MapF(s, -1.f, 1.f, 1.f, range)), 1, static_cast<int>(range));
                     int sx = static_cast<int>(x) + off;
                     scratch[idx] = (sx >= 0 && sx < w) ? fb[row + sx] : 0;
@@ -349,9 +352,9 @@ static void ApplyDisplacement(uint16_t* fb, uint16_t* scratch,
                 float coordX = static_cast<float>(x) / (10.0f / freq);
 
                 if (chromatic) {
-                    float sR = sinf(coordX + oscPhase * 8.0f);
-                    float sG = sinf(coordX + oscPhase * 8.0f + PI2_OVER3);
-                    float sB = sinf(coordX + oscPhase * 8.0f + PI4_OVER3);
+                    float sR = BE::Sin(coordX + oscPhase * 8.0f);
+                    float sG = BE::Sin(coordX + oscPhase * 8.0f + PI2_OVER3);
+                    float sB = BE::Sin(coordX + oscPhase * 8.0f + PI4_OVER3);
 
                     int oR = ClampI(static_cast<int>(MapF(sR, -1.f, 1.f, 1.f, range)), 1, static_cast<int>(range));
                     int oG = ClampI(static_cast<int>(MapF(sG, -1.f, 1.f, 1.f, range)), 1, static_cast<int>(range));
@@ -366,7 +369,7 @@ static void ApplyDisplacement(uint16_t* fb, uint16_t* scratch,
                     uint8_t b = (yB >= 0 && yB < h) ? B5(fb[static_cast<uint32_t>(yB) * w + x]) : 0;
                     scratch[idx] = PackRGB565(r, g, b);
                 } else {
-                    float s = sinf(coordX + oscPhase * 8.0f);
+                    float s = BE::Sin(coordX + oscPhase * 8.0f);
                     int off = ClampI(static_cast<int>(MapF(s, -1.f, 1.f, 1.f, range)), 1, static_cast<int>(range));
                     int sy = static_cast<int>(y) - off;
                     scratch[idx] = (sy >= 0 && sy < h) ? fb[static_cast<uint32_t>(sy) * w + x] : 0;
@@ -399,9 +402,9 @@ static void ApplyDisplacement(uint16_t* fb, uint16_t* scratch,
                 float coordX = static_cast<float>(x) / (10.0f / freq);
                 float coordY = static_cast<float>(y) / (5.0f / freq);
 
-                float sineR = sinf(coordX + mpiR * offset1) + cosf(coordY + mpiR * offset2);
-                float sineG = sinf(coordX + (mpiR + phase120) * offset1) + cosf(coordY + (mpiR + phase120) * offset2);
-                float sineB = sinf(coordX + (mpiR + phase240) * offset1) + cosf(coordY + (mpiR + phase240) * offset2);
+                float sineR = BE::Sin(coordX + mpiR * offset1) + BE::Cos(coordY + mpiR * offset2);
+                float sineG = BE::Sin(coordX + (mpiR + phase120) * offset1) + BE::Cos(coordY + (mpiR + phase120) * offset2);
+                float sineB = BE::Sin(coordX + (mpiR + phase240) * offset1) + BE::Cos(coordY + (mpiR + phase240) * offset2);
 
                 int blurR = ClampI(static_cast<int>(MapF(sineR, -2.f, 2.f, 1.f, range)), 1, static_cast<int>(range));
                 int blurG = ClampI(static_cast<int>(MapF(sineG, -2.f, 2.f, 1.f, range)), 1, static_cast<int>(range));
@@ -409,8 +412,8 @@ static void ApplyDisplacement(uint16_t* fb, uint16_t* scratch,
 
                 auto SampleRadial = [&](float angleDeg, int dist) -> uint32_t {
                     float rad = angleDeg * (MPI / 180.0f);
-                    int sx = static_cast<int>(x) + static_cast<int>(dist * cosf(rad));
-                    int sy = static_cast<int>(y) + static_cast<int>(dist * sinf(rad));
+                    int sx = static_cast<int>(x) + static_cast<int>(dist * BE::Cos(rad));
+                    int sy = static_cast<int>(y) + static_cast<int>(dist * BE::Sin(rad));
                     if (sx >= 0 && sx < w && sy >= 0 && sy < h)
                         return static_cast<uint32_t>(sy) * w + sx;
                     return UINT32_MAX;
@@ -504,9 +507,9 @@ static void ApplyColorAdjust(uint16_t* fb, uint16_t* scratch,
         float gamma = (cp.param2 > 0.01f) ? cp.param2 : 2.2f;
         float invGamma = 1.0f / gamma;
         for (uint32_t i = 0; i < totalPixels; ++i) {
-            float r = powf(R5(fb[i]) / 31.0f, invGamma);
-            float g = powf(G6(fb[i]) / 63.0f, invGamma);
-            float b = powf(B5(fb[i]) / 31.0f, invGamma);
+            float r = BE::Pow(R5(fb[i]) / 31.0f, invGamma);
+            float g = BE::Pow(G6(fb[i]) / 63.0f, invGamma);
+            float b = BE::Pow(B5(fb[i]) / 31.0f, invGamma);
             fb[i] = PackRGB565(Clamp5(static_cast<int>(r * 31.0f)),
                                Clamp6(static_cast<int>(g * 63.0f)),
                                Clamp5(static_cast<int>(b * 31.0f)));
@@ -547,7 +550,7 @@ static void ApplyColorAdjust(uint16_t* fb, uint16_t* scratch,
                 };
                 float gx = -L(-1,-1) + L(1,-1) - 2*L(-1,0) + 2*L(1,0) - L(-1,1) + L(1,1);
                 float gy = -L(-1,-1) - 2*L(0,-1) - L(1,-1) + L(-1,1) + 2*L(0,1) + L(1,1);
-                float mag = ClampF(sqrtf(gx*gx + gy*gy) * scale, 0.0f, 1.0f);
+                float mag = BE::Clamp(BE::Sqrt(gx*gx + gy*gy) * scale, 0.0f, 1.0f);
                 uint8_t r5 = static_cast<uint8_t>(mag * 31.0f);
                 uint8_t g6 = static_cast<uint8_t>(mag * 63.0f);
                 scratch[idx] = PackRGB565(r5, g6, r5);
@@ -578,7 +581,8 @@ static void ApplyColorAdjust(uint16_t* fb, uint16_t* scratch,
 static void ApplySingleShader(uint16_t* fb, uint16_t* scratch,
                                uint16_t w, uint16_t h,
                                const ShaderSlot& slot,
-                               float elapsedTimeS) {
+                               float elapsedTimeS,
+                               const SceneState* scene) {
     switch (slot.shaderClass) {
         case PGL_SHADER_CONVOLUTION:
             ApplyConvolution(fb, scratch, w, h, slot.intensity, slot.params, elapsedTimeS);
@@ -589,6 +593,62 @@ static void ApplySingleShader(uint16_t* fb, uint16_t* scratch,
         case PGL_SHADER_COLOR_ADJUST:
             ApplyColorAdjust(fb, scratch, w, h, slot.intensity, slot.params);
             break;
+        case PGL_SHADER_PROGRAM: {
+            // ── Programmable bytecode shader execution ──────────────────
+            if (slot.programId >= PGL_MAX_SHADER_PROGRAMS) break;
+            const ShaderProgram& prog = scene->shaderPrograms[slot.programId];
+            if (!prog.active) break;
+
+            // Copy framebuffer to scratch if the shader reads from it (TEX2D)
+            if (prog.flags & PSB_FLAG_NEEDS_SCRATCH_COPY) {
+                std::memcpy(scratch, fb, static_cast<uint32_t>(w) * h * 2);
+            }
+
+            // Prepare a mutable copy of the program's uniform table so we can
+            // inject auto-bound values (u_resolution, u_time) without modifying
+            // the persistent program state.
+            ShaderProgram progCopy;
+            std::memcpy(&progCopy, &prog, sizeof(ShaderProgram));
+            progCopy.uniforms[PSB_AUTO_UNIFORM_RESOLUTION_X] = static_cast<float>(w);
+            progCopy.uniforms[PSB_AUTO_UNIFORM_RESOLUTION_Y] = static_cast<float>(h);
+            progCopy.uniforms[PSB_AUTO_UNIFORM_TIME]         = elapsedTimeS;
+
+            // The VM reads from scratch (snapshot) and writes to fb (output)
+            const uint16_t* readBuf = (prog.flags & PSB_FLAG_NEEDS_SCRATCH_COPY)
+                                        ? scratch : fb;
+
+            PglShaderVM vm;
+            const float intensity = slot.intensity;
+
+            for (uint16_t y = 0; y < h; ++y) {
+                for (uint16_t x = 0; x < w; ++x) {
+                    uint32_t idx = y * w + x;
+                    uint16_t pixel = readBuf[idx];
+                    float inR = static_cast<float>(R5(pixel)) / 31.0f;
+                    float inG = static_cast<float>(G6(pixel)) / 63.0f;
+                    float inB = static_cast<float>(B5(pixel)) / 31.0f;
+
+                    float outR, outG, outB;
+                    vm.Execute(progCopy, static_cast<float>(x), static_cast<float>(y),
+                               inR, inG, inB,
+                               readBuf, w, h,
+                               outR, outG, outB);
+
+                    // Intensity blending: mix(original, shader output, intensity)
+                    if (intensity < 1.0f) {
+                        outR = inR + (outR - inR) * intensity;
+                        outG = inG + (outG - inG) * intensity;
+                        outB = inB + (outB - inB) * intensity;
+                    }
+
+                    fb[idx] = PackRGB565(
+                        Clamp5(static_cast<int>(outR * 31.0f + 0.5f)),
+                        Clamp6(static_cast<int>(outG * 63.0f + 0.5f)),
+                        Clamp5(static_cast<int>(outB * 31.0f + 0.5f)));
+                }
+            }
+            break;
+        }
         default:
             break;
     }
@@ -608,7 +668,7 @@ void ScreenspaceShaders::ApplyShaders(uint16_t* framebuffer,
             if (!slot.active) continue;
 
             ApplySingleShader(framebuffer, scratchBuffer, width, height,
-                              slot, elapsedTimeS);
+                              slot, elapsedTimeS, scene);
         }
     }
 }

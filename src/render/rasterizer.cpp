@@ -1029,3 +1029,128 @@ void Rasterizer::RasterizeRange(uint16_t* framebuffer,
         }
     }
 }
+
+
+// ─── RasterizeTile (both cores, tile-parallel) ─────────────────────────────
+//
+// Tile-based rasterisation: query the QuadTree ONCE for the entire 16×16 tile,
+// cache the candidate list, then iterate all 256 pixels testing only those
+// cached candidates.  This amortises the QuadTree traversal cost across 256
+// pixels instead of doing it per-pixel (as in RasterizeRange).
+//
+// Memory footprint per tile:
+//   FB:   16×16×2 = 512 bytes   (fits in L1)
+//   ZBuf: 16×16×4 = 1024 bytes  (fits in L1)
+//   Candidates: up to 128 handles × 2 = 256 bytes
+//   Total: ~1.8 KB per tile — well within Cortex-M33 L1/TCM.
+//
+// The framebuffer and zBuffer pointers are full-panel-sized; we only write
+// to the tile's sub-region [px0..px0+tileW) × [py0..py0+tileH).
+
+void Rasterizer::RasterizeTile(uint16_t* framebuffer, float* zBuf,
+                                uint16_t tileX, uint16_t tileY,
+                                uint16_t tileW, uint16_t tileH) {
+    // Convert tile coords to pixel coords
+    const uint16_t px0 = tileX * tileW;
+    const uint16_t py0 = tileY * tileH;
+    const uint16_t px1 = (px0 + tileW < width)  ? (px0 + tileW) : width;
+    const uint16_t py1 = (py0 + tileH < height) ? (py0 + tileH) : height;
+
+    // Early out: no triangles this frame — clear tile to black
+    if (trianglePoolUsed == 0) {
+        for (uint16_t y = py0; y < py1; ++y) {
+            uint32_t rowStart = static_cast<uint32_t>(y) * width;
+            std::memset(&framebuffer[rowStart + px0], 0,
+                        (px1 - px0) * sizeof(uint16_t));
+        }
+        return;
+    }
+
+    // ── Step 1: Query QuadTree for the entire tile AABB ──────────────
+    // This is the key optimisation — one traversal for 256 pixels.
+    static constexpr uint16_t MAX_QUERY_RESULTS = 128;
+    TriHandle candidates[MAX_QUERY_RESULTS];
+
+    uint16_t hitCount = quadTree.Query(
+        static_cast<float>(px0),
+        static_cast<float>(py0),
+        static_cast<float>(px1),
+        static_cast<float>(py1),
+        candidates, MAX_QUERY_RESULTS);
+
+    // ── Step 2: If no candidates, clear tile to black ────────────────
+    if (hitCount == 0) {
+        for (uint16_t y = py0; y < py1; ++y) {
+            uint32_t rowStart = static_cast<uint32_t>(y) * width;
+            std::memset(&framebuffer[rowStart + px0], 0,
+                        (px1 - px0) * sizeof(uint16_t));
+        }
+        return;
+    }
+
+    // ── Step 3: Rasterize pixels, testing only the cached candidates ─
+    for (uint16_t y = py0; y < py1; ++y) {
+        uint32_t rowStart = static_cast<uint32_t>(y) * width;
+        float fy = static_cast<float>(y) + 0.5f;  // pixel centre
+
+        for (uint16_t x = px0; x < px1; ++x) {
+            float fx = static_cast<float>(x) + 0.5f;  // pixel centre
+
+            uint32_t pixelIdx = rowStart + x;
+            float    bestZ = zBuf[pixelIdx];
+            uint16_t bestColor = 0x0000;
+            bool     hit = false;
+
+            for (uint16_t h = 0; h < hitCount; ++h) {
+                TriHandle handle = candidates[h];
+                if (handle >= trianglePoolUsed) continue;
+
+                const Triangle2D& tri = trianglePool[handle];
+
+                // Barycentric test
+                float u, v, w;
+                if (!tri.Barycentric(fx, fy, u, v, w)) continue;
+
+                // Interpolate depth
+                float z = tri.InterpolateZ(u, v, w);
+                if (z >= bestZ) continue;  // behind existing pixel
+
+                // Material lookup
+                const DrawCall& dc = scene->drawList[tri.drawCallIndex];
+                uint16_t matId = dc.materialId;
+                if (matId >= GpuConfig::MAX_MATERIALS) continue;
+
+                const MaterialSlot& mat = scene->materials[matId];
+                if (!mat.active) {
+                    bestZ = z;
+                    bestColor = 0xFFFF;  // no material → solid white
+                    hit = true;
+                    continue;
+                }
+
+                // Interpolate UV
+                PglVec2 uv = {0.0f, 0.0f};
+                if (tri.hasUV) {
+                    uv = tri.InterpolateUV(u, v, w);
+                }
+
+                // Evaluate material
+                PglVec3 intersectionPoint = {fx, fy, z};
+                PglVec3 normal = tri.faceNormal;
+
+                bestColor = EvaluateMaterial(mat, intersectionPoint, normal, uv,
+                                             scene, elapsedTimeS, 0);
+                bestZ = z;
+                hit = true;
+            }
+
+            // Write pixel
+            if (hit) {
+                framebuffer[pixelIdx] = bestColor;
+                zBuf[pixelIdx] = bestZ;
+            } else {
+                framebuffer[pixelIdx] = 0x0000;
+            }
+        }
+    }
+}

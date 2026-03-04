@@ -13,8 +13,11 @@
 
 #include <cstdint>
 
-// Forward declaration
+// Forward declarations
 struct SceneState;
+class OpiPsramDriver;
+class QspiPsramDriver;
+class MemTierManager;
 
 namespace CommandParser {
 
@@ -27,6 +30,32 @@ enum class ParseResult : uint8_t {
     UnknownOpcode   = 4,  // Encountered unrecognized opcode (non-fatal, skipped)
     ResourceFull    = 5,  // Mesh/material table full, create command rejected
 };
+
+/**
+ * @brief Initialize the memory subsystem pointers used by memory opcodes.
+ *
+ * Must be called after memory drivers are initialized, before any frames
+ * containing memory commands (0x30–0x3F) are parsed.
+ *
+ * @param opi    PIO2 external memory driver (may be nullptr if not present).
+ * @param qspi   QMI CS1 driver (may be nullptr if not present).
+ * @param tier   Tiered memory manager.
+ * @param frontBuf  Pointer to the front (display) framebuffer.
+ * @param backBuf   Pointer to the back (render) framebuffer.
+ * @param fbPixels  Number of pixels per framebuffer.
+ */
+void InitMemory(OpiPsramDriver* opi, QspiPsramDriver* qspi,
+                MemTierManager* tier,
+                const uint16_t* frontBuf, const uint16_t* backBuf,
+                uint32_t fbPixels);
+
+/**
+ * @brief Update the framebuffer pointers after a swap.
+ *
+ * Called by gpu_core.cpp each frame after the buffer swap so that
+ * CMD_FRAMEBUFFER_CAPTURE captures the correct buffer.
+ */
+void UpdateFramebufferPtrs(const uint16_t* frontBuf, const uint16_t* backBuf);
 
 /**
  * @brief Parse a complete ProtoGL frame and update the scene state.

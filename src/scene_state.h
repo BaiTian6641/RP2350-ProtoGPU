@@ -23,6 +23,7 @@
 #include <cstring>
 
 #include <PglTypes.h>
+#include <PglShaderBytecode.h>
 #include "gpu_config.h"
 
 // ─── Typed Bump Pool ────────────────────────────────────────────────────────
@@ -106,6 +107,25 @@ struct ShaderSlot {
     uint8_t shaderClass = 0;     // PglShaderClass
     float   intensity   = 0.0f;
     uint8_t params[20]  = {};    // class-specific, copied from PglCmdSetShader::params
+    uint16_t programId  = 0;     // For PGL_SHADER_PROGRAM: index into shaderPrograms[]
+};
+
+// ─── Programmable Shader Program Storage ────────────────────────────────────
+// Each loaded program holds its bytecode, constants, and current uniform values.
+// Per-program SRAM: ~1.3 KB.  PGL_MAX_SHADER_PROGRAMS programs = ~21 KB.
+
+struct ShaderProgram {
+    bool     active          = false;
+    uint16_t programId       = 0;
+    uint8_t  uniformCount    = 0;
+    uint8_t  constCount      = 0;
+    uint16_t instrCount      = 0;
+    uint8_t  flags           = 0;
+    float    uniforms[PSB_MAX_UNIFORMS]      = {};   // Current uniform values (64 bytes)
+    float    constants[PSB_MAX_CONSTANTS]     = {};   // Embedded constants (128 bytes)
+    uint32_t instructions[PSB_MAX_INSTRUCTIONS] = {}; // Bytecode (1024 bytes)
+    uint32_t uniformNameHashes[PSB_MAX_UNIFORMS] = {};// For name-based uniform lookup
+    uint8_t  uniformTypes[PSB_MAX_UNIFORMS]  = {};    // Component counts per uniform
 };
 
 struct CameraSlot {
@@ -149,6 +169,9 @@ struct SceneState {
     DrawCall        drawList   [GpuConfig::MAX_DRAW_CALLS];
     uint16_t        drawCallCount = 0;
 
+    // ── Programmable shader programs ────────────────────────────────────────
+    ShaderProgram   shaderPrograms[PGL_MAX_SHADER_PROGRAMS];
+
     // ── Frame info ──────────────────────────────────────────────────────────
     uint32_t frameNumber = 0;
     uint32_t frameTimeUs = 0;
@@ -185,6 +208,7 @@ struct SceneState {
         std::memset(pixelLayouts, 0, sizeof(pixelLayouts));
         std::memset(cameras,      0, sizeof(cameras));
         std::memset(drawList,     0, sizeof(drawList));
+        std::memset(shaderPrograms, 0, sizeof(shaderPrograms));
         drawCallCount = 0;
         frameNumber   = 0;
         frameTimeUs   = 0;
