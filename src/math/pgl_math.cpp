@@ -100,6 +100,51 @@ PglQuat QuatNormalize(const PglQuat& q) {
     return { q.w * inv, q.x * inv, q.y * inv, q.z * inv };
 }
 
+PglQuat QuatSlerp(const PglQuat& a, const PglQuat& b, float t) {
+    // Compute 4D dot product
+    float dot = a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z;
+
+    // Handle double-cover: if dot < 0, negate one quaternion
+    PglQuat b2 = b;
+    if (dot < 0.0f) {
+        dot = -dot;
+        b2 = { -b.w, -b.x, -b.y, -b.z };
+    }
+
+    // Clamp to avoid acos domain errors from float imprecision
+    if (dot > 1.0f) dot = 1.0f;
+
+    float angle = acosf(dot);
+    float sinAngle = sinf(angle);
+
+    // If angle is very small, fall back to normalized lerp
+    if (sinAngle < 1e-6f) {
+        return QuatNormalize({
+            a.w + (b2.w - a.w) * t,
+            a.x + (b2.x - a.x) * t,
+            a.y + (b2.y - a.y) * t,
+            a.z + (b2.z - a.z) * t
+        });
+    }
+
+    float invSin = 1.0f / sinAngle;
+    float wa = sinf((1.0f - t) * angle) * invSin;
+    float wb = sinf(t * angle) * invSin;
+
+    return {
+        wa * a.w + wb * b2.w,
+        wa * a.x + wb * b2.x,
+        wa * a.y + wb * b2.y,
+        wa * a.z + wb * b2.z
+    };
+}
+
+bool QuatIsClose(const PglQuat& a, const PglQuat& b, float epsilon) {
+    // 4D dot product — accounts for double-cover (q ≡ -q)
+    float dot = a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z;
+    return fabsf(dot) > (1.0f - epsilon);
+}
+
 // ─── Rotation Matrix ────────────────────────────────────────────────────────
 
 Mat3 QuatToMat3(const PglQuat& q) {

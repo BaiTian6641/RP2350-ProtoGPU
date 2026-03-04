@@ -101,6 +101,13 @@ struct PixelLayoutSlot {
     PglVec2*          coords   = nullptr;     // → SceneState::layoutCoordPool
 };
 
+struct ShaderSlot {
+    bool    active      = false;
+    uint8_t shaderClass = 0;     // PglShaderClass
+    float   intensity   = 0.0f;
+    uint8_t params[20]  = {};    // class-specific, copied from PglCmdSetShader::params
+};
+
 struct CameraSlot {
     bool    active   = false;
     uint8_t layoutId = 0;
@@ -111,6 +118,9 @@ struct CameraSlot {
     PglQuat lookOffset    = {};
     PglQuat baseRotation  = {};
     bool    is2D          = false;
+
+    // Screen-space post-processing shaders (applied in slot order after rasterization)
+    ShaderSlot shaders[PGL_MAX_SHADERS_PER_CAMERA];
 };
 
 struct DrawCall {

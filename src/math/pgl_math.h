@@ -42,6 +42,15 @@ PglQuat QuatConjugate(const PglQuat& q);
 PglVec3 QuatRotate(const PglQuat& q, const PglVec3& v);
 PglQuat QuatNormalize(const PglQuat& q);
 
+/// Spherical linear interpolation between two quaternions.
+/// Handles double-cover (negates b if dot < 0). Falls back to Lerp+normalize
+/// when the angle is very small to avoid division by near-zero sin.
+PglQuat QuatSlerp(const PglQuat& a, const PglQuat& b, float t);
+
+/// Returns true if two quaternions represent approximately the same rotation.
+/// Accounts for quaternion double-cover (q and -q are the same rotation).
+bool QuatIsClose(const PglQuat& a, const PglQuat& b, float epsilon = 0.001f);
+
 // ─── 3×3 Rotation Matrix (computed from quaternion) ─────────────────────────
 
 struct Mat3 {

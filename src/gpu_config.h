@@ -96,4 +96,51 @@ static constexpr uint8_t  QUADTREE_MAX_DEPTH    = 8;
 static constexpr uint8_t  QUADTREE_MAX_ENTITIES = 16;
 static constexpr uint16_t QUADTREE_MAX_NODES    = 4096;
 
+// ─── External Memory: OPI PSRAM via PIO2 (Tier 1 — indirect, DMA cached) ───
+// PIO2 is the last free PIO block (PIO0 = HUB75, PIO1 = Octal SPI RX).
+// OPI PSRAM provides high-bandwidth bulk storage for textures, large meshes,
+// and material data that don't fit in SRAM.  All access is through explicit
+// DMA reads/writes — the CPU cannot dereference OPI PSRAM as memory.
+// Set OPI_PSRAM_ENABLED = false if no OPI PSRAM is populated.
+
+static constexpr bool     OPI_PSRAM_ENABLED       = false;  // Enable when hardware is present
+static constexpr uint8_t  OPI_PSRAM_DATA_BASE_PIN = 34;     // DQ0 = GPIO34 .. DQ7 = GPIO41
+static constexpr uint8_t  OPI_PSRAM_DATA_PIN_COUNT = 8;
+static constexpr uint8_t  OPI_PSRAM_CLK_PIN       = 12;     // PSRAM CLK
+static constexpr uint8_t  OPI_PSRAM_CS_PIN        = 11;     // PSRAM CS# (active low)
+static constexpr uint32_t OPI_PSRAM_CLOCK_MHZ     = 75;     // PIO clock target (75–150 MHz)
+static constexpr uint32_t OPI_PSRAM_CAPACITY      = 8 * 1024 * 1024;  // 8 MB (APS6408L)
+static constexpr uint8_t  OPI_PSRAM_READ_LATENCY  = 5;      // Wait cycles after address
+
+// ─── External Memory: QSPI PSRAM via QMI CS1 (Tier 2 — XIP mapped) ─────────
+// Uses the RP2350's built-in QMI controller on CS1.  Memory-mapped with
+// hardware XIP cache (4 KB, 2-way set associative).  Transparent to the CPU:
+// any pointer into 0x11000000–0x11FFFFFF reads/writes PSRAM automatically.
+// Ideal for frequently-accessed, non-pipeline-critical data (lookup tables,
+// font atlases, inactive meshes, animation keyframes).
+// Set QSPI_PSRAM_ENABLED = false if no QSPI PSRAM is populated on CS1.
+
+static constexpr bool     QSPI_PSRAM_ENABLED      = false;  // Enable when hardware is present
+static constexpr uint32_t QSPI_PSRAM_CAPACITY     = 8 * 1024 * 1024;  // 8 MB
+static constexpr uint32_t QSPI_PSRAM_CLOCK_MHZ    = 75;     // QMI clock (75–133 MHz)
+static constexpr uintptr_t QSPI_PSRAM_XIP_BASE    = 0x11000000;  // Fixed by RP2350 hardware
+static constexpr uint8_t  QSPI_PSRAM_READ_LATENCY = 5;      // Dummy cycles for QPI read
+static constexpr bool     QSPI_PSRAM_DDR          = false;   // True for DDR mode (2× bandwidth)
+
+// ─── Memory Tiering ─────────────────────────────────────────────────────────
+// The tiered memory manager (memory/mem_tier.h) places resources across the
+// three tiers based on two metrics:
+//   weight — rendering pipeline impact (higher = more critical)
+//   score  — per-frame access frequency (higher = more accessed)
+//
+// SRAM cache budget: portion of SRAM reserved for caching OPI PSRAM data.
+// This is separate from framebuffers, Z-buffer, QuadTree, and pool allocators.
+// Only used when OPI_PSRAM_ENABLED = true.
+
+static constexpr uint32_t MEM_TIER_SRAM_CACHE_BUDGET = 64 * 1024;  // 64 KB cache arena
+static constexpr uint32_t MEM_TIER_CACHE_LINE_SIZE   = 4096;       // 4 KB per cache line
+static constexpr uint8_t  MEM_TIER_ALPHA_WEIGHT      = 3;          // weight coefficient
+static constexpr uint8_t  MEM_TIER_BETA_SCORE        = 1;          // score coefficient
+static constexpr uint8_t  MEM_TIER_DEMOTION_FRAMES   = 30;         // ~0.5s at 60 FPS
+
 }  // namespace GpuConfig

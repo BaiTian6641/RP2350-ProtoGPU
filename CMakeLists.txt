@@ -26,6 +26,7 @@ add_executable(protogl_gpu
     src/render/rasterizer.cpp
     src/render/quadtree.cpp
     src/render/triangle2d.cpp
+    src/render/screenspace_effects.cpp
 )
 
 target_include_directories(protogl_gpu PRIVATE
@@ -37,6 +38,7 @@ target_include_directories(protogl_gpu PRIVATE
 target_link_libraries(protogl_gpu
     pico_stdlib
     pico_multicore
+    pico_i2c_slave
     hardware_pio
     hardware_dma
     hardware_i2c

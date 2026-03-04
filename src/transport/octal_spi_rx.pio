@@ -5,56 +5,103 @@
 ; when chip select (CS) is asserted low. Each sample produces one byte in
 ; the RX FIFO, which DMA drains into a ring buffer.
 ;
-; Pin mapping (configured in octal_spi_rx_program_init):
+; Pin mapping (configured via the C init function below):
 ;   IN pins:  D0-D7  (8 consecutive GPIO, starting at SPI_DATA_BASE_PIN)
 ;   JMP pin:  CS     (active low — sample only when CS=0)
-;   Wait pin: CLK    (sample on rising edge)
 ;
-; TODO(M1/Week 4): Implement and test. This stub defines the program structure.
+; The CLK pin is sampled via WAIT GPIO to detect rising edges.
+; Since CLK could be 40–80 MHz and PIO runs at 150 MHz, each CLK cycle
+; gives us only ~2 PIO instructions.  The program is minimal (3 instructions
+; in the fast path) to keep up.
+;
+; Autopush is enabled at 8 bits to minimize instruction count in the
+; sampling loop (no explicit PUSH needed).
 
 .program octal_spi_rx
 
-; Wait for CS low, then sample D0-D7 on each rising edge of CLK.
-; Push one byte (8 bits) to RX FIFO per clock cycle.
+; ────────────────────────────────────────────────────────────────────
+; Fast path: CS-gated, CLK-edge-triggered 8-bit parallel sampling.
+;
+; When CS is high (inactive): spin in wait_cs.
+; When CS goes low: enter the fast sampling loop.
+; Each CLK rising edge: sample D0-D7 → autopush to RX FIFO.
+; When CS goes high mid-transfer: return to idle.
+;
+; With autopush at 8 bits, the ISR automatically pushes every sample.
+; This removes the need for an explicit PUSH, keeping the loop at
+; 3 instructions (wait low → wait high → IN).
+; ────────────────────────────────────────────────────────────────────
 
 .wrap_target
 wait_cs:
-    jmp pin, wait_cs        ; if CS high, loop (CS is JMP pin, active low inverted)
+    jmp pin, wait_cs        ; CS is JMP pin: if CS=1 (inactive), stay here
 
-wait_clk_low:
-    wait 0 gpio 8           ; wait for CLK low  (GPIO 8 = CLK, hardcoded for now)
+    ; CS is now low — enter sampling mode
+sample_loop:
+    wait 0 pin 8            ; wait for CLK low  (pin offset 8 from IN base = CLK)
+    wait 1 pin 8            ; wait for CLK high (rising edge detected)
+    in pins, 8              ; sample D0-D7 into ISR → autopush at 8 bits
 
-wait_clk_high:
-    wait 1 gpio 8           ; wait for CLK high (rising edge)
-    in pins, 8              ; sample D0-D7 into ISR (8 bits)
-    push noblock            ; push ISR to RX FIFO, reset ISR
-                            ; (noblock: if FIFO full, drop — DMA should keep up)
-
-    jmp pin, wait_cs        ; if CS went high during transfer, go back to idle
-    jmp wait_clk_low        ; otherwise, wait for next falling CLK edge
+    jmp pin, wait_cs        ; if CS went high, return to idle
+    jmp sample_loop         ; otherwise continue sampling
 .wrap
 
 
-; Helper: C init function prototype (implemented in octal_spi_rx.cpp)
-;
-; static inline void octal_spi_rx_program_init(PIO pio, uint sm, uint offset,
-;                                               uint data_base_pin,
-;                                               uint clk_pin, uint cs_pin) {
-;     pio_sm_config c = octal_spi_rx_program_get_default_config(offset);
-;     sm_config_set_in_pins(&c, data_base_pin);       // IN base = D0
-;     sm_config_set_jmp_pin(&c, cs_pin);              // JMP pin = CS
-;     sm_config_set_in_shift(&c, false, true, 8);     // shift left, autopush at 8 bits
-;     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);  // Join FIFOs for deeper RX
-;
-;     // Configure pin directions (all inputs)
-;     for (uint i = 0; i < 8; i++) {
-;         pio_gpio_init(pio, data_base_pin + i);
-;     }
-;     pio_gpio_init(pio, clk_pin);
-;     pio_gpio_init(pio, cs_pin);
-;     pio_sm_set_consecutive_pindirs(pio, sm, data_base_pin, 8, false);
-;     pio_sm_set_pindirs_with_mask(pio, sm, 0, (1 << clk_pin) | (1 << cs_pin));
-;
-;     pio_sm_init(pio, sm, offset, &c);
-;     pio_sm_set_enabled(pio, sm, true);
-; }
+; ─── C Helper Functions ──────────────────────────────────────────────────────
+
+% c-sdk {
+/**
+ * @brief Initialize the octal_spi_rx PIO program on a state machine.
+ *
+ * @param pio           PIO instance (pio0 or pio1)
+ * @param sm            State machine index
+ * @param offset        Program load offset (from pio_add_program)
+ * @param data_base_pin First data pin (D0). D0-D7 must be consecutive.
+ * @param clk_pin       Clock input pin (must be data_base_pin + 8 for WAIT pin offset)
+ * @param cs_pin        Chip select pin (active low, used as JMP pin)
+ */
+static inline void octal_spi_rx_program_init(PIO pio, uint sm, uint offset,
+                                              uint data_base_pin,
+                                              uint clk_pin, uint cs_pin) {
+    pio_sm_config c = octal_spi_rx_program_get_default_config(offset);
+
+    // IN base = data_base_pin (D0). Pins D0-D7 are sampled by "in pins, 8".
+    // CLK is at pin offset 8 from IN base (data_base_pin + 8) for "wait N pin 8".
+    sm_config_set_in_pins(&c, data_base_pin);
+
+    // JMP pin = CS (active low). "jmp pin" jumps when CS=1 (high = idle).
+    sm_config_set_jmp_pin(&c, cs_pin);
+
+    // IN shift: shift left (MSB first), autopush at 8 bits.
+    // Autopush eliminates the need for explicit PUSH in the PIO program.
+    sm_config_set_in_shift(&c, false, true, 8);
+
+    // Join FIFOs for deeper RX (8-entry FIFO instead of 4)
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    // Run PIO at full system clock (150 MHz) for maximum sampling speed.
+    // At 80 MHz SPI clock: 150/80 ≈ 1.875 PIO cycles per SPI cycle.
+    // The 3-instruction fast path (wait low + wait high + IN) needs ~2 cycles
+    // of margin from the WAIT instructions self-syncing to the external clock.
+    sm_config_set_clkdiv(&c, 1.0f);
+
+    // Configure GPIO pin functions for PIO
+    for (uint i = 0; i < 8; i++) {
+        pio_gpio_init(pio, data_base_pin + i);
+    }
+    pio_gpio_init(pio, clk_pin);
+    pio_gpio_init(pio, cs_pin);
+
+    // All pins are inputs
+    pio_sm_set_consecutive_pindirs(pio, sm, data_base_pin, 8, false);  // D0-D7 in
+    pio_sm_set_pindirs_with_mask(pio, sm, 0,
+        (1u << clk_pin) | (1u << cs_pin));  // CLK, CS in
+
+    // Initialize the SM at the program entry point
+    pio_sm_init(pio, sm, offset, &c);
+
+    // Start the state machine
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
+

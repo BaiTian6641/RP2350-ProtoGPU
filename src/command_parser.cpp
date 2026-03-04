@@ -35,7 +35,7 @@ static void HandleDestroyTexture(const uint8_t*& ptr, SceneState* scene);
 static void HandleSetPixelLayout(const uint8_t*& ptr, uint16_t payloadLen, SceneState* scene);
 static void HandleDrawObject(const uint8_t*& ptr, uint16_t payloadLen, SceneState* scene);
 static void HandleSetCamera(const uint8_t*& ptr, SceneState* scene);
-static void HandleSetEffect(const uint8_t*& ptr, SceneState* scene);
+static void HandleSetShader(const uint8_t*& ptr, SceneState* scene);
 
 // ─── Main Parser ────────────────────────────────────────────────────────────
 
@@ -123,8 +123,8 @@ CommandParser::ParseResult CommandParser::Parse(
             case PGL_CMD_SET_CAMERA:
                 HandleSetCamera(ptr, scene);
                 break;
-            case PGL_CMD_SET_EFFECT:
-                HandleSetEffect(ptr, scene);
+            case PGL_CMD_SET_SHADER:
+                HandleSetShader(ptr, scene);
                 break;
             default:
                 // Unknown opcode — skip payload, log warning
@@ -509,9 +509,18 @@ static void HandleSetCamera(const uint8_t*& ptr, SceneState* scene) {
     cam.is2D        = cmd.is2D != 0;
 }
 
-static void HandleSetEffect(const uint8_t*& ptr, SceneState* scene) {
-    PglCmdSetEffect cmd;
+static void HandleSetShader(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdSetShader cmd;
     PglReadStruct(ptr, cmd);
-    // TODO(M6): Store effect state for screen-space post-processing
-    (void)scene;
+
+    if (cmd.cameraId >= PGL_MAX_CAMERAS) return;
+    CameraSlot& cam = scene->cameras[cmd.cameraId];
+    if (!cam.active) return;
+    if (cmd.shaderSlot >= PGL_MAX_SHADERS_PER_CAMERA) return;
+
+    ShaderSlot& slot = cam.shaders[cmd.shaderSlot];
+    slot.active      = (cmd.shaderClass != PGL_SHADER_NONE);
+    slot.shaderClass = cmd.shaderClass;
+    slot.intensity   = cmd.intensity;
+    std::memcpy(slot.params, cmd.params, sizeof(slot.params));
 }

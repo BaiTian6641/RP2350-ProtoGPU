@@ -6,7 +6,7 @@
  *   M0-M1: Skeleton compiles, PrepareFrame/RasterizeRange are stubs.
  *   M3:    Fill in vertex transform, perspective project, QuadTree build.
  *   M4:    Fill in per-pixel rasterization (barycentric, Z-test, shading).
- *   M5:    Material evaluation, blending, screen-space effects.
+ *   M5:    Material evaluation, blending, screen-space shaders.
  */
 
 #include "rasterizer.h"
@@ -38,7 +38,7 @@ void Rasterizer::Initialize(SceneState* scene, float* zBuffer,
 //   3. Project to 2D (perspective or ortho)
 //   4. Build Triangle2D list and insert into QuadTree
 //
-// TODO(M3): Implement the full pipeline.  For now, just count triangles.
+// TODO(M4): Implement the full pipeline.  For now, just count triangles.
 
 void Rasterizer::PrepareFrame(SceneState* scene) {
     this->scene = scene;
@@ -50,7 +50,7 @@ void Rasterizer::PrepareFrame(SceneState* scene) {
         zBuffer[i] = 1e30f;  // far plane
     }
 
-    // TODO(M3): Iterate draw calls, transform, project, build QuadTree
+    // TODO(M4): Iterate draw calls, transform, project, build QuadTree
     for (uint16_t d = 0; d < scene->drawCallCount; ++d) {
         const DrawCall& dc = scene->drawList[d];
         if (!dc.enabled) continue;
@@ -62,8 +62,8 @@ void Rasterizer::PrepareFrame(SceneState* scene) {
         // Count triangles even though we don't rasterize yet
         projectedTriCount += mesh.triangleCount;
 
-        // TODO(M3): For each vertex, TransformVertex() then Project()
-        // TODO(M3): For each triangle, create Triangle2D, insert into QuadTree
+        // TODO(M4): For each vertex, TransformVertex() then Project()
+        // TODO(M4): For each triangle, create Triangle2D, insert into QuadTree
     }
 
     if (projectedTriCount > 0) {
