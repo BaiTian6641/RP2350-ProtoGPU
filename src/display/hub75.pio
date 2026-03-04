@@ -1,0 +1,39 @@
+; ─── hub75.pio ────────────────────────────────────────────────────────────────
+; PIO program for HUB75 LED matrix panel driving on RP2350.
+;
+; This PIO program shifts out RGB pixel data (R1,G1,B1,R2,G2,B2) for one
+; row pair, clocking each pixel with HUB75_CLK. After a full row is shifted:
+;   1. Assert LAT (latch) to transfer shift register to output
+;   2. Assert OE  (output enable, active low) for the BCM bit weight duration
+;   3. Update row address (A-E)
+;
+; The DMA feeds 32-bit words from the BCM plane buffer. Each word contains
+; packed pixel data for multiple clock cycles.
+;
+; TODO(M1/Week 3): Implement the full PIO program.
+;                  This stub defines the program structure and pin mappings.
+;
+; Pin mapping (configured in hub75_program_init):
+;   OUT pins:  R1, G1, B1, R2, G2, B2  (6 consecutive pins)
+;   SET pins:  CLK, LAT, OE            (3 consecutive pins)
+;   Side-set:  CLK (optional, for single-cycle clock toggle)
+
+.program hub75_data
+.side_set 1
+
+; Shift out one pixel (6 bits: R1G1B1R2G2B2) and toggle CLK
+;   autopull threshold = 32 (DMA feeds 32-bit words)
+;   OUT shifts 6 bits at a time
+
+.wrap_target
+    out pins, 6     side 0  ; output 6-bit pixel data, CLK low
+    nop             side 1  ; CLK high — panel latches data on rising edge
+.wrap
+
+; Row latch + address program (could be a second SM or inline)
+; TODO(M1/Week 3): Implement row latch and BCM timing sequence
+
+.program hub75_row
+    ; Placeholder — will handle LAT pulse, OE timing, address update
+    ; Triggered by IRQ from hub75_data SM after a full row is shifted
+    nop

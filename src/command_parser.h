@@ -1,0 +1,49 @@
+/**
+ * @file command_parser.h
+ * @brief ProtoGL command buffer parser for the RP2350 GPU.
+ *
+ * Deserializes a ProtoGL frame (sync word → commands → CRC) received via
+ * Octal SPI and updates the GPU's local SceneState (resource tables, draw list).
+ *
+ * Uses PglParser.h for alignment-safe reads — safe on both ARM Cortex-M33
+ * (which supports unaligned access) and RISC-V Hazard3 (which may not).
+ */
+
+#pragma once
+
+#include <cstdint>
+
+// Forward declaration
+struct SceneState;
+
+namespace CommandParser {
+
+/// Parse result codes
+enum class ParseResult : uint8_t {
+    Ok              = 0,  // Frame parsed successfully
+    CrcError        = 1,  // CRC-16 mismatch
+    InvalidSync     = 2,  // Missing or wrong sync word
+    TruncatedFrame  = 3,  // totalLength exceeds available data
+    UnknownOpcode   = 4,  // Encountered unrecognized opcode (non-fatal, skipped)
+    ResourceFull    = 5,  // Mesh/material table full, create command rejected
+};
+
+/**
+ * @brief Parse a complete ProtoGL frame and update the scene state.
+ *
+ * Steps:
+ *  1. Validate sync word (0x55AA)
+ *  2. Read frame header (frameNumber, totalLength, commandCount)
+ *  3. Validate CRC-16 over entire frame
+ *  4. Iterate commands: switch on opcode → dispatch to handler
+ *  5. Return result
+ *
+ * @param frameData   Pointer to the start of the frame (sync word).
+ * @param frameLength Total frame length (from frame header's totalLength).
+ * @param scene       Scene state to update with parsed commands.
+ * @return ParseResult::Ok on success.
+ */
+ParseResult Parse(const uint8_t* frameData, uint32_t frameLength,
+                  SceneState* scene);
+
+}  // namespace CommandParser

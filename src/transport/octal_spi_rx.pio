@@ -1,0 +1,60 @@
+; ─── octal_spi_rx.pio ─────────────────────────────────────────────────────────
+; PIO program for 8-bit parallel (Octal SPI) receiver on RP2350.
+;
+; Samples 8 GPIO pins (D0-D7) on the rising edge of an external clock (CLK)
+; when chip select (CS) is asserted low. Each sample produces one byte in
+; the RX FIFO, which DMA drains into a ring buffer.
+;
+; Pin mapping (configured in octal_spi_rx_program_init):
+;   IN pins:  D0-D7  (8 consecutive GPIO, starting at SPI_DATA_BASE_PIN)
+;   JMP pin:  CS     (active low — sample only when CS=0)
+;   Wait pin: CLK    (sample on rising edge)
+;
+; TODO(M1/Week 4): Implement and test. This stub defines the program structure.
+
+.program octal_spi_rx
+
+; Wait for CS low, then sample D0-D7 on each rising edge of CLK.
+; Push one byte (8 bits) to RX FIFO per clock cycle.
+
+.wrap_target
+wait_cs:
+    jmp pin, wait_cs        ; if CS high, loop (CS is JMP pin, active low inverted)
+
+wait_clk_low:
+    wait 0 gpio 8           ; wait for CLK low  (GPIO 8 = CLK, hardcoded for now)
+
+wait_clk_high:
+    wait 1 gpio 8           ; wait for CLK high (rising edge)
+    in pins, 8              ; sample D0-D7 into ISR (8 bits)
+    push noblock            ; push ISR to RX FIFO, reset ISR
+                            ; (noblock: if FIFO full, drop — DMA should keep up)
+
+    jmp pin, wait_cs        ; if CS went high during transfer, go back to idle
+    jmp wait_clk_low        ; otherwise, wait for next falling CLK edge
+.wrap
+
+
+; Helper: C init function prototype (implemented in octal_spi_rx.cpp)
+;
+; static inline void octal_spi_rx_program_init(PIO pio, uint sm, uint offset,
+;                                               uint data_base_pin,
+;                                               uint clk_pin, uint cs_pin) {
+;     pio_sm_config c = octal_spi_rx_program_get_default_config(offset);
+;     sm_config_set_in_pins(&c, data_base_pin);       // IN base = D0
+;     sm_config_set_jmp_pin(&c, cs_pin);              // JMP pin = CS
+;     sm_config_set_in_shift(&c, false, true, 8);     // shift left, autopush at 8 bits
+;     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);  // Join FIFOs for deeper RX
+;
+;     // Configure pin directions (all inputs)
+;     for (uint i = 0; i < 8; i++) {
+;         pio_gpio_init(pio, data_base_pin + i);
+;     }
+;     pio_gpio_init(pio, clk_pin);
+;     pio_gpio_init(pio, cs_pin);
+;     pio_sm_set_consecutive_pindirs(pio, sm, data_base_pin, 8, false);
+;     pio_sm_set_pindirs_with_mask(pio, sm, 0, (1 << clk_pin) | (1 << cs_pin));
+;
+;     pio_sm_init(pio, sm, offset, &c);
+;     pio_sm_set_enabled(pio, sm, true);
+; }
