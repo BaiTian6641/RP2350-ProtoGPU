@@ -26,12 +26,22 @@ struct Triangle2D {
     PglVec2 uv0, uv1, uv2;
     bool    hasUV;
 
+    // Face normal in camera/world space (computed during PrepareFrame).
+    // Used by NormalMaterial and LightMaterial for shading.
+    PglVec3 faceNormal;
+
     // Back-reference to the originating draw call and triangle index
     uint16_t drawCallIndex;
     uint16_t meshTriIndex;
 
     // Pre-computed for barycentric interpolation
     float invDenom;   // 1 / (edgeA cross edgeB)
+
+    // Precomputed edge coefficients — eliminates 4 subtractions per pixel
+    float e10y;   // v1.y - v2.y  (edge1 Δy)
+    float e21x;   // v2.x - v1.x  (edge2 Δx)
+    float e20y;   // v2.y - v0.y  (edge2 Δy)
+    float e02x;   // v0.x - v2.x  (edge0 Δx)
 
     // ── Methods ─────────────────────────────────────────────────────────
 

@@ -35,6 +35,14 @@ public:
     /// Total projected triangles this frame (diagnostic).
     uint32_t GetTriangleCount() const { return projectedTriCount; }
 
+    /// Returns true if the last PrepareFrame() determined the scene is
+    /// identical to the previous frame and rasterization can be skipped.
+    bool IsFrameSkipped() const { return frameSkipped; }
+
+    /// Set the accumulated wall time (seconds) for animated materials.
+    /// Call BEFORE RasterizeRange on each frame.
+    void SetElapsedTime(float t) { elapsedTimeS = t; }
+
 private:
     SceneState* scene    = nullptr;
     float*      zBuffer  = nullptr;
@@ -42,4 +50,13 @@ private:
     uint16_t    height   = 0;
 
     uint32_t    projectedTriCount = 0;
+    bool        frameSkipped      = false;
+    float       elapsedTimeS      = 0.0f;  ///< animated material time
+
+    /// Frame signature: FNV-1a hash of draw list + camera state.
+    /// If identical to the previous frame, rasterization is skipped.
+    uint32_t    prevFrameSignature = 0;
+
+    /// Compute a hash over the current scene state relevant to rendering.
+    uint32_t ComputeFrameSignature(const SceneState* scene) const;
 };

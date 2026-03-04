@@ -164,6 +164,17 @@ struct SceneState {
     // ── Per-frame pool (reset every BeginFrame) ─────────────────────────────
     Pool<PglVec3,   GpuConfig::FRAME_VERTEX_POOL_SIZE> frameVertexPool;
 
+    // ── GPU Memory Access State (for I2C readback) ──────────────────────────
+    PglMemAllocResult lastAllocResult = {};      // Result of last CMD_MEM_ALLOC
+    PglMemTierInfoResponse memTierInfo = {};     // Cached tier stats (updated periodically)
+
+    // Memory read staging buffer for I2C readback (PGL_REG_MEM_READ_DATA).
+    // Filled by CMD_MEM_READ_REQUEST or CMD_FRAMEBUFFER_CAPTURE.
+    static constexpr uint32_t MEM_STAGING_SIZE = PGL_MEM_READ_MAX_SIZE;  // 4096 bytes
+    uint8_t  memStagingBuffer[MEM_STAGING_SIZE] = {};
+    uint32_t memStagingLength  = 0;   // Valid bytes in staging buffer
+    uint32_t memStagingReadPos = 0;   // Current I2C read cursor (auto-increments)
+
     // ── Lifecycle ───────────────────────────────────────────────────────────
 
     /// Full reset — zeroes everything, resets all pools.
@@ -185,6 +196,12 @@ struct SceneState {
         texturePool.Reset();
         layoutCoordPool.Reset();
         frameVertexPool.Reset();
+
+        // Reset memory access state
+        lastAllocResult = {};
+        memTierInfo     = {};
+        memStagingLength  = 0;
+        memStagingReadPos = 0;
     }
 
     /// Per-frame reset — clears draw list and frame pool; persistent resources

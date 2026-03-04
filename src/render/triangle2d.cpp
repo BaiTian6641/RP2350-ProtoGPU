@@ -1,6 +1,14 @@
 /**
  * @file triangle2d.cpp
  * @brief Projected 2D triangle — barycentric, Z-interp, UV-interp.
+ *
+ * Cortex-M33 DSP optimization notes:
+ *   - Barycentric Setup() precomputes edge coefficients to reduce per-pixel work.
+ *   - Barycentric() uses fmaf() (FMA in single cycle on CM33 FPU) to eliminate
+ *     separate multiply + add instructions.
+ *   - InterpolateZ() uses fmaf() for fused multiply-accumulate.
+ *   - These changes are always-on (no compile flag) because fmaf() has zero
+ *     overhead on CM33 vs separate mul+add and reduces rounding error.
  */
 
 #include "triangle2d.h"
@@ -18,8 +26,8 @@ bool Triangle2D::Setup(const PglVec2& a, const PglVec2& b, const PglVec2& c,
 
     // Compute denominator for barycentric coordinates:
     //   denom = (v1.y - v2.y)*(v0.x - v2.x) + (v2.x - v1.x)*(v0.y - v2.y)
-    float denom = (v1.y - v2.y) * (v0.x - v2.x) +
-                  (v2.x - v1.x) * (v0.y - v2.y);
+    float denom = fmaf(v1.y - v2.y, v0.x - v2.x,
+                       (v2.x - v1.x) * (v0.y - v2.y));
 
     if (fabsf(denom) < 1e-6f) {
         invDenom = 0.0f;
@@ -27,30 +35,44 @@ bool Triangle2D::Setup(const PglVec2& a, const PglVec2& b, const PglVec2& c,
     }
 
     invDenom = 1.0f / denom;
+
+    // Precompute edge coefficients for Barycentric() — reduces per-pixel
+    // work from 4 subtracts + 4 multiplies to 2 subtracts + 2 FMAs + 1 subtract.
+    e10y = v1.y - v2.y;  // edge1 delta Y
+    e21x = v2.x - v1.x;  // edge2 delta X
+    e20y = v2.y - v0.y;  // edge2 delta Y
+    e02x = v0.x - v2.x;  // edge0 delta X
+
     return true;
 }
 
 // ─── Barycentric ────────────────────────────────────────────────────────────
+// Uses precomputed edge coefficients and fmaf() for fused multiply-accumulate.
+// On Cortex-M33 FPU, fmaf() is single-cycle and reduces rounding error.
 
 bool Triangle2D::Barycentric(float px, float py,
                              float& u, float& v, float& w) const {
-    u = ((v1.y - v2.y) * (px - v2.x) + (v2.x - v1.x) * (py - v2.y)) * invDenom;
-    v = ((v2.y - v0.y) * (px - v2.x) + (v0.x - v2.x) * (py - v2.y)) * invDenom;
+    float dx = px - v2.x;
+    float dy = py - v2.y;
+
+    u = fmaf(e10y, dx, e21x * dy) * invDenom;
+    v = fmaf(e20y, dx, e02x * dy) * invDenom;
     w = 1.0f - u - v;
 
     return (u >= 0.0f) && (v >= 0.0f) && (w >= 0.0f);
 }
 
 // ─── Interpolation ──────────────────────────────────────────────────────────
+// Uses fmaf() chains for Z and UV interpolation.
 
 float Triangle2D::InterpolateZ(float u, float v, float w) const {
-    return u * z0 + v * z1 + w * z2;
+    return fmaf(u, z0, fmaf(v, z1, w * z2));
 }
 
 PglVec2 Triangle2D::InterpolateUV(float u, float v, float w) const {
     return {
-        u * uv0.x + v * uv1.x + w * uv2.x,
-        u * uv0.y + v * uv1.y + w * uv2.y
+        fmaf(u, uv0.x, fmaf(v, uv1.x, w * uv2.x)),
+        fmaf(u, uv0.y, fmaf(v, uv1.y, w * uv2.y))
     };
 }
 

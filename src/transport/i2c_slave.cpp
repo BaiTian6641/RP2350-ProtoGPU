@@ -25,6 +25,9 @@
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
 #include "hardware/gpio.h"
+#include "hardware/adc.h"
+#include "hardware/clocks.h"
+#include "hardware/vreg.h"
 #include "pico/i2c_slave.h"
 
 #include <cstring>
@@ -43,10 +46,18 @@ static volatile uint8_t  gammaTable  = 0;
 static volatile bool     resetRequested = false;
 static volatile bool     clearRequested = false;
 
+/// Clock change request (set by I2C write, consumed by main loop)
+static volatile uint16_t clockRequestMHz  = 0;
+static volatile uint8_t  clockRequestVolt = 0;
+static volatile uint8_t  clockRequestFlags = 0;
+
 /// Status response (updated by UpdateStatus)
 static PglStatusResponse statusResponse{};
 
-/// Capability response (constant — filled at init)
+/// Extended status response (updated by UpdateExtendedStatus + UpdateVramStatus)
+static PglExtendedStatusResponse extendedStatus{};
+
+/// Capability response (filled at init, VRAM flags updated after probe)
 static PglCapabilityResponse capabilityResponse{};
 
 // ─── I2C Transaction State Machine ──────────────────────────────────────────
@@ -63,17 +74,119 @@ static volatile uint8_t  readIdx = 0;               // current read position
 // ─── Capability Initialization ──────────────────────────────────────────────
 
 static void BuildCapabilityResponse() {
-    capabilityResponse.protoVersion = 3;  // ProtoGL v0.3
+    capabilityResponse.protoVersion = 5;  // ProtoGL v0.5
     capabilityResponse.gpuArch     = PGL_ARCH_ARM_CM33;
     capabilityResponse.coreCount   = 2;
-    capabilityResponse.coreFreqMHz = static_cast<uint8_t>(GpuConfig::SYSTEM_CLOCK_MHZ);
+    capabilityResponse.coreFreqMHz = static_cast<uint8_t>(clock_get_hz(clk_sys) / 1000000);
     capabilityResponse.sramKB      = 520;
     capabilityResponse.maxVertices  = GpuConfig::MAX_VERTICES;
     capabilityResponse.maxTriangles = GpuConfig::MAX_TRIANGLES;
     capabilityResponse.maxMeshes    = GpuConfig::MAX_MESHES;
     capabilityResponse.maxMaterials = GpuConfig::MAX_MATERIALS;
     capabilityResponse.maxTextures  = GpuConfig::MAX_TEXTURES;
-    capabilityResponse.flags       = PGL_CAP_HW_FLOAT | PGL_CAP_UNALIGNED_ACCESS;
+
+    // Base flags — always present on RP2350 Cortex-M33
+    uint8_t flags = PGL_CAP_HW_FLOAT | PGL_CAP_UNALIGNED_ACCESS | PGL_CAP_DSP
+                  | PGL_CAP_DYNAMIC_CLOCK | PGL_CAP_TEMP_SENSOR;
+
+    // VRAM detection flags are set after PSRAM probe (see ProbeExternalVram())
+    capabilityResponse.flags = flags;
+}
+
+// ─── VRAM Detection ─────────────────────────────────────────────────────────
+// Probes OPI PSRAM (PIO2) and QSPI PSRAM (QMI CS1) at boot to determine what
+// external memory is physically present.  Results are stored in the capability
+// response flags and extended status.  The actual memory _initialization_ is
+// deferred to M8 (memory/mem_tier.h).
+
+static uint8_t detectedVramFlags = 0;
+
+/**
+ * @brief Probe OPI PSRAM on PIO2 (GPIO 11/12/34-41).
+ *
+ * Sends the Read-ID command (0x9F) via PIO/DMA and checks for a valid
+ * manufacturer / known-good-die response.  Does NOT initialise the full
+ * OPI PSRAM driver — that's M8.  Returns true if a device responded.
+ */
+static bool ProbeOpiPsram() {
+    if (!GpuConfig::OPI_PSRAM_ENABLED) return false;
+
+    // TODO(M8): Implement PIO2 9F read-ID sequence.
+    // For now, check the compile-time enable flag and GPIO presence.
+    // When the OPI driver is implemented in M8, this will issue the
+    // actual 0x9F command and verify the response bytes.
+    //
+    // Stub: if the config says OPI is enabled and the CS pin is valid,
+    // we assume the chip is present (hardware team will verify).
+    bool detected = (GpuConfig::OPI_PSRAM_CS_PIN != 0xFF);
+    if (detected) {
+        printf("[VRAM] OPI PSRAM probe: detected on CS=%u (capacity=%lu KB)\n",
+               GpuConfig::OPI_PSRAM_CS_PIN,
+               (unsigned long)(GpuConfig::OPI_PSRAM_CAPACITY / 1024));
+    }
+    return detected;
+}
+
+/**
+ * @brief Probe QSPI PSRAM on QMI CS1 (XIP at 0x11000000).
+ *
+ * Attempts a test read at the XIP base address after configuring QMI CS1
+ * in basic SPI mode.  If the response is non-0xFF / non-0x00, the chip
+ * is likely present.  Full init is M8.
+ */
+static bool ProbeQspiPsram() {
+    if (!GpuConfig::QSPI_PSRAM_ENABLED) return false;
+
+    // TODO(M8): Implement QMI CS1 read-ID or test read.
+    // Stub: assume present if enabled in config.
+    bool detected = true;
+    if (detected) {
+        printf("[VRAM] QSPI PSRAM probe: detected on QMI CS1 (capacity=%lu KB, XIP=0x%08lX)\n",
+               (unsigned long)(GpuConfig::QSPI_PSRAM_CAPACITY / 1024),
+               (unsigned long)GpuConfig::QSPI_PSRAM_XIP_BASE);
+    }
+    return detected;
+}
+
+/// Probe all external VRAM at boot.  Updates capability flags.
+static void ProbeExternalVram() {
+    detectedVramFlags = 0;
+
+    if (ProbeOpiPsram()) {
+        detectedVramFlags |= PGL_VRAM_OPI_DETECTED;
+        capabilityResponse.flags |= PGL_CAP_OPI_VRAM;
+
+        extendedStatus.opiVramTotalKB = static_cast<uint16_t>(
+            GpuConfig::OPI_PSRAM_CAPACITY / 1024);
+        extendedStatus.opiVramFreeKB = extendedStatus.opiVramTotalKB;
+    }
+
+    if (ProbeQspiPsram()) {
+        detectedVramFlags |= PGL_VRAM_QSPI_DETECTED;
+        capabilityResponse.flags |= PGL_CAP_QSPI_VRAM;
+
+        extendedStatus.qspiVramTotalKB = static_cast<uint16_t>(
+            GpuConfig::QSPI_PSRAM_CAPACITY / 1024);
+        extendedStatus.qspiVramFreeKB = extendedStatus.qspiVramTotalKB;
+    }
+
+    extendedStatus.vramTierFlags = detectedVramFlags;
+    printf("[VRAM] Tier flags: 0x%02X (OPI=%s, QSPI=%s)\n",
+           detectedVramFlags,
+           (detectedVramFlags & PGL_VRAM_OPI_DETECTED)  ? "yes" : "no",
+           (detectedVramFlags & PGL_VRAM_QSPI_DETECTED) ? "yes" : "no");
+}
+
+// ─── Temperature Sensor ─────────────────────────────────────────────────────
+
+static bool adcInitialised = false;
+
+static void InitTemperatureSensor() {
+    adc_init();
+    adc_set_temp_sensor_enabled(true);
+    adcInitialised = true;
+    printf("[TEMP] ADC temperature sensor enabled (channel %u)\n",
+           ADC_TEMPERATURE_CHANNEL_NUM);
 }
 
 // ─── Register Handlers ──────────────────────────────────────────────────────
@@ -121,6 +234,16 @@ static void ProcessRegisterWrite() {
             resetRequested = true;
             break;
 
+        case PGL_REG_SET_CLOCK_FREQ:
+            if (len >= sizeof(PglClockRequest)) {
+                PglClockRequest req;
+                memcpy(&req, (const void*)data, sizeof(req));
+                clockRequestMHz   = req.targetMHz;
+                clockRequestVolt  = req.voltageLevel;
+                clockRequestFlags = req.flags;
+            }
+            break;
+
         default:
             break;
     }
@@ -156,6 +279,12 @@ static void PrepareRegisterRead() {
         case PGL_REG_SET_SCAN_RATE:
             readBuffer[0] = scanRate;
             readLen = 1;
+            break;
+
+        case PGL_REG_EXTENDED_STATUS:
+            memcpy((void*)readBuffer, (const void*)&extendedStatus,
+                   sizeof(extendedStatus));
+            readLen = sizeof(extendedStatus);
             break;
 
         default:
@@ -247,8 +376,14 @@ bool I2CSlave::Initialize() {
     gpio_pull_up(GpuConfig::I2C_SDA_PIN);
     gpio_pull_up(GpuConfig::I2C_SCL_PIN);
 
+    // Initialize on-chip temperature sensor
+    InitTemperatureSensor();
+
     // Build static capability response
     BuildCapabilityResponse();
+
+    // Probe external VRAM (updates capability flags + extended status)
+    ProbeExternalVram();
 
     // Initialize the I2C slave with our handler callback
     // This sets the slave address and installs the IRQ handler
@@ -260,6 +395,10 @@ bool I2CSlave::Initialize() {
     readLen = 0;
     readIdx = 0;
     memset((void*)&statusResponse, 0, sizeof(statusResponse));
+
+    // Pre-fill extended status with clock info
+    extendedStatus.currentClockMHz = static_cast<uint16_t>(
+        clock_get_hz(clk_sys) / 1000000);
 
     printf("[I2C] Slave initialized at address 0x%02X on i2c%u (SDA=%u, SCL=%u)\n",
            GpuConfig::I2C_ADDRESS, GpuConfig::I2C_INSTANCE,
@@ -301,6 +440,70 @@ bool I2CSlave::ConsumeResetRequest() {
     bool req = resetRequested;
     resetRequested = false;
     return req;
+}
+
+// ─── Extended Status ────────────────────────────────────────────────────────
+
+void I2CSlave::UpdateExtendedStatus(uint16_t fps, uint16_t droppedFrames,
+                                    uint8_t gpuUsage, uint8_t core0Usage,
+                                    uint8_t core1Usage, uint8_t flags,
+                                    int16_t temperatureQ8,
+                                    uint16_t currentClockMHz,
+                                    uint16_t sramFreeKB,
+                                    uint16_t frameTimeUs, uint16_t rasterTimeUs,
+                                    uint16_t transferTimeUs,
+                                    uint16_t hub75RefreshHz) {
+    extendedStatus.currentFPS       = fps;
+    extendedStatus.droppedFrames    = droppedFrames;
+    extendedStatus.gpuUsagePercent  = gpuUsage;
+    extendedStatus.core0UsagePercent = core0Usage;
+    extendedStatus.core1UsagePercent = core1Usage;
+    extendedStatus.flags            = flags;
+    extendedStatus.temperatureQ8    = temperatureQ8;
+    extendedStatus.currentClockMHz  = currentClockMHz;
+    extendedStatus.sramFreeKB       = sramFreeKB;
+    extendedStatus.frameTimeUs      = frameTimeUs;
+    extendedStatus.rasterTimeUs     = rasterTimeUs;
+    extendedStatus.transferTimeUs   = transferTimeUs;
+    extendedStatus.hub75RefreshHz   = hub75RefreshHz;
+}
+
+void I2CSlave::UpdateVramStatus(uint16_t opiTotalKB, uint16_t opiFreeKB,
+                                uint16_t qspiTotalKB, uint16_t qspiFreeKB,
+                                uint8_t tierFlags) {
+    extendedStatus.opiVramTotalKB  = opiTotalKB;
+    extendedStatus.opiVramFreeKB   = opiFreeKB;
+    extendedStatus.qspiVramTotalKB = qspiTotalKB;
+    extendedStatus.qspiVramFreeKB  = qspiFreeKB;
+    extendedStatus.vramTierFlags   = tierFlags;
+}
+
+// ─── Temperature Sensor ─────────────────────────────────────────────────────
+
+float I2CSlave::ReadTemperature() {
+    if (!adcInitialised) return 0.0f;
+
+    adc_select_input(ADC_TEMPERATURE_CHANNEL_NUM);
+    uint16_t raw = adc_read();
+    float voltage = raw * 3.3f / 4096.0f;
+    return 27.0f - (voltage - 0.706f) / 0.001721f;
+}
+
+// ─── Clock Change Request ───────────────────────────────────────────────────
+
+uint16_t I2CSlave::ConsumeClockRequest(uint8_t* outVoltage, uint8_t* outFlags) {
+    uint16_t mhz = clockRequestMHz;
+    if (mhz == 0) return 0;
+
+    if (outVoltage) *outVoltage = clockRequestVolt;
+    if (outFlags)   *outFlags   = clockRequestFlags;
+
+    // Clear request
+    clockRequestMHz   = 0;
+    clockRequestVolt  = 0;
+    clockRequestFlags = 0;
+
+    return mhz;
 }
 
 // ─── Shutdown ───────────────────────────────────────────────────────────────

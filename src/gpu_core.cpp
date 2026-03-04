@@ -15,6 +15,7 @@
 #include "transport/i2c_slave.h"
 #include "render/rasterizer.h"
 #include "render/screenspace_effects.h"
+#include "profiling/perf_counters.h"
 
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
@@ -22,6 +23,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 
 // ─── GPU State ──────────────────────────────────────────────────────────────
 
@@ -96,7 +98,10 @@ bool GpuCore::Initialize() {
                           GpuConfig::PANEL_WIDTH, GpuConfig::PANEL_HEIGHT);
     printf("[GpuCore] Rasterizer initialized\n");
 
-    // 9. Assert RDY — we're ready to receive data
+    // 9. Performance counters (DWT cycle counter)
+    PerfCounters::Initialize();
+
+    // 10. Assert RDY — we're ready to receive data
     gpio_put(GpuConfig::RDY_PIN, 1);
     printf("[GpuCore] GPU ready. RDY pin asserted.\n");
 
@@ -104,6 +109,9 @@ bool GpuCore::Initialize() {
 }
 
 // ─── FPS Measurement ────────────────────────────────────────────────────────
+
+static uint32_t lastPerfReportFrameCount = 0;
+static constexpr uint32_t PERF_REPORT_INTERVAL = 60;  // print every 60 frames
 
 static void UpdateFpsMeasurement() {
     uint32_t now = time_us_32();
@@ -148,44 +156,88 @@ void GpuCore::Core0Main() {
         const uint8_t* frameData = nullptr;
         uint32_t frameLength = 0;
 
-        if (!OctalSpiRx::TryGetFrame(&frameData, &frameLength)) {
+        PerfCounters::Begin(PerfStage::SpiReceive);
+        bool hasFrame = OctalSpiRx::TryGetFrame(&frameData, &frameLength);
+        PerfCounters::End(PerfStage::SpiReceive);
+
+        if (!hasFrame) {
             // No complete frame yet — continue refreshing display
             continue;
         }
 
+        // ── BEGIN FRAME PROFILING ──
+        PerfCounters::Begin(PerfStage::FrameTotal);
+
         // ── Parse command buffer → update scene state ──
+        PerfCounters::Begin(PerfStage::Parse);
         CommandParser::ParseResult result = CommandParser::Parse(
             frameData, frameLength, &sceneState);
 
         // Release the ring buffer region
         OctalSpiRx::ConsumeFrame();
+        PerfCounters::End(PerfStage::Parse);
 
         if (result != CommandParser::ParseResult::Ok) {
             // CRC error or malformed — skip this frame, use last good state
             droppedFrames++;
             printf("[GpuCore] Frame parse error %d — dropped (total: %u)\n",
                    static_cast<int>(result), droppedFrames);
+            PerfCounters::End(PerfStage::FrameTotal);  // match Begin above
             continue;
         }
 
         // ── Transform + project + build QuadTree (single-threaded) ──
+        PerfCounters::Begin(PerfStage::Transform);
         rasterizer.PrepareFrame(&sceneState);
+        PerfCounters::End(PerfStage::Transform);
+
+        // ── Frame signature caching: skip raster if scene unchanged ──
+        // When PrepareFrame detects an identical draw list + camera state,
+        // it sets frameSkipped=true and returns immediately.  We skip
+        // rasterization and reuse the previous back buffer contents.
+        if (rasterizer.IsFrameSkipped()) {
+            // Still count the frame and update stats
+            PerfCounters::End(PerfStage::FrameTotal);  // match Begin above
+            frameCount++;
+            UpdateFpsMeasurement();
+            I2CSlave::UpdateStatus(
+                measuredFps,
+                static_cast<uint16_t>(droppedFrames),
+                OctalSpiRx::GetFreeBytes(),
+                0, false);
+            continue;
+        }
 
         // ── Signal Core 1: start rasterizing bottom half ──
+        // Set elapsed time for animated material evaluation (noise, rainbow).
+        rasterizer.SetElapsedTime(elapsedTimeS);
         multicore_fifo_push_blocking(FIFO_CMD_START_RENDER);
 
         // ── Rasterize top half (Y = 0 to H/2 - 1) ──
+        PerfCounters::Begin(PerfStage::RasterTop);
         const uint16_t halfHeight = GpuConfig::PANEL_HEIGHT / 2;
         rasterizer.RasterizeRange(backBuffer, 0, halfHeight);
+        PerfCounters::End(PerfStage::RasterTop);
 
         // ── Wait for Core 1 to finish bottom half ──
+        // Poll instead of blocking so we can keep refreshing the HUB75 display.
+        // multicore_fifo_rvalid() returns true when data is available in the FIFO.
+        while (!multicore_fifo_rvalid()) {
+            Hub75Driver::PollRefresh();
+        }
         uint32_t response = multicore_fifo_pop_blocking();
         (void)response;  // should be FIFO_CMD_RENDER_DONE
 
         // ── Accumulate elapsed time for animated shaders ──
+        // Wrap at 3600 s (1 hour) to prevent float32 precision loss.
+        // Animated shaders use periodic functions (sin/cos), so wrapping is safe.
         elapsedTimeS += sceneState.frameTimeUs / 1000000.0f;
+        if (elapsedTimeS > 3600.0f) {
+            elapsedTimeS = fmodf(elapsedTimeS, 3600.0f);
+        }
 
         // ── Apply screen-space post-processing shaders ──
+        PerfCounters::Begin(PerfStage::Shaders);
         // Reuse the Z-buffer as scratch (32 KB float → reinterpret as uint16_t).
         // Z data is stale after rasterization, so this is safe.
         ScreenspaceShaders::ApplyShaders(
@@ -194,8 +246,10 @@ void GpuCore::Core0Main() {
             GpuConfig::PANEL_WIDTH, GpuConfig::PANEL_HEIGHT,
             &sceneState,
             elapsedTimeS);
+        PerfCounters::End(PerfStage::Shaders);
 
         // ── Swap framebuffers ──
+        PerfCounters::Begin(PerfStage::Swap);
         uint16_t* temp = frontBuffer;
         frontBuffer = backBuffer;
         backBuffer = temp;
@@ -221,6 +275,8 @@ void GpuCore::Core0Main() {
         }
 
         // ── Update stats ──
+        PerfCounters::End(PerfStage::Swap);
+        PerfCounters::End(PerfStage::FrameTotal);
         frameCount++;
         UpdateFpsMeasurement();
 
@@ -232,6 +288,14 @@ void GpuCore::Core0Main() {
             0,    // temperature: not measured yet
             false // renderBusy: cleared after render complete
         );
+
+        // ── Periodic profiling report ──
+        lastPerfReportFrameCount++;
+        if (lastPerfReportFrameCount >= PERF_REPORT_INTERVAL) {
+            PerfCounters::PrintReport();
+            PerfCounters::ResetAll();
+            lastPerfReportFrameCount = 0;
+        }
     }
 }
 
@@ -247,8 +311,10 @@ void GpuCore::Core1Main() {
 
         if (cmd == FIFO_CMD_START_RENDER) {
             // Rasterize bottom half (Y = H/2 to H-1)
+            PerfCounters::Begin(PerfStage::RasterBottom);
             rasterizer.RasterizeRange(backBuffer, halfHeight,
                                       GpuConfig::PANEL_HEIGHT);
+            PerfCounters::End(PerfStage::RasterBottom);
 
             // Signal completion to Core 0
             multicore_fifo_push_blocking(FIFO_CMD_RENDER_DONE);

@@ -37,6 +37,15 @@ static void HandleDrawObject(const uint8_t*& ptr, uint16_t payloadLen, SceneStat
 static void HandleSetCamera(const uint8_t*& ptr, SceneState* scene);
 static void HandleSetShader(const uint8_t*& ptr, SceneState* scene);
 
+// Memory access handlers (0x30 – 0x3F)
+static void HandleMemWrite(const uint8_t*& ptr, uint16_t payloadLen, SceneState* scene);
+static void HandleMemReadRequest(const uint8_t*& ptr, SceneState* scene);
+static void HandleMemSetResourceTier(const uint8_t*& ptr, SceneState* scene);
+static void HandleMemAlloc(const uint8_t*& ptr, SceneState* scene);
+static void HandleMemFree(const uint8_t*& ptr, SceneState* scene);
+static void HandleFramebufferCapture(const uint8_t*& ptr, SceneState* scene);
+static void HandleMemCopy(const uint8_t*& ptr, SceneState* scene);
+
 // ─── Main Parser ────────────────────────────────────────────────────────────
 
 CommandParser::ParseResult CommandParser::Parse(
@@ -126,6 +135,30 @@ CommandParser::ParseResult CommandParser::Parse(
             case PGL_CMD_SET_SHADER:
                 HandleSetShader(ptr, scene);
                 break;
+
+            // Memory access commands (0x30 – 0x3F)
+            case PGL_CMD_MEM_WRITE:
+                HandleMemWrite(ptr, cmdHdr.payloadLength, scene);
+                break;
+            case PGL_CMD_MEM_READ_REQUEST:
+                HandleMemReadRequest(ptr, scene);
+                break;
+            case PGL_CMD_MEM_SET_RESOURCE_TIER:
+                HandleMemSetResourceTier(ptr, scene);
+                break;
+            case PGL_CMD_MEM_ALLOC:
+                HandleMemAlloc(ptr, scene);
+                break;
+            case PGL_CMD_MEM_FREE:
+                HandleMemFree(ptr, scene);
+                break;
+            case PGL_CMD_FRAMEBUFFER_CAPTURE:
+                HandleFramebufferCapture(ptr, scene);
+                break;
+            case PGL_CMD_MEM_COPY:
+                HandleMemCopy(ptr, scene);
+                break;
+
             default:
                 // Unknown opcode — skip payload, log warning
                 printf("[Parser] Unknown opcode 0x%02X, skipping %u bytes\n",
@@ -523,4 +556,123 @@ static void HandleSetShader(const uint8_t*& ptr, SceneState* scene) {
     slot.shaderClass = cmd.shaderClass;
     slot.intensity   = cmd.intensity;
     std::memcpy(slot.params, cmd.params, sizeof(slot.params));
+}
+
+// ─── Memory Access Handlers (0x30 – 0x3F) ──────────────────────────────────
+// These are M8 stubs. Full implementation requires MemTierManager and the
+// OPI/QSPI PSRAM drivers. Currently they parse the wire payload, log the
+// request, and update minimal scene state or staging buffers.
+
+static void HandleMemWrite(const uint8_t*& ptr, uint16_t payloadLen,
+                           SceneState* scene) {
+    PglCmdMemWriteHeader hdr;
+    PglReadStruct(ptr, hdr);
+
+    printf("[Parser] MemWrite: tier=%u addr=0x%08lX size=%lu\n",
+           hdr.tier, (unsigned long)hdr.address, (unsigned long)hdr.size);
+
+    // TODO(M8): Route to appropriate memory tier driver:
+    //   PGL_TIER_SRAM     → direct memcpy (if address within arena)
+    //   PGL_TIER_OPI_PSRAM → OpiPsramDriver::Write(addr, ptr, size)
+    //   PGL_TIER_QSPI_PSRAM → QspiPsramDriver::Write(addr, ptr, size)
+    // For now, skip the data payload.
+    PglSkip(ptr, hdr.size);
+
+    (void)scene;
+}
+
+static void HandleMemReadRequest(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdMemReadRequest cmd;
+    PglReadStruct(ptr, cmd);
+
+    printf("[Parser] MemReadRequest: tier=%u addr=0x%08lX size=%u\n",
+           cmd.tier, (unsigned long)cmd.address, cmd.size);
+
+    // TODO(M8): Stage the requested memory region into the I2C readback buffer.
+    //   1. Validate tier is enabled and address is in range.
+    //   2. Copy `size` bytes from tier memory into staging buffer.
+    //   3. Set staging buffer metadata so I2C handler can serve it via
+    //      PGL_REG_MEM_READ_DATA.
+    // Staging buffer lives in SceneState or a dedicated MemoryAccessState.
+
+    (void)scene;
+}
+
+static void HandleMemSetResourceTier(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdSetResourceTier cmd;
+    PglReadStruct(ptr, cmd);
+
+    printf("[Parser] SetResourceTier: class=%u id=%u tier=%u flags=0x%02X\n",
+           cmd.resourceClass, cmd.resourceId, cmd.preferredTier, cmd.flags);
+
+    // TODO(M8): Forward to MemTierManager::SetResourceTierHint().
+    //   The tier manager records the preferred tier and pinned flag,
+    //   then may initiate an async migration if the resource is currently
+    //   in a different tier.
+
+    (void)scene;
+}
+
+static void HandleMemAlloc(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdMemAlloc cmd;
+    PglReadStruct(ptr, cmd);
+
+    printf("[Parser] MemAlloc: tier=%u size=%lu tag=0x%04X\n",
+           cmd.tier, (unsigned long)cmd.size, cmd.tag);
+
+    // TODO(M8): Route to tier allocator:
+    //   PGL_TIER_SRAM     → arena_alloc(sram_arena, size)
+    //   PGL_TIER_OPI_PSRAM → opi_psram_alloc(size)
+    //   PGL_TIER_QSPI_PSRAM → qspi_psram_alloc(size)
+    // Write result to scene->lastAllocResult (PglMemAllocResult)
+    // so it's available via PGL_REG_MEM_ALLOC_RESULT I2C read.
+
+    scene->lastAllocResult.handle  = PGL_INVALID_MEM_HANDLE;
+    scene->lastAllocResult.address = 0;
+    scene->lastAllocResult.status  = PGL_ALLOC_TIER_DISABLED;  // stub: tier not yet implemented
+}
+
+static void HandleMemFree(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdMemFree cmd;
+    PglReadStruct(ptr, cmd);
+
+    printf("[Parser] MemFree: handle=%u\n", cmd.handle);
+
+    // TODO(M8): Look up handle in allocation table, free the memory region,
+    // and release the handle slot.
+
+    (void)scene;
+}
+
+static void HandleFramebufferCapture(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdFramebufferCapture cmd;
+    PglReadStruct(ptr, cmd);
+
+    printf("[Parser] FramebufferCapture: buffer=%u format=%u\n",
+           cmd.bufferSelect, cmd.format);
+
+    // TODO(M8): Copy the selected framebuffer into the I2C staging buffer.
+    //   bufferSelect 0 = front (displayed), 1 = back (in-progress)
+    //   format 0 = RGB565 (native, no conversion), 1 = RGB888 (expand)
+    // After staging, host reads via PGL_REG_MEM_READ_DATA.
+
+    (void)scene;
+}
+
+static void HandleMemCopy(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdMemCopy cmd;
+    PglReadStruct(ptr, cmd);
+
+    printf("[Parser] MemCopy: src=tier%u@0x%08lX → dst=tier%u@0x%08lX size=%lu\n",
+           cmd.srcTier, (unsigned long)cmd.srcAddress,
+           cmd.dstTier, (unsigned long)cmd.dstAddress,
+           (unsigned long)cmd.size);
+
+    // TODO(M8): Execute GPU-internal copy:
+    //   1. Read `size` bytes from srcTier:srcAddress
+    //   2. Write to dstTier:dstAddress
+    //   For same-tier SRAM copies, use memcpy.
+    //   For cross-tier copies, use DMA where available.
+
+    (void)scene;
 }

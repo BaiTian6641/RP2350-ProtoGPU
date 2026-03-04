@@ -93,8 +93,8 @@ static constexpr uint32_t FRAME_VERTEX_POOL_SIZE = 2048;   // PglVec3  — 24 KB
 // ─── QuadTree ───────────────────────────────────────────────────────────────
 
 static constexpr uint8_t  QUADTREE_MAX_DEPTH    = 8;
-static constexpr uint8_t  QUADTREE_MAX_ENTITIES = 16;
-static constexpr uint16_t QUADTREE_MAX_NODES    = 4096;
+static constexpr uint8_t  QUADTREE_MAX_ENTITIES = 8;   // entities per leaf (was 16; reduced for SRAM)
+static constexpr uint16_t QUADTREE_MAX_NODES    = 512;  // total nodes (was 4096; spec §8.3 says 512)
 
 // ─── External Memory: OPI PSRAM via PIO2 (Tier 1 — indirect, DMA cached) ───
 // PIO2 is the last free PIO block (PIO0 = HUB75, PIO1 = Octal SPI RX).

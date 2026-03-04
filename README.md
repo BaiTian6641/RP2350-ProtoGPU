@@ -107,16 +107,16 @@ Core 0                          Core 1
 |---|---|---|
 | Framebuffer ×2 | 32 KB | 128×64 RGB565, double-buffered |
 | Z-Buffer | 32 KB | 128×64 float32 |
-| QuadTree/Nodes | 100 KB | Pre-allocated node pool |
-| Mesh storage | 48 KB | 2048 vertices + 1024 triangles |
-| Material table | 16 KB | 256 material slots |
+| Triangle2D pool | 80 KB | 1024 projected triangles × ~80 B |
+| QuadTree nodes | 22 KB | 512 nodes × ~44 B |
+| Transform scratch | 24 KB | 2048 transformed vertices × 12 B |
+| Scene state pools | 138 KB | Vertex, index, UV, texture, layout coord pools |
+| Slot arrays | 40 KB | Mesh, material, texture, layout, camera, draw slots |
 | SPI ring buffer | 32 KB | DMA receive ring |
-| Draw list | 4 KB | 64 draw calls × ~64 B each |
-| Texture cache | 64 KB | Small textures for Image material |
-| **Subtotal** | **328 KB** | |
+| **Subtotal** | **~400 KB** | |
 | Pico-SDK + stack | ~60 KB | Runtime, PIO, interrupts |
-| SRAM cache arena | 64 KB | Tier 1 OPI PSRAM cache (when enabled) |
-| **Free** | **~68 KB** | Headroom (132 KB if no OPI cache) |
+| **Free** | **~60 KB** | Headroom |
+| SRAM cache arena | (64 KB) | Tier 1 OPI PSRAM cache (optional, reduces free to 0) |
 
 ---
 
@@ -232,3 +232,21 @@ and adjusts limits accordingly:
 | SRAM + QSPI 8 MB | + large lookup tables, fonts | Pico 2 Plus (stock 8 MB PSRAM on CS1) |
 | SRAM + OPI 8 MB | + large textures, cold meshes | Custom board with PIO2 PSRAM |
 | SRAM + QSPI + OPI | Full expanded mode | Maximum capacity custom board |
+
+### Host Memory Access
+
+The host can directly read/write GPU device memory across all tiers via **7 SPI commands**
+(0x30–0x3F) and **4 I2C registers** (0x0C–0x0F). This enables:
+
+- Bulk texture/data upload to PSRAM (bypassing the resource command path)
+- Framebuffer capture for screenshots (via I2C readback, ~0.33 s for 16 KB at 400 kHz)
+- Runtime memory pressure monitoring (per-tier capacity/usage/cache hit rate)
+- Explicit resource tier placement and pinning
+- GPU-internal memory copying between tiers
+
+The `command_parser.cpp` includes stub handlers for all 7 memory commands. Full
+implementations depend on M8 OPI/QSPI drivers and `MemTierManager`. The `scene_state.h`
+has been extended with a 4 KB staging buffer, `lastAllocResult`, and `memTierInfo` fields.
+
+See `GPU_API_Design.md` §9 for the complete API design and `ProtoGL_API_Spec.md` §4.4–4.5
+for wire-format tables.

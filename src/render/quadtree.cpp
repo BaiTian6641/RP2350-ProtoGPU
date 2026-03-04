@@ -27,6 +27,10 @@ void QuadTree::Clear() {
 
 void QuadTree::Insert(TriHandle handle, const PglMath::AABB2D& bounds) {
     if (nodeCount == 0) return;
+    // Store AABB in flat lookup table for use during Subdivide
+    if (handle < GpuConfig::MAX_TRIANGLES) {
+        entityBounds[handle] = bounds;
+    }
     InsertInto(rootIndex, handle, bounds, 0);
 }
 
@@ -34,8 +38,14 @@ uint16_t QuadTree::Query(float minX, float minY, float maxX, float maxY,
                          TriHandle* outHandles, uint16_t maxHandles) const {
     uint16_t count = 0;
     if (nodeCount > 0) {
+        // Seen-bitmap for deduplication: 1 bit per triangle handle.
+        // MAX_TRIANGLES = 1024 → 128 bytes (fits on stack).
+        static constexpr uint16_t BITMAP_WORDS = (GpuConfig::MAX_TRIANGLES + 31) / 32;
+        uint32_t seen[BITMAP_WORDS];
+        std::memset(seen, 0, sizeof(seen));
+
         QueryNode(rootIndex, minX, minY, maxX, maxY,
-                  outHandles, maxHandles, count);
+                  outHandles, maxHandles, count, seen);
     }
     return count;
 }
@@ -68,14 +78,20 @@ void QuadTree::Subdivide(uint16_t nodeIdx) {
 
     n.isLeaf = false;
 
-    // Re-insert existing entities into children
+    // Re-insert existing entities into children — ONLY those whose AABB overlaps.
+    // AABBs are looked up from the flat entityBounds[] array (stored during Insert).
     for (uint8_t i = 0; i < n.entityCount; ++i) {
-        // For simplicity, insert into ALL children whose bounds overlap.
-        // A proper implementation would store per-entity AABBs — TODO(M4).
+        TriHandle h = n.entities[i];
+        const PglMath::AABB2D& eb = entityBounds[h];
         for (int c = 0; c < 4; ++c) {
             if (n.children[c] != 0) {
                 QuadNode& child = nodes[n.children[c]];
-                child.entities[child.entityCount++] = n.entities[i];
+                if (Overlaps(child.minX, child.minY, child.maxX, child.maxY,
+                             eb.minX, eb.minY, eb.maxX, eb.maxY)) {
+                    if (child.entityCount < GpuConfig::QUADTREE_MAX_ENTITIES) {
+                        child.entities[child.entityCount++] = h;
+                    }
+                }
             }
         }
     }
@@ -116,7 +132,7 @@ void QuadTree::InsertInto(uint16_t nodeIdx, TriHandle handle,
 void QuadTree::QueryNode(uint16_t nodeIdx,
                          float qMinX, float qMinY, float qMaxX, float qMaxY,
                          TriHandle* outHandles, uint16_t maxHandles,
-                         uint16_t& count) const {
+                         uint16_t& count, uint32_t* seen) const {
     const QuadNode& n = nodes[nodeIdx];
 
     if (!Overlaps(n.minX, n.minY, n.maxX, n.maxY,
@@ -124,9 +140,15 @@ void QuadTree::QueryNode(uint16_t nodeIdx,
         return;
     }
 
-    // Collect entities stored in this node
+    // Collect entity handles stored in this node (deduplicated via seen-bitmap)
     for (uint8_t i = 0; i < n.entityCount && count < maxHandles; ++i) {
-        outHandles[count++] = n.entities[i];
+        TriHandle h = n.entities[i];
+        uint16_t word = h >> 5;       // h / 32
+        uint32_t bit  = 1u << (h & 31);
+        if (!(seen[word] & bit)) {
+            seen[word] |= bit;
+            outHandles[count++] = h;
+        }
     }
 
     // Recurse into children
@@ -134,7 +156,7 @@ void QuadTree::QueryNode(uint16_t nodeIdx,
         for (int c = 0; c < 4; ++c) {
             if (n.children[c] != 0 && count < maxHandles) {
                 QueryNode(n.children[c], qMinX, qMinY, qMaxX, qMaxY,
-                          outHandles, maxHandles, count);
+                          outHandles, maxHandles, count, seen);
             }
         }
     }
