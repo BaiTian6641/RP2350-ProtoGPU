@@ -24,6 +24,7 @@
 #include "memory/mem_qspi_psram.h"
 #include "memory/mem_tier.h"
 #include "scheduler/pgl_tile_scheduler.h"
+#include "selftest/gpu_selftest.h"
 
 // Free function defined in i2c_slave.cpp — returns the auto-detected CS1 chip profile
 extern const GpuConfig::QspiChipProfile& GetQspiChipProfile();
@@ -36,6 +37,13 @@ extern const GpuConfig::QspiChipProfile& GetQspiChipProfile();
 
 // ─── GPU State ──────────────────────────────────────────────────────────────
 
+/// Runtime-detected VRAM mode (set during Initialize)
+static GpuCore::VramMode g_vramMode = GpuCore::VramMode::SRAM_ONLY;
+
+/// Stashed driver pointers (set during Initialize, used by self-test)
+static OpiPsramDriver*  g_opiDriverPtr  = nullptr;
+static QspiPsramDriver* g_qspiDriverPtr = nullptr;
+
 /// Double framebuffers (RGB565)
 static uint16_t framebufferA[GpuConfig::FRAMEBUF_PIXELS];
 static uint16_t framebufferB[GpuConfig::FRAMEBUF_PIXELS];
@@ -45,7 +53,9 @@ static uint16_t* frontBuffer = framebufferA;
 static uint16_t* backBuffer  = framebufferB;
 
 /// Z-buffer (shared between cores — each core writes distinct tiles)
-static float zBuffer[GpuConfig::FRAMEBUF_PIXELS];
+/// Uses uint16_t instead of float to save 16 KB SRAM.  The rasterizer
+/// converts float depth to a sortable 16-bit representation.
+static uint16_t zBuffer[GpuConfig::FRAMEBUF_PIXELS];
 
 /// Scene and render state
 static SceneState   sceneState;
@@ -97,13 +107,15 @@ bool GpuCore::Initialize() {
     }
     printf("[GpuCore] Octal SPI receiver initialized\n");
 
-    // 6. I2C slave (IRQ-driven)
+    // 6. I2C slave (IRQ-driven) — non-fatal if pins are disabled
     if (!I2CSlave::Initialize()) {
-        printf("[GpuCore] ERROR: I2C slave init failed\n");
-        return false;
+        printf("[GpuCore] WARNING: I2C slave not available (non-fatal)\n");
+        // Continue without I2C — self-test and rendering still work.
+        // Brightness defaults to 128, reset requests are ignored.
+    } else {
+        printf("[GpuCore] I2C slave initialized at address 0x%02X\n",
+               GpuConfig::I2C_ADDRESS);
     }
-    printf("[GpuCore] I2C slave initialized at address 0x%02X\n",
-           GpuConfig::I2C_ADDRESS);
 
     // 7. Scene state (zeroes resource tables)
     sceneState.Reset();
@@ -206,6 +218,58 @@ bool GpuCore::Initialize() {
         tierCfg.qspiXipBase  = GpuConfig::QSPI_CS1_XIP_BASE;
         tierCfg.qspiHasRandomAccessPenalty = qspiPtr ? qspiPtr->HasRandomAccessPenalty() : true;
         tierCfg.qspiIsNonVolatile          = qspiPtr ? qspiPtr->IsNonVolatile()          : false;
+
+        // ── VRAMless Mode Detection ─────────────────────────────────────
+        // Determine the runtime VRAM configuration based on probe results.
+        // When no external memory is present, operate in VRAMless mode:
+        //   - SRAM cache budget set to 0 (no external data to cache)
+        //   - All scene resources live in internal SRAM pools
+        //   - Tier manager still initialised but operates as pass-through
+        {
+            bool hasOpi  = (opiPtr != nullptr);
+            bool hasQspi = (qspiPtr != nullptr);
+
+            if (hasOpi && hasQspi) {
+                g_vramMode = VramMode::DUAL_VRAM;
+            } else if (hasOpi) {
+                g_vramMode = VramMode::OPI_ONLY;
+            } else if (hasQspi) {
+                g_vramMode = VramMode::QSPI_ONLY;
+            } else {
+                g_vramMode = VramMode::SRAM_ONLY;
+            }
+
+            // Stash driver pointers for self-test / diagnostics
+            g_opiDriverPtr  = opiPtr;
+            g_qspiDriverPtr = qspiPtr;
+
+            if (g_vramMode == VramMode::SRAM_ONLY) {
+                tierCfg.sramCacheBudget = 0;  // No external memory to cache
+                printf("[GpuCore] *** VRAMless mode — all resources in internal SRAM ***\n");
+                printf("[GpuCore] SRAM cache budget: 0 (no external memory detected)\n");
+                printf("[GpuCore] Memory layout (SRAM only):\n");
+                printf("[GpuCore]   Framebuffers (x2):  %u KB\n",
+                       (unsigned)(GpuConfig::FRAMEBUF_SIZE * 2 / 1024));
+                printf("[GpuCore]   Z-buffer:           %u KB\n",
+                       (unsigned)(GpuConfig::FRAMEBUF_PIXELS * 2 / 1024));
+                printf("[GpuCore]   Vertex pool:        %u KB\n",
+                       (unsigned)(GpuConfig::VERTEX_POOL_SIZE * 12 / 1024));
+                printf("[GpuCore]   Index pool:         %u KB\n",
+                       (unsigned)(GpuConfig::INDEX_POOL_SIZE * 6 / 1024));
+                printf("[GpuCore]   Texture pool:       %u KB\n",
+                       (unsigned)(GpuConfig::TEXTURE_POOL_SIZE / 1024));
+                printf("[GpuCore]   Layout coords:      %u KB\n",
+                       (unsigned)(GpuConfig::LAYOUT_COORD_POOL_SIZE * 8 / 1024));
+            } else {
+                const char* modeStr =
+                    (g_vramMode == VramMode::DUAL_VRAM) ? "DUAL (PIO2 + QSPI)" :
+                    (g_vramMode == VramMode::OPI_ONLY)  ? "PIO2 only" :
+                    (g_vramMode == VramMode::QSPI_ONLY) ? "QSPI CS1 only" : "?";
+                printf("[GpuCore] VRAM mode: %s\n", modeStr);
+                printf("[GpuCore] SRAM cache budget: %u KB\n",
+                       (unsigned)(tierCfg.sramCacheBudget / 1024));
+            }
+        }
 
         memTierManager.Initialize(tierCfg, opiPtr, qspiPtr);
 
@@ -366,11 +430,11 @@ void GpuCore::Core0Main() {
 
         // ── Apply screen-space post-processing shaders ──
         PerfCounters::Begin(PerfStage::Shaders);
-        // Reuse the Z-buffer as scratch (32 KB float → reinterpret as uint16_t).
+        // Reuse the Z-buffer (16 KB uint16_t) as scratch for shaders.
         // Z data is stale after rasterization, so this is safe.
         ScreenspaceShaders::ApplyShaders(
             backBuffer,
-            reinterpret_cast<uint16_t*>(zBuffer),
+            zBuffer,
             GpuConfig::PANEL_WIDTH, GpuConfig::PANEL_HEIGHT,
             &sceneState,
             elapsedTimeS);
@@ -462,4 +526,77 @@ void GpuCore::Core0Main() {
 void GpuCore::Core1Main() {
     printf("[GpuCore] Core 1 entering tile scheduler loop\n");
     tileScheduler.Core1Main();  // never returns — work-stealing tile loop
+}
+
+// ─── VRAMless Mode + Self-Test Support ──────────────────────────────────────
+
+GpuCore::VramMode GpuCore::GetVramMode() {
+    return g_vramMode;
+}
+
+void GpuCore::GetVramDrivers(OpiPsramDriver** opiOut, QspiPsramDriver** qspiOut) {
+    if (opiOut)  *opiOut  = g_opiDriverPtr;
+    if (qspiOut) *qspiOut = g_qspiDriverPtr;
+}
+
+bool GpuCore::WaitForHost(uint32_t timeoutMs) {
+    printf("[GpuCore] Waiting up to %lu ms for host SPI data...\n", (unsigned long)timeoutMs);
+
+    uint32_t startUs = time_us_32();
+    uint32_t timeoutUs = timeoutMs * 1000;
+
+    while ((time_us_32() - startUs) < timeoutUs) {
+        // Keep display alive
+        Hub75Driver::PollRefresh();
+
+        // Check if any SPI data has arrived in the ring buffer
+        uint32_t freeBytes = OctalSpiRx::GetFreeBytes();
+        if (freeBytes < GpuConfig::SPI_RING_BUFFER_SIZE) {
+            uint32_t received = GpuConfig::SPI_RING_BUFFER_SIZE - freeBytes;
+            printf("[GpuCore] Host SPI data detected (%lu bytes in buffer)\n",
+                   (unsigned long)received);
+            return true;
+        }
+    }
+
+    printf("[GpuCore] No host SPI data detected after %lu ms\n", (unsigned long)timeoutMs);
+    return false;
+}
+
+void GpuCore::RunSelfTest() {
+    printf("\n[GpuCore] === Entering Self-Test Mode ===\n");
+    printf("[GpuCore] VRAM mode: %s\n",
+           g_vramMode == VramMode::SRAM_ONLY ? "SRAM_ONLY (VRAMless)" :
+           g_vramMode == VramMode::OPI_ONLY  ? "OPI_ONLY" :
+           g_vramMode == VramMode::QSPI_ONLY ? "QSPI_ONLY" :
+           g_vramMode == VramMode::DUAL_VRAM ? "DUAL_VRAM" : "?");
+
+    // Run the full self-test suite with visual feedback on HUB75
+    GpuSelfTest::SelfTestResult result = GpuSelfTest::RunAll(
+        frontBuffer, backBuffer, zBuffer,
+        g_opiDriverPtr, g_qspiDriverPtr,
+        GpuConfig::PANEL_WIDTH, GpuConfig::PANEL_HEIGHT);
+
+    // Self-test display hold loop: keep results visible while checking for host
+    printf("[GpuCore] Self-test complete. Holding display (waiting for host)...\n");
+
+    while (true) {
+        Hub75Driver::PollRefresh();
+
+        // Auto-exit self-test when host connects
+        uint32_t freeBytes = OctalSpiRx::GetFreeBytes();
+        if (freeBytes < GpuConfig::SPI_RING_BUFFER_SIZE) {
+            printf("[GpuCore] Host SPI data detected — exiting self-test mode\n");
+            // Consume any partial data
+            const uint8_t* dummy = nullptr;
+            uint32_t dummyLen = 0;
+            if (OctalSpiRx::TryGetFrame(&dummy, &dummyLen)) {
+                OctalSpiRx::ConsumeFrame();
+            }
+            break;
+        }
+
+        // Sync brightness from I2C (host might set brightness even in self-test)
+        Hub75Driver::SetBrightness(I2CSlave::GetBrightness());
+    }
 }

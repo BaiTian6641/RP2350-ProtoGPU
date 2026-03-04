@@ -76,7 +76,7 @@ namespace TileConfig {
 struct TilePassContext {
     Rasterizer*     rasterizer;
     uint16_t*       framebuffer;
-    float*          zBuffer;
+    uint16_t*       zBuffer;
     uint16_t        panelW;
     uint16_t        panelH;
 
@@ -117,7 +117,7 @@ public:
     /// @param idleFunc    Called by Core 0 while waiting for Core 1 to finish
     ///                    (e.g. Hub75Driver::PollRefresh)
     void DispatchTilePass(Rasterizer* rasterizer,
-                          uint16_t* fb, float* zBuf,
+                          uint16_t* fb, uint16_t* zBuf,
                           uint16_t w, uint16_t h,
                           void (*idleFunc)());
 

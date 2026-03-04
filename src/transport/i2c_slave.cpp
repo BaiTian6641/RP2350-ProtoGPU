@@ -198,31 +198,52 @@ static bool ProbePio2Memory() {
 // These are lightweight SPI functions for RDID probes only.
 // The full QMI configuration is done by QspiPsramDriver::Initialize().
 
+/// Timeout for QMI direct-mode busy-waits (~2 ms at 150 MHz).
+static constexpr uint32_t QMI_PROBE_TIMEOUT = 300000;
+
+/// Track whether QMI probe timed out (used to early-exit the probe sequence).
+static volatile bool qmiProbeTimedOut = false;
+
 static void QmiProbeEnterDirect() {
+    qmiProbeTimedOut = false;
     // Temporarily disable XIP caching to enter direct mode
-    xip_ctrl_hw->ctrl &= ~XIP_CTRL_EN_BITS;
+    xip_ctrl_hw->ctrl &= ~(XIP_CTRL_EN_SECURE_BITS | XIP_CTRL_EN_NONSECURE_BITS);
     // Enable QMI direct-mode CS1
     qmi_hw->direct_csr = QMI_DIRECT_CSR_EN_BITS
                         | QMI_DIRECT_CSR_CLKDIV_BITS  // max divider for safe probe
                         | (1u << QMI_DIRECT_CSR_ASSERT_CS1N_LSB);
-    // Wait for direct mode to be ready
-    while (!(qmi_hw->direct_csr & QMI_DIRECT_CSR_TXEMPTY_BITS)) { tight_loop_contents(); }
+    // Wait for direct mode to be ready (with timeout)
+    uint32_t timeout = QMI_PROBE_TIMEOUT;
+    while (!(qmi_hw->direct_csr & QMI_DIRECT_CSR_TXEMPTY_BITS) && --timeout) {
+        tight_loop_contents();
+    }
+    if (timeout == 0) {
+        printf("[VRAM] QMI direct-mode enter timed out\n");
+        qmiProbeTimedOut = true;
+    }
 }
 
 static void QmiProbeExitDirect() {
     // Deassert CS, disable direct mode
     qmi_hw->direct_csr = 0;
     // Re-enable XIP caching
-    xip_ctrl_hw->ctrl |= XIP_CTRL_EN_BITS;
+    xip_ctrl_hw->ctrl |= (XIP_CTRL_EN_SECURE_BITS | XIP_CTRL_EN_NONSECURE_BITS);
     // Fence to ensure XIP is active before returning
     __compiler_memory_barrier();
 }
 
 /// Transfer one byte via QMI direct mode (full-duplex SPI).
 /// If `isTx` is true, sends `txByte`; otherwise sends 0xFF and returns the response.
+/// Returns 0xFF on timeout (no device present).
 static uint8_t QmiProbeTransfer(uint8_t txByte, bool isTx) {
-    // Wait for TX ready
-    while (qmi_hw->direct_csr & QMI_DIRECT_CSR_BUSY_BITS) { tight_loop_contents(); }
+    if (qmiProbeTimedOut) return 0xFF;
+
+    // Wait for TX ready (with timeout)
+    uint32_t timeout = QMI_PROBE_TIMEOUT;
+    while ((qmi_hw->direct_csr & QMI_DIRECT_CSR_BUSY_BITS) && --timeout) {
+        tight_loop_contents();
+    }
+    if (timeout == 0) { qmiProbeTimedOut = true; return 0xFF; }
 
     if (isTx) {
         // Transmit: OE enabled, 1-bit width, 8 bits, push RX
@@ -234,13 +255,27 @@ static uint8_t QmiProbeTransfer(uint8_t txByte, bool isTx) {
         qmi_hw->direct_tx = (0u << QMI_DIRECT_TX_IWIDTH_LSB) | 0xFF;
     }
 
-    // Wait for RX data
-    while (!(qmi_hw->direct_csr & QMI_DIRECT_CSR_RXFULL_BITS)) { tight_loop_contents(); }
+    // Wait for RX data (with timeout)
+    timeout = QMI_PROBE_TIMEOUT;
+    while (!(qmi_hw->direct_csr & QMI_DIRECT_CSR_RXFULL_BITS) && --timeout) {
+        tight_loop_contents();
+    }
+    if (timeout == 0) { qmiProbeTimedOut = true; return 0xFF; }
+
     return static_cast<uint8_t>(qmi_hw->direct_rx);
 }
 
 static bool ProbeQspiCs1() {
-    if (!GpuConfig::QSPI_CS1_ENABLED) return false;
+    // Always attempt runtime QSPI CS1 auto-detection regardless of the
+    // QSPI_CS1_ENABLED compile-time flag.  The QMI peripheral on RP2350
+    // can safely probe CS1 even when nothing is connected — the RDID
+    // commands will return 0xFF (no response), which we handle gracefully.
+    // This enables VRAMless mode: the firmware auto-detects whatever memory
+    // is physically present at boot without needing recompilation.
+    //
+    // Note: QSPI_CS1_ENABLED is still respected for compile-time optimisation
+    // hints (e.g., the tier manager's weight tables), but it no longer gates
+    // the runtime probe.
 
     QmiProbeEnterDirect();
 
@@ -554,6 +589,18 @@ static void i2c_slave_handler(i2c_inst_t* i2c, i2c_slave_event_t event) {
 // ─── Initialization ─────────────────────────────────────────────────────────
 
 bool I2CSlave::Initialize() {
+    // Initialize on-chip temperature sensor (ADC — not I2C dependent)
+    InitTemperatureSensor();
+
+    // Build static capability response (needed even without I2C for self-test)
+    BuildCapabilityResponse();
+
+    // ── Skip I2C + VRAM probe when pins are disabled (0xFF) ──
+    if (GpuConfig::I2C_SDA_PIN == 0xFF || GpuConfig::I2C_SCL_PIN == 0xFF) {
+        printf("[I2C] Disabled (no I2C pins assigned — Pico 2 mode)\n");
+        return false;
+    }
+
     // Select the I2C instance
     i2c_inst = (GpuConfig::I2C_INSTANCE == 0) ? i2c0 : i2c1;
 
@@ -565,12 +612,6 @@ bool I2CSlave::Initialize() {
     gpio_set_function(GpuConfig::I2C_SCL_PIN, GPIO_FUNC_I2C);
     gpio_pull_up(GpuConfig::I2C_SDA_PIN);
     gpio_pull_up(GpuConfig::I2C_SCL_PIN);
-
-    // Initialize on-chip temperature sensor
-    InitTemperatureSensor();
-
-    // Build static capability response
-    BuildCapabilityResponse();
 
     // Probe external VRAM (updates capability flags + extended status)
     ProbeExternalVram();

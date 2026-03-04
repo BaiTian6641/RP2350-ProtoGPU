@@ -72,6 +72,9 @@ static volatile uint32_t refreshCount = 0;
 static volatile uint32_t lastRefreshUs = 0;
 static volatile uint32_t measuredRefreshHz = 0;
 
+/// When true, all HUB75 driver functions are no-ops (no panel connected).
+static bool hub75Disabled = false;
+
 // ─── BCM Bit-Plane Extraction ───────────────────────────────────────────────
 
 /**
@@ -261,7 +264,7 @@ static void InitDMA() {
  *   5. Wait for SM1 OE cycle to complete (IRQ 0)
  */
 static void DriveOnePlane(uint8_t row, uint8_t bit) {
-    const uint16_t* fb = active_framebuffer;
+    const uint16_t* fb = const_cast<const uint16_t*>(active_framebuffer);
     if (!fb) return;
 
     // 1. Extract bit-plane
@@ -333,6 +336,13 @@ static void RefreshEntirePanel() {
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 bool Hub75Driver::Initialize(const uint16_t* initialFramebuffer) {
+    // ── Guard: skip PIO/DMA setup when HUB75 pins are disabled (0xFF) ──
+    if (GpuConfig::HUB75_R1_PIN == 0xFF) {
+        hub75Disabled = true;
+        printf("[HUB75] Disabled (no pins assigned — headless mode)\n");
+        return true;
+    }
+
     active_framebuffer = initialFramebuffer;
 
     // --- GPIO setup (direct control for pins not managed by PIO) ---
@@ -364,11 +374,13 @@ bool Hub75Driver::Initialize(const uint16_t* initialFramebuffer) {
 }
 
 void Hub75Driver::SetFramebuffer(const uint16_t* framebuffer) {
+    if (hub75Disabled) return;
     // Atomic pointer update — picked up at next row-0 / bit-0 boundary
     active_framebuffer = framebuffer;
 }
 
 void Hub75Driver::SetBrightness(uint8_t b) {
+    if (hub75Disabled) return;
     currentBrightness = b;
     // Brightness is applied per-pixel during ExtractBcmPlane().
     // No PIO reconfiguration needed.
@@ -379,6 +391,7 @@ uint32_t Hub75Driver::GetRefreshRate() {
 }
 
 void Hub75Driver::Shutdown() {
+    if (hub75Disabled) return;
     // Stop state machines
     pio_sm_set_enabled(pio_hw_inst, sm_data, false);
     pio_sm_set_enabled(pio_hw_inst, sm_row, false);
@@ -416,6 +429,7 @@ void Hub75Driver::Shutdown() {
  * This approach avoids blocking the main loop for the full refresh.
  */
 void Hub75Driver::PollRefresh() {
+    if (hub75Disabled) return;
     DriveOnePlane(currentRow, currentBit);
 
     currentBit++;

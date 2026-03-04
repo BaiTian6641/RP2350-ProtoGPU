@@ -106,17 +106,19 @@ Core 0                          Core 1
 | Subsystem | Size | Notes |
 |---|---|---|
 | Framebuffer ×2 | 32 KB | 128×64 RGB565, double-buffered |
-| Z-Buffer | 32 KB | 128×64 float32 |
-| Triangle2D pool | 80 KB | 1024 projected triangles × ~80 B |
-| QuadTree nodes | 22 KB | 512 nodes × ~44 B |
-| Transform scratch | 24 KB | 2048 transformed vertices × 12 B |
+| Z-Buffer | 16 KB | 128×64 uint16 (IEEE-754 upper bits, order-preserving) |
+| Triangle2D pool | 50 KB | 512 projected triangles × 100 B |
+| QuadTree nodes + bounds | 19 KB | 256 nodes × ~44 B + 512 entity bounds × 16 B |
+| Transform scratch | 12 KB | 1024 transformed vertices × 12 B |
 | Scene state pools | 138 KB | Vertex, index, UV, texture, layout coord pools |
 | Slot arrays | 40 KB | Mesh, material, texture, layout, camera, draw slots |
 | SPI ring buffer | 32 KB | DMA receive ring |
-| **Subtotal** | **~400 KB** | |
-| Pico-SDK + stack | ~60 KB | Runtime, PIO, interrupts |
-| **Free** | **~60 KB** | Headroom |
-| SRAM cache arena | (64 KB) | Tier 1 OPI PSRAM cache (optional, reduces free to 0) |
+| Staging buffer | 16 KB | Bulk upload staging |
+| Alloc table | 4 KB | Memory tier allocator |
+| **Subtotal** | **~359 KB** | |
+| Pico-SDK + stack | ~20 KB | Runtime, PIO, interrupts, Core 1 stack |
+| **Free** | **~133 KB** | Headroom |
+| SRAM cache arena | (64 KB) | Tier 1 OPI PSRAM cache (optional, reduces free to ~69 KB) |
 
 ---
 

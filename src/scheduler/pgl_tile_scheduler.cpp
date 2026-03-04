@@ -109,7 +109,7 @@ void PglTileScheduler::Core1Main() {
 //      (calling idleFunc, e.g. HUB75 refresh, while waiting)
 
 void PglTileScheduler::DispatchTilePass(Rasterizer* rasterizer,
-                                         uint16_t* fb, float* zBuf,
+                                         uint16_t* fb, uint16_t* zBuf,
                                          uint16_t w, uint16_t h,
                                          void (*idleFunc)()) {
     // Populate shared context

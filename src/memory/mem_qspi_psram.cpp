@@ -20,6 +20,8 @@
 #include "hardware/regs/addressmap.h"
 #include "hardware/sync.h"
 #include "hardware/gpio.h"
+#include "hardware/clocks.h"
+#include "hardware/xip_cache.h"
 #include "pico/time.h"
 
 #include <cstdio>
@@ -35,7 +37,7 @@
 /// Disables XIP caching temporarily so we can issue raw SPI commands.
 static void QmiEnterDirectMode() {
     // Disable XIP caching
-    xip_ctrl_hw->ctrl &= ~XIP_CTRL_EN_BITS;
+    xip_ctrl_hw->ctrl &= ~(XIP_CTRL_EN_SECURE_BITS | XIP_CTRL_EN_NONSECURE_BITS);
     __dsb();
     __isb();
 }
@@ -43,7 +45,7 @@ static void QmiEnterDirectMode() {
 /// Exit QMI direct mode — re-enable XIP.
 static void QmiExitDirectMode() {
     // Re-enable XIP caching
-    xip_ctrl_hw->ctrl |= XIP_CTRL_EN_BITS;
+    xip_ctrl_hw->ctrl |= (XIP_CTRL_EN_SECURE_BITS | XIP_CTRL_EN_NONSECURE_BITS);
     __dsb();
     __isb();
 }
@@ -343,11 +345,8 @@ void QspiPsramDriver::InvalidateCache() {
     // The RP2350 XIP controller shares a cache across CS0 and CS1.
     // Bit 0 of XIP_CTRL.CTRL = POWER_DOWN toggles; bit 1 = INVALIDATE
     __dsb();
-    xip_ctrl_hw->flush = 1;
-    // Wait for flush completion — check STAT register
-    while (!(xip_ctrl_hw->stat & XIP_STAT_FLUSH_READY_BITS)) {
-        tight_loop_contents();
-    }
+    // Use the SDK's cache invalidation API (RP2350 has no flush register)
+    xip_cache_invalidate_all();
     __dsb();
     __isb();
 }

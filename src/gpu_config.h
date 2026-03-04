@@ -33,28 +33,32 @@ static constexpr uint8_t RDY_ASSERT_THRESHOLD   = 50;  // assert RDY when >= 50%
 static constexpr uint8_t RDY_DEASSERT_THRESHOLD = 25;  // deassert when < 25% free
 
 // ─── I2C Slave ──────────────────────────────────────────────────────────────
+// GP14 = I2C1_SDA, GP15 = I2C1_SCL on the Pico 2 header.
 
 static constexpr uint8_t I2C_SDA_PIN  = 14;
 static constexpr uint8_t I2C_SCL_PIN  = 15;
 static constexpr uint8_t I2C_ADDRESS  = 0x3C;
-static constexpr uint     I2C_INSTANCE = 0;  // i2c0
+static constexpr unsigned int I2C_INSTANCE = 1;  // i2c1 (GP14/15 are I2C1)
 
 // ─── HUB75 Display ─────────────────────────────────────────────────────────
+// HUB75 is DISABLED for Pico 2 functional testing (no panel connected).
+// All pins set to 0xFF — the driver detects this and becomes a no-op.
+// UART0 TX uses GP16, RX uses GP17 (reclaimed from RGB data pins).
 
-static constexpr uint8_t HUB75_R1_PIN    = 16;
-static constexpr uint8_t HUB75_G1_PIN    = 17;
-static constexpr uint8_t HUB75_B1_PIN    = 18;
-static constexpr uint8_t HUB75_R2_PIN    = 19;
-static constexpr uint8_t HUB75_G2_PIN    = 20;
-static constexpr uint8_t HUB75_B2_PIN    = 21;
-static constexpr uint8_t HUB75_ADDR_A    = 22;
-static constexpr uint8_t HUB75_ADDR_B    = 23;
-static constexpr uint8_t HUB75_ADDR_C    = 24;
-static constexpr uint8_t HUB75_ADDR_D    = 25;
-static constexpr uint8_t HUB75_ADDR_E    = 26;  // for 1/32 scan (64 rows)
-static constexpr uint8_t HUB75_CLK_PIN   = 27;
-static constexpr uint8_t HUB75_LAT_PIN   = 28;
-static constexpr uint8_t HUB75_OE_PIN    = 29;
+static constexpr uint8_t HUB75_R1_PIN    = 0xFF;  // disabled
+static constexpr uint8_t HUB75_G1_PIN    = 0xFF;
+static constexpr uint8_t HUB75_B1_PIN    = 0xFF;
+static constexpr uint8_t HUB75_R2_PIN    = 0xFF;
+static constexpr uint8_t HUB75_G2_PIN    = 0xFF;
+static constexpr uint8_t HUB75_B2_PIN    = 0xFF;
+static constexpr uint8_t HUB75_ADDR_A    = 0xFF;
+static constexpr uint8_t HUB75_ADDR_B    = 0xFF;
+static constexpr uint8_t HUB75_ADDR_C    = 0xFF;
+static constexpr uint8_t HUB75_ADDR_D    = 0xFF;
+static constexpr uint8_t HUB75_ADDR_E    = 0xFF;
+static constexpr uint8_t HUB75_CLK_PIN   = 0xFF;
+static constexpr uint8_t HUB75_LAT_PIN   = 0xFF;
+static constexpr uint8_t HUB75_OE_PIN    = 0xFF;
 
 // Panel geometry
 static constexpr uint16_t PANEL_WIDTH    = 128;
@@ -69,8 +73,8 @@ static constexpr uint32_t FRAMEBUF_SIZE   = FRAMEBUF_PIXELS * 2;  // RGB565 = 2 
 
 // ─── Resource Limits (must be ≤ PGL_MAX_* from PglTypes.h) ─────────────────
 
-static constexpr uint16_t MAX_VERTICES   = 2048;
-static constexpr uint16_t MAX_TRIANGLES  = 1024;
+static constexpr uint16_t MAX_VERTICES   = 1024;   // per-mesh vertex limit (transform scratch)
+static constexpr uint16_t MAX_TRIANGLES  = 512;    // max projected triangles per frame
 static constexpr uint16_t MAX_MESHES     = 256;
 static constexpr uint16_t MAX_MATERIALS  = 256;
 static constexpr uint8_t  MAX_TEXTURES   = 64;
@@ -82,19 +86,19 @@ static constexpr uint8_t  MAX_DRAW_CALLS = 64;
 // from typed bump pools.  This keeps slot metadata small (~40 B) while
 // supporting the full protocol resource-ID range.
 
-static constexpr uint32_t VERTEX_POOL_SIZE       = 4096;   // PglVec3  — 48 KB
+static constexpr uint32_t VERTEX_POOL_SIZE       = 2048;   // PglVec3  — 24 KB
 static constexpr uint32_t INDEX_POOL_SIZE        = 2048;   // PglIndex3 — 12 KB
 static constexpr uint32_t UV_VERTEX_POOL_SIZE    = 2048;   // PglVec2  — 16 KB
 static constexpr uint32_t UV_INDEX_POOL_SIZE     = 1024;   // PglIndex3 — 6 KB
 static constexpr uint32_t TEXTURE_POOL_SIZE      = 32768;  // bytes   — 32 KB
-static constexpr uint32_t LAYOUT_COORD_POOL_SIZE = 4096;   // PglVec2  — 32 KB
+static constexpr uint32_t LAYOUT_COORD_POOL_SIZE = 2048;   // PglVec2  — 16 KB
 static constexpr uint32_t FRAME_VERTEX_POOL_SIZE = 2048;   // PglVec3  — 24 KB (per-frame)
 
 // ─── QuadTree ───────────────────────────────────────────────────────────────
 
-static constexpr uint8_t  QUADTREE_MAX_DEPTH    = 8;
-static constexpr uint8_t  QUADTREE_MAX_ENTITIES = 8;   // entities per leaf (was 16; reduced for SRAM)
-static constexpr uint16_t QUADTREE_MAX_NODES    = 512;  // total nodes (was 4096; spec §8.3 says 512)
+static constexpr uint8_t  QUADTREE_MAX_DEPTH    = 6;   // reduced for 128×64 panel (>6 unnecessary)
+static constexpr uint8_t  QUADTREE_MAX_ENTITIES = 8;   // entities per leaf
+static constexpr uint16_t QUADTREE_MAX_NODES    = 256;  // total nodes (128×64 panel needs few subdivisions)
 
 // ─── External Memory: PIO2 Bus (Tier 1 — indirect, DMA) ────────────────────
 // PIO2 is the last free PIO block (PIO0 = HUB75, PIO1 = Octal SPI RX).

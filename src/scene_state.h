@@ -75,13 +75,36 @@ struct MeshSlot {
     PglIndex3* indices   = nullptr;  // → SceneState::indexPool
     PglVec2*   uvVertices = nullptr; // → SceneState::uvVertexPool
     PglIndex3* uvIndices  = nullptr; // → SceneState::uvIndexPool
+
+    // Cached object-space AABB — computed on mesh creation/update.
+    // Used for fast mesh-level frustum culling before per-triangle work.
+    PglVec3 aabbMin = {0, 0, 0};
+    PglVec3 aabbMax = {0, 0, 0};
+
+    /// Recompute aabbMin/aabbMax from current vertex data.
+    void RecomputeAABB() {
+        if (!vertices || vertexCount == 0) return;
+        PglVec3 mn = vertices[0], mx = vertices[0];
+        for (uint16_t i = 1; i < vertexCount; ++i) {
+            const PglVec3& v = vertices[i];
+            if (v.x < mn.x) mn.x = v.x;
+            if (v.y < mn.y) mn.y = v.y;
+            if (v.z < mn.z) mn.z = v.z;
+            if (v.x > mx.x) mx.x = v.x;
+            if (v.y > mx.y) mx.y = v.y;
+            if (v.z > mx.z) mx.z = v.z;
+        }
+        aabbMin = mn;
+        aabbMax = mx;
+    }
 };
 
 struct MaterialSlot {
     bool           active    = false;
     PglMaterialType type     = PGL_MAT_SIMPLE;
     PglBlendMode   blendMode = PGL_BLEND_BASE;
-    uint8_t        params[64] = {};   // type-specific, copied verbatim from wire
+    uint8_t        params[60] = {};   // type-specific, copied verbatim from wire
+                                      // (max: 7-stop gradient = 59 B)
 };
 
 struct TextureSlot {

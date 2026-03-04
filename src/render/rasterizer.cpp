@@ -52,6 +52,28 @@ static PglVec3 transformedVerts[GpuConfig::MAX_VERTICES];
 // QuadTree instance — rebuilt every frame by PrepareFrame().
 static QuadTree quadTree;
 
+// ─── uint16_t Z-buffer Conversion ───────────────────────────────────────
+// The Z-buffer uses uint16_t to save 16 KB SRAM (vs float).
+// We exploit the fact that IEEE 754 positive floats are order-preserving
+// when their bit-pattern is interpreted as unsigned integers.  Taking the
+// upper 16 bits of the float gives us a compact representation that
+// preserves the depth ordering perfectly for all positive z values.
+//
+// Precision: sign(1) + exponent(8) + top-7-mantissa = 16 bits.
+// This gives 128 discrete depth levels per power-of-two range, which is
+// more than sufficient for a 128×64 panel.
+
+/// Convert a positive float depth to a sortable uint16_t.
+/// Preserves ordering: closer (smaller z) → smaller uint16_t value.
+static inline uint16_t FloatZToU16(float z) {
+    uint32_t bits;
+    __builtin_memcpy(&bits, &z, 4);
+    return static_cast<uint16_t>(bits >> 16);
+}
+
+/// Far-plane sentinel: FloatZToU16(1e30f).
+static constexpr uint16_t Z_FAR_U16 = 0x720D;  // upper 16 bits of 1e30f
+
 // ─── RGB565 Utility Functions ───────────────────────────────────────────────
 
 static inline uint16_t PackRGB565(uint8_t r, uint8_t g, uint8_t b) {
@@ -82,7 +104,13 @@ static inline void UnpackRGB565(uint16_t c, uint8_t& r, uint8_t& g, uint8_t& b) 
 #endif
 
 #if PGL_USE_DSP_BLEND
-#include <arm_compat.h>  // __UQADD16, __UQSUB16, __UHADD16, etc.
+#include <arm_acle.h>   // __uqadd16, __uqsub16, __uhadd16, etc.
+// arm_acle.h uses lowercase; define uppercase aliases for portability
+#ifndef __UQADD16
+#define __UQADD16(a, b)  __uqadd16((a), (b))
+#define __UQSUB16(a, b)  __uqsub16((a), (b))
+#define __UHADD16(a, b)  __uhadd16((a), (b))
+#endif
 
 // Unpack RGB565 to {R8|G8} packed halfword + B8
 static inline void UnpackRGB565_DSP(uint16_t c, uint32_t& rg, uint8_t& b) {
@@ -667,7 +695,7 @@ static uint16_t EvaluateMaterial(const MaterialSlot& mat,
 
 // ─── Initialize ─────────────────────────────────────────────────────────────
 
-void Rasterizer::Initialize(SceneState* scene, float* zBuffer,
+void Rasterizer::Initialize(SceneState* scene, uint16_t* zBuffer,
                             uint16_t width, uint16_t height) {
     this->scene   = scene;
     this->zBuffer = zBuffer;
@@ -756,11 +784,9 @@ void Rasterizer::PrepareFrame(SceneState* scene) {
     }
     prevFrameSignature = sig;
 
-    // Clear Z-buffer to far plane
+    // Clear Z-buffer to far plane (uint16_t representation)
     const uint32_t pixelCount = static_cast<uint32_t>(width) * height;
-    for (uint32_t i = 0; i < pixelCount; ++i) {
-        zBuffer[i] = 1e30f;
-    }
+    std::memset(zBuffer, 0xFF, pixelCount * sizeof(uint16_t));  // 0xFFFF > Z_FAR_U16
 
     // Clear and re-initialize QuadTree for this frame
     quadTree.Clear();
@@ -814,10 +840,56 @@ void Rasterizer::PrepareFrame(SceneState* scene) {
             vertCount = GpuConfig::MAX_VERTICES;
         }
 
+        // Get transform early — needed for both AABB cull and vertex transform
+        const PglTransform& xform = dc.transform;
+
+        // ── Mesh-level AABB frustum cull ────────────────────────────
+        // Transform the 8 corners of the mesh AABB, project to screen,
+        // and skip the entire draw call if fully off-screen.
+        // For morph overrides we use the base mesh AABB (conservative).
+        {
+            const PglVec3& mn = mesh.aabbMin;
+            const PglVec3& mx = mesh.aabbMax;
+            const PglVec3 corners[8] = {
+                {mn.x, mn.y, mn.z}, {mx.x, mn.y, mn.z},
+                {mn.x, mx.y, mn.z}, {mx.x, mx.y, mn.z},
+                {mn.x, mn.y, mx.z}, {mx.x, mn.y, mx.z},
+                {mn.x, mx.y, mx.z}, {mx.x, mx.y, mx.z},
+            };
+            float sMinX = 1e30f, sMinY = 1e30f;
+            float sMaxX = -1e30f, sMaxY = -1e30f;
+            bool anyInFront = false;
+            for (int c = 0; c < 8; ++c) {
+                PglVec3 tv = PglMath::TransformVertex(xform, corners[c]);
+                float cz;
+                PglVec2 sp;
+                if (is2D) {
+                    sp = PglMath::OrthoProject(tv, camPos,
+                             static_cast<float>(width), static_cast<float>(height));
+                    cz = tv.z;
+                } else {
+                    sp = PglMath::PerspectiveProject(tv, camPos, camRot, fovFactor,
+                             static_cast<float>(width), static_cast<float>(height), &cz);
+                }
+                if (cz > 0.0f) {
+                    anyInFront = true;
+                    if (sp.x < sMinX) sMinX = sp.x;
+                    if (sp.y < sMinY) sMinY = sp.y;
+                    if (sp.x > sMaxX) sMaxX = sp.x;
+                    if (sp.y > sMaxY) sMaxY = sp.y;
+                }
+            }
+            // Skip entire mesh if all corners behind camera or projected AABB off-screen
+            if (!anyInFront ||
+                sMaxX < 0.0f || sMinX >= static_cast<float>(width) ||
+                sMaxY < 0.0f || sMinY >= static_cast<float>(height)) {
+                continue;  // skip this draw call entirely
+            }
+        }
+
         // ── Step 1: Transform vertices by the DrawCall's transform ──
         // Applies scale (around scaleOffset), rotation (around rotationOffset),
         // then translation.  This matches ProtoTracer's Transform pipeline.
-        const PglTransform& xform = dc.transform;
         for (uint16_t v = 0; v < vertCount; ++v) {
             transformedVerts[v] = PglMath::TransformVertex(xform, srcVerts[v]);
         }
@@ -904,6 +976,13 @@ void Rasterizer::PrepareFrame(SceneState* scene) {
                 }
             }
 
+            // Clamp AABB to screen bounds before QuadTree insertion.
+            // Prevents oversized nodes from large triangles extending off-screen.
+            bounds.minX = (bounds.minX > 0.0f) ? bounds.minX : 0.0f;
+            bounds.minY = (bounds.minY > 0.0f) ? bounds.minY : 0.0f;
+            bounds.maxX = (bounds.maxX < static_cast<float>(width))  ? bounds.maxX : static_cast<float>(width);
+            bounds.maxY = (bounds.maxY < static_cast<float>(height)) ? bounds.maxY : static_cast<float>(height);
+
             // Insert into QuadTree
             quadTree.Insert(trianglePoolUsed, bounds);
             trianglePoolUsed++;
@@ -968,7 +1047,8 @@ void Rasterizer::RasterizeRange(uint16_t* framebuffer,
 
             // Find the nearest triangle at this pixel
             uint32_t pixelIdx = rowStart + x;
-            float    bestZ = zBuffer[pixelIdx];
+            uint16_t bestZU16 = zBuffer[pixelIdx];
+            float    bestZ    = 1e30f;  // float z kept for material evaluation
             uint16_t bestColor = 0x0000;  // black (background)
             bool     hit = false;
 
@@ -984,7 +1064,8 @@ void Rasterizer::RasterizeRange(uint16_t* framebuffer,
 
                 // Interpolate depth
                 float z = tri.InterpolateZ(u, v, w);
-                if (z >= bestZ) continue;  // behind existing pixel
+                uint16_t zU16 = FloatZToU16(z);
+                if (zU16 >= bestZU16) continue;  // behind existing pixel
 
                 // This triangle is closer — look up material
                 const DrawCall& dc = scene->drawList[tri.drawCallIndex];
@@ -995,6 +1076,7 @@ void Rasterizer::RasterizeRange(uint16_t* framebuffer,
                 if (!mat.active) {
                     // No material assigned — render solid white
                     bestZ = z;
+                    bestZU16 = zU16;
                     bestColor = 0xFFFF;
                     hit = true;
                     continue;
@@ -1016,13 +1098,14 @@ void Rasterizer::RasterizeRange(uint16_t* framebuffer,
                 bestColor = EvaluateMaterial(mat, intersectionPoint, normal, uv,
                                              scene, elapsedTimeS, 0);
                 bestZ = z;
+                bestZU16 = zU16;
                 hit = true;
             }
 
             // Write pixel
             if (hit) {
                 framebuffer[pixelIdx] = bestColor;
-                zBuffer[pixelIdx] = bestZ;
+                zBuffer[pixelIdx] = bestZU16;
             } else {
                 framebuffer[pixelIdx] = 0x0000;  // background: black
             }
@@ -1047,7 +1130,7 @@ void Rasterizer::RasterizeRange(uint16_t* framebuffer,
 // The framebuffer and zBuffer pointers are full-panel-sized; we only write
 // to the tile's sub-region [px0..px0+tileW) × [py0..py0+tileH).
 
-void Rasterizer::RasterizeTile(uint16_t* framebuffer, float* zBuf,
+void Rasterizer::RasterizeTile(uint16_t* framebuffer, uint16_t* zBuf,
                                 uint16_t tileX, uint16_t tileY,
                                 uint16_t tileW, uint16_t tileH) {
     // Convert tile coords to pixel coords
@@ -1088,6 +1171,30 @@ void Rasterizer::RasterizeTile(uint16_t* framebuffer, float* zBuf,
         return;
     }
 
+    // ── Step 2b: Sort candidates front-to-back by minimum Z ──────────
+    // This ensures closer triangles are tested first, maximising Z-buffer
+    // rejection for subsequent (farther) candidates.  Insertion sort is
+    // efficient for the small candidate lists (typically 5-30 items).
+    for (uint16_t i = 1; i < hitCount; ++i) {
+        TriHandle key = candidates[i];
+        const Triangle2D& triKey = trianglePool[key];
+        float keyMinZ = triKey.z0;
+        if (triKey.z1 < keyMinZ) keyMinZ = triKey.z1;
+        if (triKey.z2 < keyMinZ) keyMinZ = triKey.z2;
+
+        int j = static_cast<int>(i) - 1;
+        while (j >= 0) {
+            const Triangle2D& triJ = trianglePool[candidates[j]];
+            float jMinZ = triJ.z0;
+            if (triJ.z1 < jMinZ) jMinZ = triJ.z1;
+            if (triJ.z2 < jMinZ) jMinZ = triJ.z2;
+            if (jMinZ <= keyMinZ) break;
+            candidates[j + 1] = candidates[j];
+            --j;
+        }
+        candidates[j + 1] = key;
+    }
+
     // ── Step 3: Rasterize pixels, testing only the cached candidates ─
     for (uint16_t y = py0; y < py1; ++y) {
         uint32_t rowStart = static_cast<uint32_t>(y) * width;
@@ -1097,7 +1204,8 @@ void Rasterizer::RasterizeTile(uint16_t* framebuffer, float* zBuf,
             float fx = static_cast<float>(x) + 0.5f;  // pixel centre
 
             uint32_t pixelIdx = rowStart + x;
-            float    bestZ = zBuf[pixelIdx];
+            uint16_t bestZU16 = zBuf[pixelIdx];
+            float    bestZ    = 1e30f;  // float z kept for material evaluation
             uint16_t bestColor = 0x0000;
             bool     hit = false;
 
@@ -1107,13 +1215,26 @@ void Rasterizer::RasterizeTile(uint16_t* framebuffer, float* zBuf,
 
                 const Triangle2D& tri = trianglePool[handle];
 
+                // Hi-Z early-out: if this triangle's closest vertex is
+                // behind the current best Z for this pixel, skip it.
+                // Candidates are sorted front-to-back, so once we fail
+                // this test all remaining candidates are also behind.
+                {
+                    float triMinZ = tri.z0;
+                    if (tri.z1 < triMinZ) triMinZ = tri.z1;
+                    if (tri.z2 < triMinZ) triMinZ = tri.z2;
+                    uint16_t triMinZU16 = FloatZToU16(triMinZ);
+                    if (triMinZU16 >= bestZU16) break;  // all remaining are farther
+                }
+
                 // Barycentric test
                 float u, v, w;
                 if (!tri.Barycentric(fx, fy, u, v, w)) continue;
 
                 // Interpolate depth
                 float z = tri.InterpolateZ(u, v, w);
-                if (z >= bestZ) continue;  // behind existing pixel
+                uint16_t zU16 = FloatZToU16(z);
+                if (zU16 >= bestZU16) continue;  // behind existing pixel
 
                 // Material lookup
                 const DrawCall& dc = scene->drawList[tri.drawCallIndex];
@@ -1123,6 +1244,7 @@ void Rasterizer::RasterizeTile(uint16_t* framebuffer, float* zBuf,
                 const MaterialSlot& mat = scene->materials[matId];
                 if (!mat.active) {
                     bestZ = z;
+                    bestZU16 = zU16;
                     bestColor = 0xFFFF;  // no material → solid white
                     hit = true;
                     continue;
@@ -1141,13 +1263,14 @@ void Rasterizer::RasterizeTile(uint16_t* framebuffer, float* zBuf,
                 bestColor = EvaluateMaterial(mat, intersectionPoint, normal, uv,
                                              scene, elapsedTimeS, 0);
                 bestZ = z;
+                bestZU16 = zU16;
                 hit = true;
             }
 
             // Write pixel
             if (hit) {
                 framebuffer[pixelIdx] = bestColor;
-                zBuf[pixelIdx] = bestZ;
+                zBuf[pixelIdx] = bestZU16;
             } else {
                 framebuffer[pixelIdx] = 0x0000;
             }

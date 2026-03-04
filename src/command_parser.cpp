@@ -306,6 +306,9 @@ static void HandleCreateMesh(const uint8_t*& ptr, uint16_t payloadLen,
         PglSkip(ptr, (hdr.vertexCount - vertsToCopy) * sizeof(PglVec3));
     }
 
+    // Compute and cache object-space bounding box for frustum culling
+    mesh.RecomputeAABB();
+
     // Read triangle indices into pool memory
     PglReadArray(ptr, mesh.indices, trisToCopy);
     if (hdr.triangleCount > trisToCopy) {
@@ -373,8 +376,10 @@ static void HandleUpdateVertices(const uint8_t*& ptr, uint16_t payloadLen,
     if (hdr.vertexCount > count) {
         PglSkip(ptr, (hdr.vertexCount - count) * sizeof(PglVec3));
     }
-}
 
+    // Recompute cached AABB after vertex replacement
+    mesh.RecomputeAABB();
+}
 static void HandleUpdateVerticesDelta(const uint8_t*& ptr, uint16_t payloadLen,
                                       SceneState* scene) {
     PglCmdUpdateVerticesDeltaHeader hdr;
@@ -395,6 +400,9 @@ static void HandleUpdateVerticesDelta(const uint8_t*& ptr, uint16_t payloadLen,
             mesh.vertices[delta.index].z += delta.z;
         }
     }
+
+    // Recompute cached AABB after delta updates
+    mesh.RecomputeAABB();
 }
 
 static void HandleCreateMaterial(const uint8_t*& ptr, uint16_t payloadLen,

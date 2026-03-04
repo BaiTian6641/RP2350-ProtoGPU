@@ -22,7 +22,7 @@ struct SceneState;  // forward
 class Rasterizer {
 public:
     /// Bind the scene, Z-buffer, and panel dimensions.
-    void Initialize(SceneState* scene, float* zBuffer,
+    void Initialize(SceneState* scene, uint16_t* zBuffer,
                     uint16_t width, uint16_t height);
 
     /// Phase 1 (single-threaded, Core 0):
@@ -47,12 +47,12 @@ public:
     ///   - Amortises traversal cost across 256 pixels
     ///
     /// @param framebuffer  Full-panel framebuffer (128×64 RGB565)
-    /// @param zBuf         Full-panel Z-buffer (128×64 float)
+    /// @param zBuf         Full-panel Z-buffer (128×64 uint16_t)
     /// @param tileX        Tile column index (0..PANEL_WIDTH/TILE_W - 1)
     /// @param tileY        Tile row index (0..PANEL_HEIGHT/TILE_H - 1)
     /// @param tileW        Tile width in pixels (typically 16)
     /// @param tileH        Tile height in pixels (typically 16)
-    void RasterizeTile(uint16_t* framebuffer, float* zBuf,
+    void RasterizeTile(uint16_t* framebuffer, uint16_t* zBuf,
                        uint16_t tileX, uint16_t tileY,
                        uint16_t tileW, uint16_t tileH);
 
@@ -69,7 +69,7 @@ public:
 
 private:
     SceneState* scene    = nullptr;
-    float*      zBuffer  = nullptr;
+    uint16_t*   zBuffer  = nullptr;
     uint16_t    width    = 0;
     uint16_t    height   = 0;
 

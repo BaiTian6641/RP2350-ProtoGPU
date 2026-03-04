@@ -34,6 +34,7 @@ add_executable(protogl_gpu
     src/memory/mem_opi_psram.cpp
     src/memory/mem_qspi_psram.cpp
     src/memory/mem_tier.cpp
+    src/selftest/gpu_selftest.cpp
 )
 
 target_include_directories(protogl_gpu PRIVATE
@@ -51,7 +52,7 @@ target_link_libraries(protogl_gpu
     hardware_i2c
     hardware_gpio
     hardware_clocks    hardware_adc
-    hardware_xip)
+    hardware_xip_cache)
 
 # ─── PIO programs ───────────────────────────────────────────────────────────
 pico_generate_pio_header(protogl_gpu
@@ -61,9 +62,18 @@ pico_generate_pio_header(protogl_gpu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/octal_spi_rx.pio
 )
 
-# ─── USB/UART output for debugging ──────────────────────────────────────────
-pico_enable_stdio_usb(protogl_gpu 1)
+# ─── Serial output for debugging ────────────────────────────────────────────
+# UART0 TX on GPIO 16, RX on GPIO 17.
+# HUB75 is disabled, so those pins are free for UART.
+# USB stdio disabled — USB CDC caused processor hangs during PIO/DMA init.
+pico_enable_stdio_usb(protogl_gpu 0)
 pico_enable_stdio_uart(protogl_gpu 1)
+
+target_compile_definitions(protogl_gpu PRIVATE
+    PICO_DEFAULT_UART=0
+    PICO_DEFAULT_UART_TX_PIN=16
+    PICO_DEFAULT_UART_RX_PIN=17
+)
 
 # ─── Generate UF2 for flashing ──────────────────────────────────────────────
 pico_add_extra_outputs(protogl_gpu)
@@ -74,4 +84,13 @@ target_compile_options(protogl_gpu PRIVATE
     -Wextra
     -Wno-unused-parameter
     -O2
+    -ffast-math            # Enables VFMA.F32 contraction from a*b+c patterns,
+                           # reciprocal sqrt approx, no-errno — safe for renderer.
+    -ffunction-sections    # Place each function in its own section for linker GC
+    -fdata-sections        # Place each data item in its own section for linker GC
+)
+
+# Remove unused code/data sections
+target_link_options(protogl_gpu PRIVATE
+    -Wl,--gc-sections
 )

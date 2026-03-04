@@ -44,11 +44,15 @@ bool MemTierManager::Initialize(const MemTierConfig& config,
     }
 
     // Allocate SRAM cache arena
-    // In a real deployment, this would be a static array or linker-placed region.
-    // For now, we use a static buffer sized to the configured budget.
-    static uint8_t s_cacheArena[GpuConfig::MEM_TIER_SRAM_CACHE_BUDGET]
-        __attribute__((aligned(4)));
-    cacheArena_ = s_cacheArena;
+    // Only allocate when external memory is configured — saves 64 KB BSS otherwise.
+    if constexpr (GpuConfig::PIO2_MEM_MODE != GpuConfig::Pio2MemMode::NONE
+               || GpuConfig::QSPI_CS1_ENABLED) {
+        static uint8_t s_cacheArena[GpuConfig::MEM_TIER_SRAM_CACHE_BUDGET]
+            __attribute__((aligned(4)));
+        cacheArena_ = s_cacheArena;
+    } else {
+        cacheArena_ = nullptr;
+    }
 
     // Initialize cache lines
     uint32_t lineCount = config_.sramCacheBudget / config_.cacheLineSize;
