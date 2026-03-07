@@ -22,6 +22,7 @@
 #include "hardware/vreg.h"
 #include "hardware/pll.h"
 #include "hardware/pio.h"
+#include "hardware/uart.h"
 
 #include <cstdio>
 
@@ -64,6 +65,13 @@ static void RecalculatePioClocks(uint16_t newMHz) {
         pio_sm_set_clkdiv(s.pio, s.sm, newDiv);
         pio_sm_set_enabled(s.pio, s.sm, true);
     }
+}
+
+static void RefreshUartBaudAfterClockChange() {
+#if defined(PICO_DEFAULT_UART) && defined(PICO_DEFAULT_UART_BAUD_RATE)
+    uart_inst_t* uartInst = (PICO_DEFAULT_UART == 0) ? uart0 : uart1;
+    uart_set_baudrate(uartInst, PICO_DEFAULT_UART_BAUD_RATE);
+#endif
 }
 
 // ─── API Implementation ─────────────────────────────────────────────────────
@@ -134,6 +142,10 @@ uint16_t GpuClock::SetFrequency(uint16_t targetMHz, uint8_t voltageLevel,
     if (reconfigurePIO) {
         RecalculatePioClocks(currentMHz_);
     }
+
+    // Step 6: Refresh UART baud divider so stdio serial stays stable
+    // after clk_sys/clock tree changes.
+    RefreshUartBaudAfterClockChange();
 
     printf("[CLOCK] Now running at %u MHz (verified: %lu Hz)\n",
            currentMHz_, (unsigned long)clock_get_hz(clk_sys));

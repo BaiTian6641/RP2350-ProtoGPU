@@ -7,12 +7,14 @@
  *
  * Architecture:
  *   ┌──────────────────────────────────────────────────────────┐
- *   │  128×64 panel → 8×4 grid of 16×16 tiles (32 tiles)      │
+ *   │  Panel → COLSxROWS grid of 16×16 tiles                   │
+ *   │    Normal:   128×64  → 8×4 grid (32 tiles)              │
+ *   │    Headless:  96×96  → 6×6 grid (36 tiles)              │
  *   │                                                          │
- *   │  work queue: atomic tile index (0..31)                   │
+ *   │  work queue: atomic tile index (0..TILE_COUNT-1)         │
  *   │                                                          │
- *   │  Core 0:  while (tile = next_tile++) < 32: rasterize(tile)│
- *   │  Core 1:  while (tile = next_tile++) < 32: rasterize(tile)│
+ *   │  Core 0:  while (tile = next_tile++) < N: rasterize(tile)│
+ *   │  Core 1:  while (tile = next_tile++) < N: rasterize(tile)│
  *   │                                                          │
  *   │  Both cores pull from the same atomic counter — whoever  │
  *   │  finishes a tile first grabs the next one (work-stealing)│
@@ -35,9 +37,9 @@
  *     redundant QuadTree queries when tiles share the same spatial region.
  *
  * Tile order:  Morton / Z-order curve for improved spatial locality when both
- * cores fetch adjacent tiles.  For 8×4 this is a static lookup table.
+ * cores fetch adjacent tiles.  Static lookup table (32 or 36 entries).
  *
- * Performance target: < 1 µs scheduling overhead per tile (~32 µs total).
+ * Performance target: < 1 µs scheduling overhead per tile.
  */
 
 #pragma once
@@ -53,19 +55,38 @@ struct SceneState;
 namespace TileConfig {
     static constexpr uint16_t TILE_W     = 16;
     static constexpr uint16_t TILE_H     = 16;
-    static constexpr uint16_t COLS       = 8;   // 128 / 16
-    static constexpr uint16_t ROWS       = 4;   //  64 / 16
-    static constexpr uint16_t TILE_COUNT = COLS * ROWS;  // 32
 
-    /// Morton-order (Z-curve) tile indices for 8×4 grid.
+#ifdef RP2350GPU_HEADLESS_SELFTEST
+    // Headless: 96×96 panel → 6×6 grid of 16×16 tiles (36 tiles)
+    static constexpr uint16_t COLS       = 6;
+    static constexpr uint16_t ROWS       = 6;
+#else
+    // Normal: 128×64 panel → 8×4 grid of 16×16 tiles (32 tiles)
+    static constexpr uint16_t COLS       = 8;
+    static constexpr uint16_t ROWS       = 4;
+#endif
+
+    static constexpr uint16_t TILE_COUNT = COLS * ROWS;
+
+    /// Morton-order (Z-curve) tile indices.
     /// Improves spatial locality when two cores steal adjacent tiles.
-    /// Generated offline: interleave X and Y bits.
+    /// Generated offline: interleave X and Y bits, skip out-of-range entries.
     static constexpr uint8_t MORTON_ORDER[TILE_COUNT] = {
-        // (col,row) pairs in Morton order, mapped to linear tileid = row*8+col
-         0,  1,  8,  9,  2,  3, 10, 11,   //  Z-curve quadrant 0,1
-        16, 17, 24, 25, 18, 19, 26, 27,   //  Z-curve quadrant 2,3
-         4,  5, 12, 13,  6,  7, 14, 15,   //  Z-curve quadrant 4,5
-        20, 21, 28, 29, 22, 23, 30, 31    //  Z-curve quadrant 6,7
+#ifdef RP2350GPU_HEADLESS_SELFTEST
+        // 6×6 grid: linear tileid = row*6 + col
+        // Morton Z-curve traversal (36 tiles, skipping col≥6 or row≥6)
+         0,  1,  6,  7,  2,  3,  8,  9,     // quadrant TL
+        12, 13, 18, 19, 14, 15, 20, 21,     // quadrant BL
+         4,  5, 10, 11, 16, 17, 22, 23,     // quadrant TR
+        24, 25, 30, 31, 26, 27, 32, 33,     // quadrant BL-outer
+        28, 29, 34, 35                       // quadrant BR
+#else
+        // 8×4 grid: linear tileid = row*8 + col
+         0,  1,  8,  9,  2,  3, 10, 11,     // Z-curve quadrant 0,1
+        16, 17, 24, 25, 18, 19, 26, 27,     // Z-curve quadrant 2,3
+         4,  5, 12, 13,  6,  7, 14, 15,     // Z-curve quadrant 4,5
+        20, 21, 28, 29, 22, 23, 30, 31      // Z-curve quadrant 6,7
+#endif
     };
 }
 

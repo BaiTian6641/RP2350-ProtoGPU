@@ -2,29 +2,32 @@
  * @file gpu_core.cpp
  * @brief GPU core lifecycle implementation — RP2350 dual-core.
  *
- * Both normal and headless self-test modes share the SAME ProtoGL graphics
- * pipeline:  SceneState → Rasterizer.PrepareFrame() → PglTileScheduler
- * (dual-core work-stealing, 32 tiles in Morton order) → display.
+ * Core 0: SPI receive → parse → prepare frame → tile raster (work-stealing) → swap → HUB75 refresh
+ * Core 1: Tile raster (work-stealing, Morton Z-order, FIFO-triggered)
  *
- * Normal mode:
- *   Display  = HUB75 128×64 LED panel
- *   Scene    = received via Octal SPI from host and parsed by CommandParser
- *   Extras   = I2C slave, VRAM tiering, screenspace shaders, perf counters
- *
- * Headless self-test (RP2350GPU_HEADLESS_SELFTEST):
- *   Display  = SSD1331 96×64 OLED (center-cropped from 96×96 render output)
- *   Scene    = built-in 2×3 rotating gradient cubes (HeadlessSelfTest module)
- *   Excluded = HUB75, Octal SPI, I2C, VRAM drivers, command parser
- *   Shared   = SceneState, Rasterizer, TileScheduler, dual-core operation
+ * Rasterisation is tile-based: the 128×64 panel is divided into 32 tiles of
+ * 16×16 pixels, dispatched via PglTileScheduler.  Both cores pull tiles from
+ * a lock-free atomic counter, giving natural load balancing.
  */
-
-// ─── Common includes (both modes) ──────────────────────────────────────────
 
 #include "gpu_core.h"
 #include "gpu_config.h"
 #include "scene_state.h"
+#include "command_parser.h"
+#include "display/hub75_driver.h"
+#include "transport/octal_spi_rx.h"
+#include "transport/i2c_slave.h"
 #include "render/rasterizer.h"
+#include "render/screenspace_effects.h"
+#include "profiling/perf_counters.h"
+#include "memory/mem_opi_psram.h"
+#include "memory/mem_qspi_psram.h"
+#include "memory/mem_tier.h"
 #include "scheduler/pgl_tile_scheduler.h"
+#include "selftest/gpu_selftest.h"
+
+// Free function defined in i2c_slave.cpp — returns the auto-detected CS1 chip profile
+extern const GpuConfig::QspiChipProfile& GetQspiChipProfile();
 
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
@@ -33,127 +36,73 @@
 #include <cstdio>
 #include <cstring>
 
-// ─── Mode-specific includes ────────────────────────────────────────────────
-
-#ifdef RP2350GPU_HEADLESS_SELFTEST
-#include "selftest/ssd1331_driver.h"
-#include "selftest/headless_selftest.h"
-#else
-#include "command_parser.h"
-#include "display/hub75_driver.h"
-#include "transport/octal_spi_rx.h"
-#include "transport/i2c_slave.h"
-#include "render/screenspace_effects.h"
-#include "profiling/perf_counters.h"
-#include "memory/mem_opi_psram.h"
-#include "memory/mem_qspi_psram.h"
-#include "memory/mem_tier.h"
-#include "selftest/gpu_selftest.h"
-extern const GpuConfig::QspiChipProfile& GetQspiChipProfile();
-#endif
-
 // ═══════════════════════════════════════════════════════════════════════════
-// Common GPU state — shared ProtoGL pipeline for both modes.
-// Renders at 128×64 (PANEL_WIDTH × PANEL_HEIGHT) regardless of output.
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Runtime-detected VRAM mode (set during Initialize)
-static GpuCore::VramMode g_vramMode = GpuCore::VramMode::SRAM_ONLY;
-
-/// Double framebuffers (RGB565, 128×64 = 16 KB each)
-static uint16_t framebufferA[GpuConfig::FRAMEBUF_PIXELS];
-static uint16_t framebufferB[GpuConfig::FRAMEBUF_PIXELS];
-static uint16_t* frontBuffer = framebufferA;
-static uint16_t* backBuffer  = framebufferB;
-
-/// Z-buffer (shared between cores — each core writes distinct tiles).
-/// 128×64 = 16 KB.  Cleared to 0xFFFF by Rasterizer::PrepareFrame().
-static uint16_t zBuffer[GpuConfig::FRAMEBUF_PIXELS];
-
-/// Scene state (meshes, materials, cameras, draw calls, resource pools ~194 KB)
-static SceneState sceneState;
-
-/// Rasterizer (transform → project → tile rasterize)
-static Rasterizer rasterizer;
-
-/// Tile scheduler (dual-core work-stealing, 16×16 tiles, Morton Z-order)
-static PglTileScheduler tileScheduler;
-
-/// Common frame timing
-static uint32_t frameCount    = 0;
-static uint32_t lastFpsTimeUs = 0;
-static uint16_t measuredFps   = 0;
-static float    elapsedTimeS  = 0.0f;
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Normal-mode-only state (transport, VRAM, profiling)
+// When RP2350GPU_HEADLESS_SELFTEST is defined, the headless self-test owns
+// the display pipeline and renders directly to SSD1331.  The normal GPU
+// subsystems (HUB75, SPI receiver, I2C slave, full scene state, etc.) are
+// excluded to save ~180 KB of BSS that would otherwise overflow SRAM.
+// Minimal stubs are provided so the translation unit still compiles.
 // ═══════════════════════════════════════════════════════════════════════════
 
 #ifndef RP2350GPU_HEADLESS_SELFTEST
 
+// ─── GPU State ──────────────────────────────────────────────────────────────
+
+/// Runtime-detected VRAM mode (set during Initialize)
+static GpuCore::VramMode g_vramMode = GpuCore::VramMode::SRAM_ONLY;
+
+/// Stashed driver pointers (set during Initialize, used by self-test)
 static OpiPsramDriver*  g_opiDriverPtr  = nullptr;
 static QspiPsramDriver* g_qspiDriverPtr = nullptr;
 
-static OpiPsramDriver   opiDriver;
-static QspiPsramDriver  qspiDriver;
-static MemTierManager   memTierManager;
+/// Double framebuffers (RGB565)
+static uint16_t framebufferA[GpuConfig::FRAMEBUF_PIXELS];
+static uint16_t framebufferB[GpuConfig::FRAMEBUF_PIXELS];
 
-static uint32_t droppedFrames = 0;
+/// Pointers for double-buffering: display reads front, rasterizer writes back
+static uint16_t* frontBuffer = framebufferA;
+static uint16_t* backBuffer  = framebufferB;
 
-static uint32_t lastPerfReportFrameCount = 0;
-static constexpr uint32_t PERF_REPORT_INTERVAL = 60;
+/// Z-buffer (shared between cores — each core writes distinct tiles)
+/// Uses uint16_t instead of float to save 16 KB SRAM.  The rasterizer
+/// converts float depth to a sortable 16-bit representation.
+static uint16_t zBuffer[GpuConfig::FRAMEBUF_PIXELS];
 
-#endif // !RP2350GPU_HEADLESS_SELFTEST
+/// Scene and render state
+static SceneState   sceneState;
+static Rasterizer   rasterizer;
+static uint32_t     frameCount = 0;
+static uint32_t     droppedFrames = 0;
+static uint32_t     lastFpsTimeUs = 0;
+static uint16_t     measuredFps = 0;
+static float        elapsedTimeS = 0.0f;   // accumulated wall time for animated effects
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Headless-mode-only state (SSD1331 output buffer)
-// ═══════════════════════════════════════════════════════════════════════════
+/// Memory subsystem
+static OpiPsramDriver  opiDriver;
+static QspiPsramDriver qspiDriver;
+static MemTierManager  memTierManager;
 
-#ifdef RP2350GPU_HEADLESS_SELFTEST
-
-/// Output buffer for SSD1331 (96×64, center-cropped from 96×96 pipeline output)
-static uint16_t g_ssd1331Fb[GpuConfig::SSD1331_WIDTH * GpuConfig::SSD1331_HEIGHT];
-
-#endif // RP2350GPU_HEADLESS_SELFTEST
+/// Tile-based dual-core scheduler (bare-metal, work-stealing)
+static PglTileScheduler tileScheduler;
 
 // ─── Initialization ─────────────────────────────────────────────────────────
 
 bool GpuCore::Initialize() {
     printf("[GpuCore] Initializing subsystems...\n");
 
-    // Clear both framebuffers
+    // 1. RDY pin — output, initially low (not ready)
+    gpio_init(GpuConfig::RDY_PIN);
+    gpio_set_dir(GpuConfig::RDY_PIN, GPIO_OUT);
+    gpio_put(GpuConfig::RDY_PIN, 0);
+
+    // 2. Clear both framebuffers
     memset(framebufferA, 0, sizeof(framebufferA));
     memset(framebufferB, 0, sizeof(framebufferB));
 
-    // ── Display output (mode-specific) ──────────────────────────────────
+    // 3. Fill front buffer with a test pattern for initial bringup
+    Hub75Driver::FillTestPattern(frontBuffer, 1);  // RGB gradient
 
-#ifdef RP2350GPU_HEADLESS_SELFTEST
-    // Headless: SSD1331 OLED
-    printf("[GpuCore] Headless mode — initializing SSD1331 OLED...\n");
-    if (!Ssd1331::Initialize()) {
-        printf("[GpuCore] ERROR: SSD1331 init failed\n");
-        return false;
-    }
-    printf("[GpuCore] SSD1331 initialized (%ux%u, SPI0 @ %lu Hz)\n",
-           GpuConfig::SSD1331_WIDTH, GpuConfig::SSD1331_HEIGHT,
-           (unsigned long)GpuConfig::SSD1331_SPI_BAUD);
-
-#else
-    // Normal: DIR + IRQ pins, HUB75 + Octal SPI (bidir) + I2C
-
-    // DIR pin — input from host (high = host TX, low = GPU TX)
-    gpio_init(GpuConfig::DIR_PIN);
-    gpio_set_dir(GpuConfig::DIR_PIN, GPIO_IN);
-
-    // IRQ pin — output, active-low, initially deasserted (high)
-    gpio_init(GpuConfig::IRQ_PIN);
-    gpio_set_dir(GpuConfig::IRQ_PIN, GPIO_OUT);
-    gpio_put(GpuConfig::IRQ_PIN, 1);  // deasserted (active-low)
-
-    // Fill front buffer with test pattern for initial bringup
-    Hub75Driver::FillTestPattern(frontBuffer, 1);
-
-    // HUB75 display driver (PIO + DMA)
+    // 4. HUB75 display driver (PIO + DMA)
     if (!Hub75Driver::Initialize(frontBuffer)) {
         printf("[GpuCore] ERROR: HUB75 init failed\n");
         return false;
@@ -162,63 +111,41 @@ bool GpuCore::Initialize() {
            GpuConfig::PANEL_WIDTH, GpuConfig::PANEL_HEIGHT,
            GpuConfig::SCAN_ROWS, GpuConfig::COLOR_DEPTH);
 
-    // Octal SPI transceiver (PIO + DMA, bidirectional)
+    // 5. Octal SPI receiver (PIO + DMA)
     if (!OctalSpiRx::Initialize()) {
         printf("[GpuCore] ERROR: Octal SPI init failed\n");
         return false;
     }
-    printf("[GpuCore] Octal SPI transceiver initialized (bidir)\n");
+    printf("[GpuCore] Octal SPI receiver initialized\n");
 
-    // I2C slave (IRQ-driven) — non-fatal
+    // 6. I2C slave (IRQ-driven) — non-fatal if pins are disabled
     if (!I2CSlave::Initialize()) {
         printf("[GpuCore] WARNING: I2C slave not available (non-fatal)\n");
+        // Continue without I2C — self-test and rendering still work.
+        // Brightness defaults to 128, reset requests are ignored.
     } else {
         printf("[GpuCore] I2C slave initialized at address 0x%02X\n",
                GpuConfig::I2C_ADDRESS);
     }
 
-#endif // RP2350GPU_HEADLESS_SELFTEST
-
-    // ── Common: Scene state ─────────────────────────────────────────────
-
+    // 7. Scene state (zeroes resource tables)
     sceneState.Reset();
-#ifndef RP2350GPU_HEADLESS_SELFTEST
     I2CSlave::SetSceneState(&sceneState);
-#endif
     printf("[GpuCore] Scene state reset (max %u meshes, %u materials)\n",
            GpuConfig::MAX_MESHES, GpuConfig::MAX_MATERIALS);
 
-    // ── Common: Rasterizer ──────────────────────────────────────────────
-
+    // 8. Rasterizer (references to framebuffer, Z-buffer, scene)
     rasterizer.Initialize(&sceneState, zBuffer,
                           GpuConfig::PANEL_WIDTH, GpuConfig::PANEL_HEIGHT);
-    printf("[GpuCore] Rasterizer initialized (%ux%u)\n",
-           GpuConfig::PANEL_WIDTH, GpuConfig::PANEL_HEIGHT);
+    printf("[GpuCore] Rasterizer initialized\n");
 
-    // ── Common: Tile scheduler (dual-core work-stealing) ────────────────
-
-    tileScheduler.Initialize();
-    printf("[GpuCore] Tile scheduler initialized (%u tiles, %ux%u px each)\n",
-           TileConfig::TILE_COUNT, TileConfig::TILE_W, TileConfig::TILE_H);
-
-    // ── Mode-specific post-init ─────────────────────────────────────────
-
-#ifdef RP2350GPU_HEADLESS_SELFTEST
-    // Build self-test scene: six rotating gradient cubes in a 2×3 grid,
-    // perspective camera at z=-7
-    HeadlessSelfTest::BuildScene(&sceneState);
-    g_vramMode = VramMode::SRAM_ONLY;
-    printf("[GpuCore] Headless scene built — pipeline ready.\n");
-    printf("[GpuCore] Render: %ux%u (%u tiles, dual-core) → center-crop → %ux%u (SSD1331)\n",
-           GpuConfig::PANEL_WIDTH, GpuConfig::PANEL_HEIGHT,
-           TileConfig::TILE_COUNT,
-           GpuConfig::SSD1331_WIDTH, GpuConfig::SSD1331_HEIGHT);
-
-#else
-    // Performance counters (DWT cycle counter)
+    // 9. Performance counters (DWT cycle counter)
     PerfCounters::Initialize();
 
-    // Memory subsystem (PIO2 external + QSPI CS1 + tier manager)
+    // 10. Tile scheduler (bare-metal, work-stealing, dual-core)
+    tileScheduler.Initialize();
+
+    // 11. Memory subsystem (PIO2 external + QSPI CS1 + tier manager)
     {
         // Initialize PIO2 external memory driver (if configured)
         OpiPsramDriver* opiPtr = nullptr;
@@ -226,7 +153,7 @@ bool GpuCore::Initialize() {
             OpiPsramConfig opiCfg = {};
             opiCfg.mode           = static_cast<Pio2MemMode>(
                                         static_cast<uint8_t>(GpuConfig::PIO2_MEM_MODE));
-            opiCfg.pioInstance    = 2;
+            opiCfg.pioInstance    = 2;  // PIO2
             opiCfg.dataBasePin    = GpuConfig::PIO2_MEM_DATA_BASE_PIN;
             opiCfg.dataPinCount   = GpuConfig::Pio2DataPinCount();
             opiCfg.clkPin         = GpuConfig::PIO2_MEM_CLK_PIN;
@@ -304,7 +231,12 @@ bool GpuCore::Initialize() {
         tierCfg.qspiHasRandomAccessPenalty = qspiPtr ? qspiPtr->HasRandomAccessPenalty() : true;
         tierCfg.qspiIsNonVolatile          = qspiPtr ? qspiPtr->IsNonVolatile()          : false;
 
-        // VRAMless mode detection
+        // ── VRAMless Mode Detection ─────────────────────────────────────
+        // Determine the runtime VRAM configuration based on probe results.
+        // When no external memory is present, operate in VRAMless mode:
+        //   - SRAM cache budget set to 0 (no external data to cache)
+        //   - All scene resources live in internal SRAM pools
+        //   - Tier manager still initialised but operates as pass-through
         {
             bool hasOpi  = (opiPtr != nullptr);
             bool hasQspi = (qspiPtr != nullptr);
@@ -319,11 +251,12 @@ bool GpuCore::Initialize() {
                 g_vramMode = VramMode::SRAM_ONLY;
             }
 
+            // Stash driver pointers for self-test / diagnostics
             g_opiDriverPtr  = opiPtr;
             g_qspiDriverPtr = qspiPtr;
 
             if (g_vramMode == VramMode::SRAM_ONLY) {
-                tierCfg.sramCacheBudget = 0;
+                tierCfg.sramCacheBudget = 0;  // No external memory to cache
                 printf("[GpuCore] *** VRAMless mode — all resources in internal SRAM ***\n");
                 printf("[GpuCore] SRAM cache budget: 0 (no external memory detected)\n");
                 printf("[GpuCore] Memory layout (SRAM only):\n");
@@ -352,6 +285,7 @@ bool GpuCore::Initialize() {
 
         memTierManager.Initialize(tierCfg, opiPtr, qspiPtr);
 
+        // Wire memory subsystem into the command parser
         CommandParser::InitMemory(
             opiPtr, qspiPtr, &memTierManager,
             frontBuffer, backBuffer,
@@ -360,16 +294,17 @@ bool GpuCore::Initialize() {
         printf("[GpuCore] Memory subsystem initialized\n");
     }
 
-    // Deassert IRQ — GPU initialized and ready
-    gpio_put(GpuConfig::IRQ_PIN, 1);  // deasserted (high)
-    printf("[GpuCore] GPU ready. IRQ deasserted.\n");
-
-#endif // !RP2350GPU_HEADLESS_SELFTEST
+    // 12. Assert RDY — we're ready to receive data
+    gpio_put(GpuConfig::RDY_PIN, 1);
+    printf("[GpuCore] GPU ready. RDY pin asserted.\n");
 
     return true;
 }
 
-// ─── FPS Measurement (common) ───────────────────────────────────────────────
+// ─── FPS Measurement ────────────────────────────────────────────────────────
+
+static uint32_t lastPerfReportFrameCount = 0;
+static constexpr uint32_t PERF_REPORT_INTERVAL = 60;  // print every 60 frames
 
 static void UpdateFpsMeasurement() {
     uint32_t now = time_us_32();
@@ -377,6 +312,8 @@ static void UpdateFpsMeasurement() {
         lastFpsTimeUs = now;
         return;
     }
+
+    // Update FPS every second
     uint32_t elapsed = now - lastFpsTimeUs;
     if (elapsed >= 1000000) {
         measuredFps = static_cast<uint16_t>(
@@ -386,134 +323,15 @@ static void UpdateFpsMeasurement() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Core 0 Main Loop
-// ═══════════════════════════════════════════════════════════════════════════
-
-#ifdef RP2350GPU_HEADLESS_SELFTEST
-
-// ─── Headless Core 0: self-generated scene → standard pipeline → SSD1331 ──
-
-void GpuCore::Core0Main() {
-    printf("[GpuCore] Core 0 entering headless render loop\n");
-    printf("[GpuCore] Scene: rotating cube (10 s) then Utah teapot, with Lambert shading\n");
-    printf("[GpuCore] Pipeline: PrepareFrame → DispatchTilePass (%u tiles, dual-core) → center-crop → SSD1331\n",
-           TileConfig::TILE_COUNT);
-    // NOTE: All timing (sleep_ms, busy_wait_us, time_us_32) uses the RP2350
-    // hardware timer at 1 MHz (from reference clock), NOT clk_sys.  The
-    // 360 MHz core overclock has zero effect on delays or timestamps.
-    printf("[GpuCore] Timing: hardware timer (1 MHz ref clock), unaffected by clk_sys OC\n");
-
-    float cubeAngleY = 0.0f;
-    float cubeAngleX = 0.0f;
-
-    uint32_t fpsFrames  = 0;
-    uint32_t lastFpsUs  = time_us_32();
-    uint16_t displayFps = 0;
-    uint16_t displayCpu = 0;
-    uint32_t busyUs     = 0;
-
-    while (true) {
-        uint32_t frameStartUs = time_us_32();
-
-        // ── 1. Update draw list with rotating cube angles ───────────────
-        HeadlessSelfTest::UpdateDrawList(&sceneState, cubeAngleY, cubeAngleX,
-                                             elapsedTimeS);
-
-        // ── 2. PrepareFrame: transform → project → Z-clear → QuadTree ──
-        //    Standard ProtoGL pipeline — identical to normal mode.
-        rasterizer.PrepareFrame(&sceneState);
-
-        if (!rasterizer.IsFrameSkipped()) {
-            // ── 3. Set elapsed time for animated material evaluation ────
-            rasterizer.SetElapsedTime(elapsedTimeS);
-
-            // ── 4. Tile rasterization (dual-core, work-stealing) ────────
-            //    TILE_COUNT tiles (16×16) in Morton Z-order.  Both cores
-            //    share an atomic tile counter.  This is the SAME scheduler
-            //    as the normal HUB75 pipeline — no code differences.
-            tileScheduler.DispatchTilePass(
-                &rasterizer, backBuffer, zBuffer,
-                GpuConfig::PANEL_WIDTH, GpuConfig::PANEL_HEIGHT,
-                nullptr);  // no HUB75 refresh needed
-
-            // ── 5. Swap framebuffers ────────────────────────────────────
-            uint16_t* temp = frontBuffer;
-            frontBuffer = backBuffer;
-            backBuffer  = temp;
-        }
-
-        // ── 6. Center-crop 96×96 → 96×64 for SSD1331 output ────────────
-        //    The pipeline renders at 96×96 (square, matching SSD1331 width).
-        //    We extract the center 64 rows vertically for the 96×64 display.
-        {
-            constexpr uint16_t srcW = GpuConfig::PANEL_WIDTH;    // 96
-            constexpr uint16_t srcH = GpuConfig::PANEL_HEIGHT;   // 96
-            constexpr uint16_t dstW = GpuConfig::SSD1331_WIDTH;  // 96
-            constexpr uint16_t dstH = GpuConfig::SSD1331_HEIGHT; // 64
-            constexpr uint16_t xOff = (srcW - dstW) / 2;         // 0
-            constexpr uint16_t yOff = (srcH - dstH) / 2;         // 16
-
-            for (uint16_t y = 0; y < dstH; ++y) {
-                std::memcpy(&g_ssd1331Fb[y * dstW],
-                            &frontBuffer[(y + yOff) * srcW + xOff],
-                            dstW * sizeof(uint16_t));
-            }
-        }
-
-        // ── 7. Draw HUD overlay (FPS + CPU %) on SSD1331 buffer ────────
-        HeadlessSelfTest::DrawHUD(g_ssd1331Fb,
-                                  GpuConfig::SSD1331_WIDTH,
-                                  GpuConfig::SSD1331_HEIGHT,
-                                  displayFps, displayCpu);
-
-        // ── 8. Push to SSD1331 OLED ─────────────────────────────────────
-        Ssd1331::PushFramebuffer(g_ssd1331Fb);
-
-        // ── 9. Advance rotation angles ──────────────────────────────────
-        cubeAngleY += 0.04f;
-        cubeAngleX += 0.015f;
-        if (cubeAngleY > 6.2832f) cubeAngleY -= 6.2832f;
-        if (cubeAngleX > 6.2832f) cubeAngleX -= 6.2832f;
-
-        // ── 10. Timing & FPS measurement ────────────────────────────────
-        uint32_t frameEndUs  = time_us_32();
-        uint32_t frameTimeUs = frameEndUs - frameStartUs;
-
-        elapsedTimeS += frameTimeUs / 1000000.0f;
-        if (elapsedTimeS > 3600.0f) elapsedTimeS -= 3600.0f;
-
-        busyUs += frameTimeUs;
-        fpsFrames++;
-        frameCount++;
-
-        uint32_t elapsed = frameEndUs - lastFpsUs;
-        if (elapsed >= 1000000) {
-            displayFps = (uint16_t)((uint64_t)fpsFrames * 1000000u / elapsed);
-            displayCpu = (uint16_t)((uint64_t)busyUs * 100u / elapsed);
-            if (displayCpu > 100) displayCpu = 100;
-
-            printf("[GpuCore] Headless FPS: %u, CPU: %u%%, Frame: %lu us, Tris: %lu\n",
-                   displayFps, displayCpu,
-                   (unsigned long)frameTimeUs,
-                   (unsigned long)rasterizer.GetTriangleCount());
-
-            fpsFrames = 0;
-            busyUs    = 0;
-            lastFpsUs = frameEndUs;
-        }
-    }
-}
-
-#else // !RP2350GPU_HEADLESS_SELFTEST
-
-// ─── Normal Core 0: SPI receive → parse → prepare → tile raster → HUB75 ──
+// ─── Core 0 Main Loop ──────────────────────────────────────────────────────
 
 void GpuCore::Core0Main() {
     printf("[GpuCore] Core 0 entering main loop\n");
 
     while (true) {
         // ── HUB75 refresh (cooperative, one BCM plane per call) ──
+        // We call PollRefresh() every iteration to keep the display updating.
+        // Each call takes ~12 µs, so this doesn't block the main loop.
         Hub75Driver::PollRefresh();
 
         // ── Sync brightness from I2C ──
@@ -536,6 +354,7 @@ void GpuCore::Core0Main() {
         PerfCounters::End(PerfStage::SpiReceive);
 
         if (!hasFrame) {
+            // No complete frame yet — continue refreshing display
             continue;
         }
 
@@ -546,29 +365,41 @@ void GpuCore::Core0Main() {
         PerfCounters::Begin(PerfStage::Parse);
         CommandParser::ParseResult result = CommandParser::Parse(
             frameData, frameLength, &sceneState);
+
+        // Release the ring buffer region
         OctalSpiRx::ConsumeFrame();
         PerfCounters::End(PerfStage::Parse);
 
         if (result != CommandParser::ParseResult::Ok &&
             result != CommandParser::ParseResult::UnknownOpcode) {
+            // CRC error or malformed — skip this frame, use last good state
             droppedFrames++;
             printf("[GpuCore] Frame parse error %d — dropped (total: %u)\n",
                    static_cast<int>(result), droppedFrames);
-            PerfCounters::End(PerfStage::FrameTotal);
+            PerfCounters::End(PerfStage::FrameTotal);  // match Begin above
             continue;
         }
+        // UnknownOpcode is non-fatal: the parser already skipped the
+        // unrecognised command and processed the rest of the frame.
+        // This preserves forward compatibility when the host sends
+        // newer opcodes that this firmware doesn't recognise yet.
 
         // ── Memory tier: begin-of-frame bookkeeping ──
+        // Decay access scores, evaluate promotion/demotion.
         memTierManager.BeginFrame();
 
-        // ── Transform + project + build QuadTree ──
+        // ── Transform + project + build QuadTree (single-threaded) ──
         PerfCounters::Begin(PerfStage::Transform);
         rasterizer.PrepareFrame(&sceneState);
         PerfCounters::End(PerfStage::Transform);
 
-        // ── Frame signature caching ──
+        // ── Frame signature caching: skip raster if scene unchanged ──
+        // When PrepareFrame detects an identical draw list + camera state,
+        // it sets frameSkipped=true and returns immediately.  We skip
+        // rasterization and reuse the previous back buffer contents.
         if (rasterizer.IsFrameSkipped()) {
-            PerfCounters::End(PerfStage::FrameTotal);
+            // Still count the frame and update stats
+            PerfCounters::End(PerfStage::FrameTotal);  // match Begin above
             frameCount++;
             UpdateFpsMeasurement();
             I2CSlave::UpdateStatus(
@@ -579,10 +410,12 @@ void GpuCore::Core0Main() {
             continue;
         }
 
-        // ── Set elapsed time for animated material evaluation ──
+        // ── Set elapsed time for animated material evaluation (noise, rainbow) ──
         rasterizer.SetElapsedTime(elapsedTimeS);
 
-        // ── Memory tier: prefetch PIO2-resident data ──
+        // ── Memory tier: prefetch PIO2-resident data into SRAM cache ──
+        // Build ID arrays from the draw list for prefetch.
+        // (Lightweight — just indexes into the existing draw list.)
         {
             static uint16_t meshIds[GpuConfig::MAX_DRAW_CALLS];
             static uint16_t matIds[GpuConfig::MAX_DRAW_CALLS];
@@ -594,24 +427,34 @@ void GpuCore::Core0Main() {
                 meshIds, matIds, nullptr, sceneState.drawCallCount);
         }
 
-        // ── Tile rasterization (dual-core, work-stealing) ──
-        PerfCounters::Begin(PerfStage::RasterTop);
+        // ── Rasterize via tile scheduler (32 tiles, work-stealing) ──
+        // Both cores pull 16×16 tiles from an atomic counter in Morton order.
+        // Each tile queries the QuadTree once (256-pixel amortisation).
+        PerfCounters::Begin(PerfStage::RasterTop);   // reuse stage for "raster total"
         tileScheduler.DispatchTilePass(
             &rasterizer, backBuffer, zBuffer,
             GpuConfig::PANEL_WIDTH, GpuConfig::PANEL_HEIGHT,
             Hub75Driver::PollRefresh);
         PerfCounters::End(PerfStage::RasterTop);
 
-        // ── Accumulate elapsed time ──
+        // ── Accumulate elapsed time for animated shaders ──
+        // Wrap at 3600 s (1 hour) to prevent float32 precision loss.
+        // Animated shaders use periodic functions (sin/cos), so wrapping is safe.
         elapsedTimeS += sceneState.frameTimeUs / 1000000.0f;
-        if (elapsedTimeS > 3600.0f) elapsedTimeS -= 3600.0f;
+        if (elapsedTimeS > 3600.0f) {
+            elapsedTimeS -= 3600.0f;
+        }
 
-        // ── Screenspace post-processing shaders ──
+        // ── Apply screen-space post-processing shaders ──
         PerfCounters::Begin(PerfStage::Shaders);
+        // Reuse the Z-buffer (16 KB uint16_t) as scratch for shaders.
+        // Z data is stale after rasterization, so this is safe.
         ScreenspaceShaders::ApplyShaders(
-            backBuffer, zBuffer,
+            backBuffer,
+            zBuffer,
             GpuConfig::PANEL_WIDTH, GpuConfig::PANEL_HEIGHT,
-            &sceneState, elapsedTimeS);
+            &sceneState,
+            elapsedTimeS);
         PerfCounters::End(PerfStage::Shaders);
 
         // ── Swap framebuffers ──
@@ -620,28 +463,30 @@ void GpuCore::Core0Main() {
         frontBuffer = backBuffer;
         backBuffer = temp;
         Hub75Driver::SetFramebuffer(frontBuffer);
+
+        // ── Update command parser's framebuffer pointers after swap ──
         CommandParser::UpdateFramebufferPtrs(frontBuffer, backBuffer);
 
         // ── Memory tier: end-of-frame flush ──
+        // Write back dirty SRAM cache lines to external memory.
         memTierManager.EndFrame();
 
-        // ── Update flow control (IRQ pin) with hysteresis ──
-        // IRQ is active-low: asserted (0) = backpressure, deasserted (1) = OK
+        // ── Update flow control (RDY pin) with hysteresis ──
         uint32_t freeBytes = OctalSpiRx::GetFreeBytes();
-        bool irqAsserted = !gpio_get(GpuConfig::IRQ_PIN);  // active-low
-        if (!irqAsserted) {
-            // Currently OK — check if we need to assert backpressure
+        bool rdyHigh = gpio_get(GpuConfig::RDY_PIN);
+        if (rdyHigh) {
+            // Currently asserted — deassert when free space drops below 25%
             uint32_t deassertThreshold = GpuConfig::SPI_RING_BUFFER_SIZE
-                                       * GpuConfig::IRQ_DEASSERT_THRESHOLD / 100;
+                                       * GpuConfig::RDY_DEASSERT_THRESHOLD / 100;
             if (freeBytes < deassertThreshold) {
-                gpio_put(GpuConfig::IRQ_PIN, 0);  // assert IRQ (backpressure)
+                gpio_put(GpuConfig::RDY_PIN, 0);
             }
         } else {
-            // Currently backpressure — check if we can release
+            // Currently deasserted — reassert when free space rises above 50%
             uint32_t assertThreshold = GpuConfig::SPI_RING_BUFFER_SIZE
-                                     * GpuConfig::IRQ_ASSERT_THRESHOLD / 100;
+                                     * GpuConfig::RDY_ASSERT_THRESHOLD / 100;
             if (freeBytes >= assertThreshold) {
-                gpio_put(GpuConfig::IRQ_PIN, 1);  // deassert IRQ (OK)
+                gpio_put(GpuConfig::RDY_PIN, 1);
             }
         }
 
@@ -651,14 +496,18 @@ void GpuCore::Core0Main() {
         frameCount++;
         UpdateFpsMeasurement();
 
-        // ── Update I2C status ──
+        // ── Update I2C status response ──
         I2CSlave::UpdateStatus(
             measuredFps,
             static_cast<uint16_t>(droppedFrames),
             OctalSpiRx::GetFreeBytes(),
-            0, false);
+            0,    // temperature: not measured yet
+            false // renderBusy: cleared after render complete
+        );
 
-        // ── Update I2C extended status ──
+        // ── Update I2C extended status response ──
+        // Provides per-core usage, frame timing, clock, and temperature
+        // to the host via PGL_REG_EXTENDED_STATUS.
         {
             float tempC = I2CSlave::ReadTemperature();
             int16_t tempQ8 = static_cast<int16_t>(tempC * 256.0f);
@@ -669,30 +518,41 @@ void GpuCore::Core0Main() {
             I2CSlave::UpdateExtendedStatus(
                 measuredFps,
                 static_cast<uint16_t>(droppedFrames),
-                0, 0, 0, 0,
-                tempQ8, clkMHz, sramFree,
+                0,     // gpuUsage: TODO compute from perf counters
+                0,     // core0Usage: TODO
+                0,     // core1Usage: TODO
+                0,     // flags
+                tempQ8,
+                clkMHz,
+                sramFree,
                 static_cast<uint16_t>(PerfCounters::stages[static_cast<uint8_t>(PerfStage::FrameTotal)].LastUs()),
                 static_cast<uint16_t>(PerfCounters::stages[static_cast<uint8_t>(PerfStage::RasterTop)].LastUs()),
                 static_cast<uint16_t>(PerfCounters::stages[static_cast<uint8_t>(PerfStage::SpiReceive)].LastUs()),
-                0);
+                0      // hub75RefreshHz: TODO
+            );
         }
 
         // ── Update memory tier info for I2C readback ──
         {
             PglMemTierInfoResponse& ti = sceneState.memTierInfo;
-            ti.sramTotalKB = 520;
+            // Tier 0 — SRAM
+            ti.sramTotalKB = 520;  // RP2350 has 520 KB SRAM
             ti.sramFreeKB  = static_cast<uint16_t>(
                 520 - (memTierManager.GetSramCacheUsed() / 1024));
+            // Tier 1 — PIO2
             ti.opiTotalKB = static_cast<uint16_t>(
                 opiDriver.IsInitialized() ? opiDriver.GetCapacity() / 1024 : 0);
             ti.opiFreeKB  = static_cast<uint16_t>(
                 opiDriver.IsInitialized() ? opiDriver.Available() / 1024 : 0);
             ti.opiEnabled = opiDriver.IsInitialized() ? 1 : 0;
+            // Tier 2 — QSPI CS1
             ti.qspiTotalKB = static_cast<uint16_t>(
                 qspiDriver.IsInitialized() ? qspiDriver.GetCapacity() / 1024 : 0);
             ti.qspiFreeKB  = static_cast<uint16_t>(
                 qspiDriver.IsInitialized() ? qspiDriver.Available() / 1024 : 0);
             ti.qspiEnabled = qspiDriver.IsInitialized() ? 1 : 0;
+            // Cache stats
+            // (cachedEntries, cacheHitRate left as-is for now)
         }
 
         // ── Periodic profiling report ──
@@ -705,45 +565,23 @@ void GpuCore::Core0Main() {
     }
 }
 
-#endif // RP2350GPU_HEADLESS_SELFTEST
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Core 1 Main Loop — shared by both modes (tile scheduler work-stealing)
-// ═══════════════════════════════════════════════════════════════════════════
+// ─── Core 1 Main Loop ──────────────────────────────────────────────────────
 
 void GpuCore::Core1Main() {
     printf("[GpuCore] Core 1 entering tile scheduler loop\n");
-    tileScheduler.Core1Main();  // never returns
+    tileScheduler.Core1Main();  // never returns — work-stealing tile loop
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// VRAM Mode & Driver Access
-// ═══════════════════════════════════════════════════════════════════════════
+// ─── VRAMless Mode + Self-Test Support ──────────────────────────────────────
 
 GpuCore::VramMode GpuCore::GetVramMode() {
     return g_vramMode;
 }
 
 void GpuCore::GetVramDrivers(OpiPsramDriver** opiOut, QspiPsramDriver** qspiOut) {
-#ifdef RP2350GPU_HEADLESS_SELFTEST
-    if (opiOut)  *opiOut  = nullptr;
-    if (qspiOut) *qspiOut = nullptr;
-#else
     if (opiOut)  *opiOut  = g_opiDriverPtr;
     if (qspiOut) *qspiOut = g_qspiDriverPtr;
-#endif
 }
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Host Wait & HUB75 Self-Test (normal mode only)
-// ═══════════════════════════════════════════════════════════════════════════
-
-#ifdef RP2350GPU_HEADLESS_SELFTEST
-
-bool GpuCore::WaitForHost(uint32_t) { return false; }
-void GpuCore::RunSelfTest() {}
-
-#else
 
 bool GpuCore::WaitForHost(uint32_t timeoutMs) {
     printf("[GpuCore] Waiting up to %lu ms for host SPI data...\n", (unsigned long)timeoutMs);
@@ -752,11 +590,14 @@ bool GpuCore::WaitForHost(uint32_t timeoutMs) {
     uint32_t timeoutUs = timeoutMs * 1000;
 
     while ((time_us_32() - startUs) < timeoutUs) {
+        // Keep display alive
         Hub75Driver::PollRefresh();
+
+        // Check if any SPI data has arrived in the ring buffer
         uint32_t freeBytes = OctalSpiRx::GetFreeBytes();
         if (freeBytes < GpuConfig::SPI_RING_BUFFER_SIZE) {
             uint32_t received = GpuConfig::SPI_RING_BUFFER_SIZE - freeBytes;
-            printf("[GpuCore] Host SPI data detected (%lu bytes)\n",
+            printf("[GpuCore] Host SPI data detected (%lu bytes in buffer)\n",
                    (unsigned long)received);
             return true;
         }
@@ -774,19 +615,23 @@ void GpuCore::RunSelfTest() {
            g_vramMode == VramMode::QSPI_ONLY ? "QSPI_ONLY" :
            g_vramMode == VramMode::DUAL_VRAM ? "DUAL_VRAM" : "?");
 
+    // Run the full self-test suite with visual feedback on HUB75
     GpuSelfTest::SelfTestResult result = GpuSelfTest::RunAll(
         frontBuffer, backBuffer, zBuffer,
         g_opiDriverPtr, g_qspiDriverPtr,
         GpuConfig::PANEL_WIDTH, GpuConfig::PANEL_HEIGHT);
 
+    // Self-test display hold loop: keep results visible while checking for host
     printf("[GpuCore] Self-test complete. Holding display (waiting for host)...\n");
 
     while (true) {
         Hub75Driver::PollRefresh();
 
+        // Auto-exit self-test when host connects
         uint32_t freeBytes = OctalSpiRx::GetFreeBytes();
         if (freeBytes < GpuConfig::SPI_RING_BUFFER_SIZE) {
             printf("[GpuCore] Host SPI data detected — exiting self-test mode\n");
+            // Consume any partial data
             const uint8_t* dummy = nullptr;
             uint32_t dummyLen = 0;
             if (OctalSpiRx::TryGetFrame(&dummy, &dummyLen)) {
@@ -795,8 +640,22 @@ void GpuCore::RunSelfTest() {
             break;
         }
 
+        // Sync brightness from I2C (host might set brightness even in self-test)
         Hub75Driver::SetBrightness(I2CSlave::GetBrightness());
     }
 }
 
-#endif // RP2350GPU_HEADLESS_SELFTEST
+#else  // RP2350GPU_HEADLESS_SELFTEST — minimal stubs (never called at runtime)
+
+bool GpuCore::Initialize() { return false; }
+void GpuCore::Core0Main() {}
+void GpuCore::Core1Main() {}
+GpuCore::VramMode GpuCore::GetVramMode() { return VramMode::SRAM_ONLY; }
+void GpuCore::GetVramDrivers(OpiPsramDriver** o, QspiPsramDriver** q) {
+    if (o) *o = nullptr;
+    if (q) *q = nullptr;
+}
+bool GpuCore::WaitForHost(uint32_t) { return false; }
+void GpuCore::RunSelfTest() {}
+
+#endif  // RP2350GPU_HEADLESS_SELFTEST

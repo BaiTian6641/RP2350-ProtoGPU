@@ -1,0 +1,658 @@
+/**
+ * @file headless_selftest.cpp
+ * @brief Headless self-test — renders ProtoGL scenes on SSD1331 OLED.
+ *
+ * Uses the full ProtoGL GPU rendering pipeline (SceneState, Rasterizer) to
+ * draw meshes defined in memory and display the result on a 96×64 SSD1331
+ * OLED panel.
+ *
+ * Scene contents:
+ *   - Mesh 0: A single triangle (3 vertices, 1 face)
+ *   - Mesh 1: A cube (8 vertices, 12 faces)
+ *   - Material 0: Gradient (red→green→blue) along Y axis (for the triangle)
+ *   - Material 1: Normal-map material (for the cube — shows face orientation)
+ *   - Material 2: Solid cyan (second small triangle)
+ *   - Camera 0: Perspective camera, positioned along +Z looking at origin
+ *
+ * The triangle sits on the left, the rotating cube on the right, and a small
+ * solid-cyan triangle sits below the cube.  FPS and CPU usage are overlaid.
+ *
+ * Only compiled when RP2350GPU_HEADLESS_SELFTEST is defined.
+ */
+
+#ifdef RP2350GPU_HEADLESS_SELFTEST
+
+#include "headless_selftest.h"
+#include "ssd1331_driver.h"
+#include "../gpu_config.h"
+#include "../scene_state.h"
+#include "../render/rasterizer.h"
+#include "../math/pgl_math.h"
+
+#include "pico/stdlib.h"
+
+#include <cstdio>
+#include <cstring>
+#include <cmath>
+
+// ─── Display Constants ──────────────────────────────────────────────────────
+
+static constexpr uint16_t W = GpuConfig::SSD1331_WIDTH;   // 96
+static constexpr uint16_t H = GpuConfig::SSD1331_HEIGHT;  // 64
+static constexpr uint32_t FB_PIXELS = W * H;
+
+// ─── Framebuffer & Z-buffer ─────────────────────────────────────────────────
+
+static uint16_t g_fb[FB_PIXELS];
+static uint16_t g_zb[FB_PIXELS];
+
+// ─── Scene & Rasterizer ─────────────────────────────────────────────────────
+
+static SceneState  g_scene;
+static Rasterizer  g_rasterizer;
+
+// ─── RGB565 Helper ──────────────────────────────────────────────────────────
+
+static inline uint16_t Rgb565(uint8_t r, uint8_t g, uint8_t b) {
+    return ((uint16_t)(r >> 3) << 11) |
+           ((uint16_t)(g >> 2) <<  5) |
+           ((uint16_t)(b >> 3));
+}
+
+// ─── Minimal 5×7 Bitmap Font ────────────────────────────────────────────────
+// Covers ASCII 0x20–0x7E (space to tilde). Each glyph is 5 columns wide,
+// 7 rows tall, stored as 5 bytes (one per column, LSB = top row).
+
+// clang-format off
+static const uint8_t font5x7[][5] = {
+    // 0x20 ' '
+    {0x00,0x00,0x00,0x00,0x00},
+    // 0x21 '!'
+    {0x00,0x00,0x5F,0x00,0x00},
+    // 0x22 '"'
+    {0x00,0x07,0x00,0x07,0x00},
+    // 0x23 '#'
+    {0x14,0x7F,0x14,0x7F,0x14},
+    // 0x24 '$'
+    {0x24,0x2A,0x7F,0x2A,0x12},
+    // 0x25 '%'
+    {0x23,0x13,0x08,0x64,0x62},
+    // 0x26 '&'
+    {0x36,0x49,0x55,0x22,0x50},
+    // 0x27 '''
+    {0x00,0x05,0x03,0x00,0x00},
+    // 0x28 '('
+    {0x00,0x1C,0x22,0x41,0x00},
+    // 0x29 ')'
+    {0x00,0x41,0x22,0x1C,0x00},
+    // 0x2A '*'
+    {0x14,0x08,0x3E,0x08,0x14},
+    // 0x2B '+'
+    {0x08,0x08,0x3E,0x08,0x08},
+    // 0x2C ','
+    {0x00,0x50,0x30,0x00,0x00},
+    // 0x2D '-'
+    {0x08,0x08,0x08,0x08,0x08},
+    // 0x2E '.'
+    {0x00,0x60,0x60,0x00,0x00},
+    // 0x2F '/'
+    {0x20,0x10,0x08,0x04,0x02},
+    // 0x30 '0'
+    {0x3E,0x51,0x49,0x45,0x3E},
+    // 0x31 '1'
+    {0x00,0x42,0x7F,0x40,0x00},
+    // 0x32 '2'
+    {0x42,0x61,0x51,0x49,0x46},
+    // 0x33 '3'
+    {0x21,0x41,0x45,0x4B,0x31},
+    // 0x34 '4'
+    {0x18,0x14,0x12,0x7F,0x10},
+    // 0x35 '5'
+    {0x27,0x45,0x45,0x45,0x39},
+    // 0x36 '6'
+    {0x3C,0x4A,0x49,0x49,0x30},
+    // 0x37 '7'
+    {0x01,0x71,0x09,0x05,0x03},
+    // 0x38 '8'
+    {0x36,0x49,0x49,0x49,0x36},
+    // 0x39 '9'
+    {0x06,0x49,0x49,0x29,0x1E},
+    // 0x3A ':'
+    {0x00,0x36,0x36,0x00,0x00},
+    // 0x3B ';'
+    {0x00,0x56,0x36,0x00,0x00},
+    // 0x3C '<'
+    {0x08,0x14,0x22,0x41,0x00},
+    // 0x3D '='
+    {0x14,0x14,0x14,0x14,0x14},
+    // 0x3E '>'
+    {0x00,0x41,0x22,0x14,0x08},
+    // 0x3F '?'
+    {0x02,0x01,0x51,0x09,0x06},
+    // 0x40 '@'
+    {0x32,0x49,0x79,0x41,0x3E},
+    // 0x41 'A'
+    {0x7E,0x11,0x11,0x11,0x7E},
+    // 0x42 'B'
+    {0x7F,0x49,0x49,0x49,0x36},
+    // 0x43 'C'
+    {0x3E,0x41,0x41,0x41,0x22},
+    // 0x44 'D'
+    {0x7F,0x41,0x41,0x22,0x1C},
+    // 0x45 'E'
+    {0x7F,0x49,0x49,0x49,0x41},
+    // 0x46 'F'
+    {0x7F,0x09,0x09,0x09,0x01},
+    // 0x47 'G'
+    {0x3E,0x41,0x49,0x49,0x7A},
+    // 0x48 'H'
+    {0x7F,0x08,0x08,0x08,0x7F},
+    // 0x49 'I'
+    {0x00,0x41,0x7F,0x41,0x00},
+    // 0x4A 'J'
+    {0x20,0x40,0x41,0x3F,0x01},
+    // 0x4B 'K'
+    {0x7F,0x08,0x14,0x22,0x41},
+    // 0x4C 'L'
+    {0x7F,0x40,0x40,0x40,0x40},
+    // 0x4D 'M'
+    {0x7F,0x02,0x0C,0x02,0x7F},
+    // 0x4E 'N'
+    {0x7F,0x04,0x08,0x10,0x7F},
+    // 0x4F 'O'
+    {0x3E,0x41,0x41,0x41,0x3E},
+    // 0x50 'P'
+    {0x7F,0x09,0x09,0x09,0x06},
+    // 0x51 'Q'
+    {0x3E,0x41,0x51,0x21,0x5E},
+    // 0x52 'R'
+    {0x7F,0x09,0x19,0x29,0x46},
+    // 0x53 'S'
+    {0x46,0x49,0x49,0x49,0x31},
+    // 0x54 'T'
+    {0x01,0x01,0x7F,0x01,0x01},
+    // 0x55 'U'
+    {0x3F,0x40,0x40,0x40,0x3F},
+    // 0x56 'V'
+    {0x1F,0x20,0x40,0x20,0x1F},
+    // 0x57 'W'
+    {0x3F,0x40,0x38,0x40,0x3F},
+    // 0x58 'X'
+    {0x63,0x14,0x08,0x14,0x63},
+    // 0x59 'Y'
+    {0x07,0x08,0x70,0x08,0x07},
+    // 0x5A 'Z'
+    {0x61,0x51,0x49,0x45,0x43},
+    // 0x5B '['
+    {0x00,0x7F,0x41,0x41,0x00},
+    // 0x5C '\'
+    {0x02,0x04,0x08,0x10,0x20},
+    // 0x5D ']'
+    {0x00,0x41,0x41,0x7F,0x00},
+    // 0x5E '^'
+    {0x04,0x02,0x01,0x02,0x04},
+    // 0x5F '_'
+    {0x40,0x40,0x40,0x40,0x40},
+    // 0x60 '`'
+    {0x00,0x01,0x02,0x04,0x00},
+    // 0x61 'a'
+    {0x20,0x54,0x54,0x54,0x78},
+    // 0x62 'b'
+    {0x7F,0x48,0x44,0x44,0x38},
+    // 0x63 'c'
+    {0x38,0x44,0x44,0x44,0x20},
+    // 0x64 'd'
+    {0x38,0x44,0x44,0x48,0x7F},
+    // 0x65 'e'
+    {0x38,0x54,0x54,0x54,0x18},
+    // 0x66 'f'
+    {0x08,0x7E,0x09,0x01,0x02},
+    // 0x67 'g'
+    {0x0C,0x52,0x52,0x52,0x3E},
+    // 0x68 'h'
+    {0x7F,0x08,0x04,0x04,0x78},
+    // 0x69 'i'
+    {0x00,0x44,0x7D,0x40,0x00},
+    // 0x6A 'j'
+    {0x20,0x40,0x44,0x3D,0x00},
+    // 0x6B 'k'
+    {0x7F,0x10,0x28,0x44,0x00},
+    // 0x6C 'l'
+    {0x00,0x41,0x7F,0x40,0x00},
+    // 0x6D 'm'
+    {0x7C,0x04,0x18,0x04,0x78},
+    // 0x6E 'n'
+    {0x7C,0x08,0x04,0x04,0x78},
+    // 0x6F 'o'
+    {0x38,0x44,0x44,0x44,0x38},
+    // 0x70 'p'
+    {0x7C,0x14,0x14,0x14,0x08},
+    // 0x71 'q'
+    {0x08,0x14,0x14,0x18,0x7C},
+    // 0x72 'r'
+    {0x7C,0x08,0x04,0x04,0x08},
+    // 0x73 's'
+    {0x48,0x54,0x54,0x54,0x20},
+    // 0x74 't'
+    {0x04,0x3F,0x44,0x40,0x20},
+    // 0x75 'u'
+    {0x3C,0x40,0x40,0x20,0x7C},
+    // 0x76 'v'
+    {0x1C,0x20,0x40,0x20,0x1C},
+    // 0x77 'w'
+    {0x3C,0x40,0x30,0x40,0x3C},
+    // 0x78 'x'
+    {0x44,0x28,0x10,0x28,0x44},
+    // 0x79 'y'
+    {0x0C,0x50,0x50,0x50,0x3C},
+    // 0x7A 'z'
+    {0x44,0x64,0x54,0x4C,0x44},
+    // 0x7B '{'
+    {0x00,0x08,0x36,0x41,0x00},
+    // 0x7C '|'
+    {0x00,0x00,0x7F,0x00,0x00},
+    // 0x7D '}'
+    {0x00,0x41,0x36,0x08,0x00},
+    // 0x7E '~'
+    {0x10,0x08,0x08,0x10,0x08},
+};
+// clang-format on
+
+/// Draw a single character at (x, y) with the given colour.
+static void DrawChar(uint16_t x, uint16_t y, char ch, uint16_t color) {
+    if (ch < 0x20 || ch > 0x7E) ch = '?';
+    const uint8_t* glyph = font5x7[ch - 0x20];
+
+    for (uint8_t col = 0; col < 5; ++col) {
+        uint8_t bits = glyph[col];
+        for (uint8_t row = 0; row < 7; ++row) {
+            if (bits & (1 << row)) {
+                uint16_t px = x + col;
+                uint16_t py = y + row;
+                if (px < W && py < H) {
+                    g_fb[py * W + px] = color;
+                }
+            }
+        }
+    }
+}
+
+/// Draw a null-terminated string starting at (x, y), 6-pixel pitch.
+static void DrawString(uint16_t x, uint16_t y, const char* str, uint16_t color) {
+    while (*str) {
+        DrawChar(x, y, *str, color);
+        x += 6;
+        ++str;
+    }
+}
+
+/// Draw a right-aligned string ending at xRight.
+static void DrawStringRight(uint16_t xRight, uint16_t y, const char* str, uint16_t color) {
+    uint16_t len = 0;
+    while (str[len]) ++len;
+    uint16_t totalW = len * 6;
+    int16_t startX = (int16_t)xRight - totalW;
+    if (startX < 0) startX = 0;
+    DrawString((uint16_t)startX, y, str, color);
+}
+
+// ─── Simple itoa (no heap) ──────────────────────────────────────────────────
+
+static void IntToStr(int32_t val, char* buf, uint8_t bufSize) {
+    if (bufSize == 0) return;
+    bool neg = (val < 0);
+    if (neg) val = -val;
+
+    // Build digits in reverse
+    char tmp[12];
+    uint8_t len = 0;
+    do {
+        tmp[len++] = '0' + (val % 10);
+        val /= 10;
+    } while (val > 0 && len < sizeof(tmp));
+    if (neg && len < sizeof(tmp)) tmp[len++] = '-';
+
+    // Reverse into output
+    uint8_t i = 0;
+    while (len > 0 && i < bufSize - 1) {
+        buf[i++] = tmp[--len];
+    }
+    buf[i] = '\0';
+}
+
+// ─── Mesh Data — Triangle ───────────────────────────────────────────────────
+//
+// A single equilateral-ish triangle, centred at origin, ~1.6 units tall.
+// Placed at mesh slot 0.
+
+static const PglVec3 kTriangleVerts[] = {
+    {  0.0f,  0.8f, 0.0f },   // top
+    { -0.7f, -0.5f, 0.0f },   // bottom-left
+    {  0.7f, -0.5f, 0.0f },   // bottom-right
+};
+static const PglIndex3 kTriangleIndices[] = {
+    { 0, 1, 2 },
+};
+static constexpr uint16_t kTriVertCount = 3;
+static constexpr uint16_t kTriFaceCount = 1;
+
+// ─── Mesh Data — Cube ───────────────────────────────────────────────────────
+//
+// Unit cube centred at origin (side length 1.0).  12 triangles (2 per face).
+// Placed at mesh slot 1.  Winding order is CCW from outside.
+
+static const PglVec3 kCubeVerts[] = {
+    // Front face (z = +0.5)
+    { -0.5f, -0.5f,  0.5f },  // 0
+    {  0.5f, -0.5f,  0.5f },  // 1
+    {  0.5f,  0.5f,  0.5f },  // 2
+    { -0.5f,  0.5f,  0.5f },  // 3
+    // Back face (z = -0.5)
+    { -0.5f, -0.5f, -0.5f },  // 4
+    {  0.5f, -0.5f, -0.5f },  // 5
+    {  0.5f,  0.5f, -0.5f },  // 6
+    { -0.5f,  0.5f, -0.5f },  // 7
+};
+static const PglIndex3 kCubeIndices[] = {
+    // Front  (+Z)
+    { 0, 1, 2 }, { 0, 2, 3 },
+    // Back   (-Z)
+    { 5, 4, 7 }, { 5, 7, 6 },
+    // Right  (+X)
+    { 1, 5, 6 }, { 1, 6, 2 },
+    // Left   (-X)
+    { 4, 0, 3 }, { 4, 3, 7 },
+    // Top    (+Y)
+    { 3, 2, 6 }, { 3, 6, 7 },
+    // Bottom (-Y)
+    { 4, 5, 1 }, { 4, 1, 0 },
+};
+static constexpr uint16_t kCubeVertCount = 8;
+static constexpr uint16_t kCubeFaceCount = 12;
+
+// ─── Scene Setup ────────────────────────────────────────────────────────────
+//
+// Populate SceneState with meshes, materials, and camera.
+// Persistent resources (meshes, materials, camera) are set up once.
+// Draw calls are rebuilt every frame via BuildDrawList().
+
+static void BuildScene() {
+    g_scene.Reset();
+
+    // ── Mesh 0: Triangle ────────────────────────────────────────────────
+    {
+        MeshSlot& m = g_scene.meshes[0];
+        m.active        = true;
+        m.vertexCount   = kTriVertCount;
+        m.triangleCount = kTriFaceCount;
+
+        m.vertices = g_scene.AllocVertices(kTriVertCount);
+        m.indices  = g_scene.AllocIndices(kTriFaceCount);
+
+        std::memcpy(m.vertices, kTriangleVerts, kTriVertCount * sizeof(PglVec3));
+        std::memcpy(m.indices,  kTriangleIndices, kTriFaceCount * sizeof(PglIndex3));
+        m.RecomputeAABB();
+    }
+
+    // ── Mesh 1: Cube ────────────────────────────────────────────────────
+    {
+        MeshSlot& m = g_scene.meshes[1];
+        m.active        = true;
+        m.vertexCount   = kCubeVertCount;
+        m.triangleCount = kCubeFaceCount;
+
+        m.vertices = g_scene.AllocVertices(kCubeVertCount);
+        m.indices  = g_scene.AllocIndices(kCubeFaceCount);
+
+        std::memcpy(m.vertices, kCubeVerts, kCubeVertCount * sizeof(PglVec3));
+        std::memcpy(m.indices,  kCubeIndices, kCubeFaceCount * sizeof(PglIndex3));
+        m.RecomputeAABB();
+    }
+
+    // ── Material 0: Rainbow gradient along Y (for triangle) ─────────────
+    {
+        MaterialSlot& mat = g_scene.materials[0];
+        mat.active    = true;
+        mat.type      = PGL_MAT_GRADIENT;
+        mat.blendMode = PGL_BLEND_BASE;
+
+        // Build gradient params in-place:
+        // Header: 3 stops
+        PglParamGradientHeader* hdr =
+            reinterpret_cast<PglParamGradientHeader*>(mat.params);
+        hdr->stopCount = 3;
+
+        PglGradientStop* stops = reinterpret_cast<PglGradientStop*>(
+            mat.params + sizeof(PglParamGradientHeader));
+        stops[0] = { 0.0f, 255,  50,  50 };  // red   at bottom
+        stops[1] = { 0.5f,  50, 255,  50 };  // green at middle
+        stops[2] = { 1.0f,  50,  80, 255 };  // blue  at top
+
+        // After stops: axis(1 byte) + rangeMin(4) + rangeMax(4)
+        uint8_t* afterStops = mat.params
+            + sizeof(PglParamGradientHeader)
+            + 3 * sizeof(PglGradientStop);
+        afterStops[0] = 1;  // Y axis
+
+        float rangeMin = -0.6f;
+        float rangeMax =  0.9f;
+        std::memcpy(afterStops + 1, &rangeMin, sizeof(float));
+        std::memcpy(afterStops + 5, &rangeMax, sizeof(float));
+    }
+
+    // ── Material 1: Normal-map (shows face orientation as colour) ────────
+    {
+        MaterialSlot& mat = g_scene.materials[1];
+        mat.active    = true;
+        mat.type      = PGL_MAT_NORMAL;
+        mat.blendMode = PGL_BLEND_BASE;
+        // Normal material has no extra params — colour is derived from face normal
+    }
+
+    // ── Material 2: Solid cyan (for a second small triangle) ─────────────
+    {
+        MaterialSlot& mat = g_scene.materials[2];
+        mat.active    = true;
+        mat.type      = PGL_MAT_SIMPLE;
+        mat.blendMode = PGL_BLEND_BASE;
+
+        PglParamSimple* p = reinterpret_cast<PglParamSimple*>(mat.params);
+        p->r = 0;
+        p->g = 220;
+        p->b = 255;
+    }
+
+    // ── Camera 0: Perspective, looking down -Z ──────────────────────────
+    {
+        CameraSlot& cam = g_scene.cameras[0];
+        cam.active       = true;
+        cam.layoutId     = 0;
+        cam.position     = { 0.0f, 0.0f, 5.0f };
+        cam.rotation     = { 1.0f, 0.0f, 0.0f, 0.0f };   // identity quat
+        cam.baseRotation = { 1.0f, 0.0f, 0.0f, 0.0f };
+        cam.scale        = { 1.0f, 1.0f, 1.0f };
+        cam.is2D         = false;
+    }
+
+    printf("[HeadlessSelfTest] Scene built: 2 meshes, 3 materials, 1 camera\n");
+}
+
+/// Helper: make an identity PglTransform with the given position and scale.
+static PglTransform MakeTransform(PglVec3 pos, PglVec3 scl, PglQuat rot) {
+    PglTransform t;
+    std::memset(&t, 0, sizeof(t));
+    t.position              = pos;
+    t.scale                 = scl;
+    t.rotation              = rot;
+    t.baseRotation          = { 1.0f, 0.0f, 0.0f, 0.0f };
+    t.scaleRotationOffset   = { 1.0f, 0.0f, 0.0f, 0.0f };
+    return t;
+}
+
+/// Build the draw list for this frame with an updated cube rotation.
+static void BuildDrawList(float cubeAngleY, float cubeAngleX) {
+    // Reset draw list for this frame (preserves meshes/materials/camera)
+    g_scene.drawCallCount = 0;
+    std::memset(g_scene.drawList, 0, sizeof(g_scene.drawList));
+
+    static const PglQuat kIdentityQ = { 1.0f, 0.0f, 0.0f, 0.0f };
+    static const PglVec3 kUnitScale = { 1.0f, 1.0f, 1.0f };
+
+    // ── Draw call 0: Triangle (left side, static) ───────────────────────
+    {
+        DrawCall& dc = g_scene.drawList[0];
+        dc.enabled    = true;
+        dc.meshId     = 0;   // triangle mesh
+        dc.materialId = 0;   // gradient material
+        dc.transform  = MakeTransform(
+            { -1.2f, 0.0f, 0.0f },     // shifted left
+            kUnitScale,
+            kIdentityQ
+        );
+    }
+
+    // ── Draw call 1: Cube (right side, rotating) ────────────────────────
+    {
+        DrawCall& dc = g_scene.drawList[1];
+        dc.enabled    = true;
+        dc.meshId     = 1;   // cube mesh
+        dc.materialId = 1;   // normal-map material
+
+        // Build rotation quaternion: Ry(cubeAngleY) * Rx(cubeAngleX)
+        float halfY = cubeAngleY * 0.5f;
+        float halfX = cubeAngleX * 0.5f;
+        PglQuat qy = { cosf(halfY), 0.0f, sinf(halfY), 0.0f };
+        PglQuat qx = { cosf(halfX), sinf(halfX), 0.0f, 0.0f };
+        PglQuat rot = PglMath::QuatMul(qy, qx);
+
+        dc.transform = MakeTransform(
+            { 1.2f, 0.0f, 0.0f },      // shifted right
+            kUnitScale,
+            rot
+        );
+    }
+
+    // ── Draw call 2: Small triangle (below cube, static, solid cyan) ────
+    {
+        DrawCall& dc = g_scene.drawList[2];
+        dc.enabled    = true;
+        dc.meshId     = 0;   // reuse triangle mesh
+        dc.materialId = 2;   // solid cyan material
+
+        dc.transform = MakeTransform(
+            { 1.2f, -1.4f, 0.0f },     // below the cube
+            { 0.5f,  0.5f, 0.5f },     // half scale
+            kIdentityQ
+        );
+    }
+
+    g_scene.drawCallCount = 3;
+}
+
+// ─── Main Render Loop ───────────────────────────────────────────────────────
+
+void HeadlessSelfTest::Run() {
+    printf("\n[HeadlessSelfTest] Initializing SSD1331 OLED...\n");
+
+    if (!Ssd1331::Initialize()) {
+        printf("[HeadlessSelfTest] ERROR: SSD1331 init failed\n");
+        while (true) { tight_loop_contents(); }
+    }
+
+    printf("[HeadlessSelfTest] Initializing ProtoGL rasterizer (%ux%u)...\n", W, H);
+
+    // Build scene (meshes, materials, camera) — one-time setup
+    BuildScene();
+
+    // Initialize the rasterizer for the OLED's 96×64 resolution
+    g_rasterizer.Initialize(&g_scene, g_zb, W, H);
+
+    printf("[HeadlessSelfTest] Entering render loop (ProtoGL pipeline)\n");
+
+    float cubeAngleY = 0.0f;
+    float cubeAngleX = 0.0f;
+
+    uint32_t frameCount = 0;
+    uint32_t fpsFrames = 0;
+    uint32_t lastFpsUs = time_us_32();
+    uint16_t displayFps = 0;
+    uint16_t displayUsage = 0;
+    uint32_t busyUs = 0;
+
+    while (true) {
+        uint32_t frameStartUs = time_us_32();
+
+        // ── 1. Clear framebuffer (rasterizer only writes covered pixels) ──
+        std::memset(g_fb, 0, sizeof(g_fb));
+
+        // ── 2. Build draw list with updated cube rotation ──
+        BuildDrawList(cubeAngleY, cubeAngleX);
+
+        // ── 3. PrepareFrame: transform → project → QuadTree ──
+        g_rasterizer.PrepareFrame(&g_scene);
+
+        // ── 4. Rasterize all scanlines (single-core, full range) ──
+        g_rasterizer.RasterizeRange(g_fb, 0, H);
+
+        // ── 5. Draw text overlay (FPS + usage) ──
+        {
+            char fpsStr[16];
+            IntToStr(displayFps, fpsStr, sizeof(fpsStr));
+            uint8_t len = 0;
+            while (fpsStr[len]) ++len;
+            if (len + 4 < sizeof(fpsStr)) {
+                fpsStr[len++] = 'F';
+                fpsStr[len++] = 'P';
+                fpsStr[len++] = 'S';
+                fpsStr[len] = '\0';
+            }
+            DrawString(1, 1, fpsStr, Rgb565(255, 255, 100));
+        }
+        {
+            char usageStr[16];
+            IntToStr(displayUsage, usageStr, sizeof(usageStr));
+            uint8_t len = 0;
+            while (usageStr[len]) ++len;
+            if (len + 1 < sizeof(usageStr)) {
+                usageStr[len++] = '%';
+                usageStr[len] = '\0';
+            }
+            DrawStringRight(W - 1, 1, usageStr, Rgb565(100, 255, 255));
+        }
+
+        // ── 6. Push framebuffer to SSD1331 ──
+        Ssd1331::PushFramebuffer(g_fb);
+
+        // ── 7. Advance rotation angles ──
+        cubeAngleY += 0.04f;
+        cubeAngleX += 0.015f;
+        if (cubeAngleY > 6.2832f) cubeAngleY -= 6.2832f;
+        if (cubeAngleX > 6.2832f) cubeAngleX -= 6.2832f;
+
+        // ── 8. Measure frame timing ──
+        uint32_t frameEndUs = time_us_32();
+        uint32_t frameTimeUs = frameEndUs - frameStartUs;
+        busyUs += frameTimeUs;
+
+        frameCount++;
+        fpsFrames++;
+
+        // Update FPS and usage once per second
+        uint32_t elapsedUs = frameEndUs - lastFpsUs;
+        if (elapsedUs >= 1000000) {
+            displayFps = (uint16_t)((uint64_t)fpsFrames * 1000000u / elapsedUs);
+            displayUsage = (uint16_t)((uint64_t)busyUs * 100u / elapsedUs);
+            if (displayUsage > 100) displayUsage = 100;
+
+            printf("[HeadlessSelfTest] FPS: %u, CPU: %u%%, Frame: %lu us, Tris: %u\n",
+                   displayFps, displayUsage, (unsigned long)frameTimeUs,
+                   g_rasterizer.GetTriangleCount());
+
+            fpsFrames = 0;
+            busyUs = 0;
+            lastFpsUs = frameEndUs;
+        }
+    }
+}
+
+#endif  // RP2350GPU_HEADLESS_SELFTEST

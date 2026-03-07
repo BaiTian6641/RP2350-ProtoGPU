@@ -16,6 +16,8 @@
 
 #include <cstdint>
 
+struct SceneState;  // forward declaration for memory register readback
+
 namespace I2CSlave {
 
 /**
@@ -94,6 +96,15 @@ bool ConsumeResetRequest();
  *        Clears the request after reading.
  */
 uint16_t ConsumeClockRequest(uint8_t* outVoltage = nullptr, uint8_t* outFlags = nullptr);
+
+/**
+ * @brief Set a pointer to the SceneState for I2C memory register readback.
+ *
+ * Must be called after SceneState is initialised and before memory
+ * register reads (0x0C–0x0F) are used.  The pointer must remain valid
+ * for the lifetime of the I2C slave.
+ */
+void SetSceneState(SceneState* scene);
 
 /**
  * @brief Shut down I2C slave.

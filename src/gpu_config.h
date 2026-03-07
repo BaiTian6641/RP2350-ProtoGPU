@@ -15,7 +15,7 @@ namespace GpuConfig {
 
 static constexpr uint32_t SYSTEM_CLOCK_MHZ = 150;  // default; try 200 if stable
 
-// ─── Octal SPI Receiver (PIO) ───────────────────────────────────────────────
+// ─── Bidirectional Octal SPI (PIO) ─────────────────────────────────────────────────
 
 static constexpr uint8_t SPI_DATA_BASE_PIN = 0;    // D0=GPIO0 .. D7=GPIO7
 static constexpr uint8_t SPI_DATA_PIN_COUNT = 8;
@@ -24,13 +24,16 @@ static constexpr uint8_t SPI_CS_PIN   = 9;
 
 static constexpr uint32_t SPI_RING_BUFFER_SIZE = 32768;  // 32 KB
 
-// ─── Flow Control ───────────────────────────────────────────────────────────
+// ─── Bus Direction & Notification ─────────────────────────────────────────────────
 
-static constexpr uint8_t RDY_PIN = 10;  // Output: assert high when GPU can accept data
+static constexpr uint8_t DIR_PIN = 10;  // Input: host drives direction (high=host TX, low=GPU TX)
+static constexpr uint8_t IRQ_PIN = 13;  // Output: active-low async notification to host
 
 /// Backpressure thresholds (percentage of ring buffer)
-static constexpr uint8_t RDY_ASSERT_THRESHOLD   = 50;  // assert RDY when >= 50% free
-static constexpr uint8_t RDY_DEASSERT_THRESHOLD = 25;  // deassert when < 25% free
+/// IRQ is asserted (active-low) when ring buffer free space drops below DEASSERT threshold,
+/// and deasserted when free space rises above ASSERT threshold.
+static constexpr uint8_t IRQ_ASSERT_THRESHOLD   = 50;  // deassert IRQ (release) when >= 50% free
+static constexpr uint8_t IRQ_DEASSERT_THRESHOLD = 25;  // assert IRQ (backpressure) when < 25% free
 
 // ─── I2C Slave ──────────────────────────────────────────────────────────────
 // GP14 = I2C1_SDA, GP15 = I2C1_SCL on the Pico 2 header.
@@ -61,10 +64,17 @@ static constexpr uint8_t HUB75_LAT_PIN   = 0xFF;
 static constexpr uint8_t HUB75_OE_PIN    = 0xFF;
 
 // Panel geometry
+// Headless self-test renders at 96×96 (matching SSD1331 width, square aspect).
+// Normal mode renders at 128×64 (HUB75 LED panel).
+#ifdef RP2350GPU_HEADLESS_SELFTEST
+static constexpr uint16_t PANEL_WIDTH    = 96;
+static constexpr uint16_t PANEL_HEIGHT   = 96;
+#else
 static constexpr uint16_t PANEL_WIDTH    = 128;
 static constexpr uint16_t PANEL_HEIGHT   = 64;
-static constexpr uint8_t  SCAN_ROWS      = 32;   // 1/32 scan
-static constexpr uint8_t  COLOR_DEPTH    = 8;     // BCM bits per channel
+#endif
+static constexpr uint8_t  SCAN_ROWS      = 32;   // 1/32 scan (HUB75 only)
+static constexpr uint8_t  COLOR_DEPTH    = 8;     // BCM bits per channel (HUB75 only)
 
 // ─── Framebuffer ────────────────────────────────────────────────────────────
 
@@ -74,7 +84,7 @@ static constexpr uint32_t FRAMEBUF_SIZE   = FRAMEBUF_PIXELS * 2;  // RGB565 = 2 
 // ─── Resource Limits (must be ≤ PGL_MAX_* from PglTypes.h) ─────────────────
 
 static constexpr uint16_t MAX_VERTICES   = 1024;   // per-mesh vertex limit (transform scratch)
-static constexpr uint16_t MAX_TRIANGLES  = 512;    // max projected triangles per frame
+static constexpr uint16_t MAX_TRIANGLES  = 1280;   // max projected triangles per frame (teapot needs ~600 after cull)
 static constexpr uint16_t MAX_MESHES     = 256;
 static constexpr uint16_t MAX_MATERIALS  = 256;
 static constexpr uint8_t  MAX_TEXTURES   = 64;
@@ -101,7 +111,7 @@ static constexpr uint8_t  QUADTREE_MAX_ENTITIES = 8;   // entities per leaf
 static constexpr uint16_t QUADTREE_MAX_NODES    = 256;  // total nodes (128×64 panel needs few subdivisions)
 
 // ─── External Memory: PIO2 Bus (Tier 1 — indirect, DMA) ────────────────────
-// PIO2 is the last free PIO block (PIO0 = HUB75, PIO1 = Octal SPI RX).
+// PIO2 is the last free PIO block (PIO0 = HUB75, PIO1 = Octal SPI bidir).
 // It can operate in three modes depending on the installed hardware:
 //
 //   Mode 1 — OPI PSRAM (APS6408L):
@@ -275,6 +285,23 @@ static constexpr uint32_t  QSPI_PSRAM_CLOCK_MHZ   = QSPI_MRAM_CLOCK_MHZ;
 static constexpr uintptr_t QSPI_PSRAM_XIP_BASE    = QSPI_CS1_XIP_BASE;
 static constexpr uint8_t   QSPI_PSRAM_READ_LATENCY = QSPI_MRAM_READ_LATENCY;
 static constexpr bool      QSPI_PSRAM_DDR         = QSPI_MRAM_DDR;
+
+// ─── SSD1331 OLED Display (Headless Self-Test) ──────────────────────────────
+// Used only when RP2350GPU_HEADLESS_SELFTEST is defined.
+// 96×64 RGB565 OLED connected via hardware SPI0.
+// GPIO 17 is repurposed from UART RX when this mode is active.
+
+static constexpr uint8_t  SSD1331_CS_PIN   = 17;   // Chip Select (repurposed from UART RX)
+static constexpr uint8_t  SSD1331_SCK_PIN  = 18;   // SPI0 SCK
+static constexpr uint8_t  SSD1331_MOSI_PIN = 19;   // SPI0 TX (MOSI)
+static constexpr uint8_t  SSD1331_DC_PIN   = 21;   // Data/Command select
+static constexpr uint8_t  SSD1331_RST_PIN  = 22;   // Hardware reset
+
+static constexpr uint16_t SSD1331_WIDTH    = 96;
+static constexpr uint16_t SSD1331_HEIGHT   = 64;
+// SSD1331 supports high-speed SPI transfers; 16 MHz is typically stable on
+// short PCB traces with clean signal integrity.
+static constexpr uint32_t SSD1331_SPI_BAUD = 32000000;  // 32 MHz SPI clock (requested)
 
 // ─── Memory Tiering ─────────────────────────────────────────────────────────
 // The tiered memory manager (memory/mem_tier.h) places resources across the

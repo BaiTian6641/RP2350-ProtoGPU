@@ -1,0 +1,91 @@
+/**
+ * @file main.cpp
+ * @brief ProtoGL GPU firmware entry point — RP2350 (ARM Cortex-M33 dual-core).
+ *
+ * Normal mode (default):
+ *   Core 0: SPI receive → command parse → scene update → tile raster (work-stealing)
+ *   Core 1: Tile raster (work-stealing, FIFO-triggered)
+ *   Boot: init all subsystems → wait for host → self-test or render loop
+ *
+ * Headless Self-Test (RP2350GPU_HEADLESS_SELFTEST):
+ *   Renders ProtoGL scenes (gradient triangle + rotating cube) on SSD1331
+ *   96×64 OLED.  Skips HUB75, Octal SPI, I2C, and VRAM init entirely to
+ *   save ~180 KB SRAM.  Core 1 is not launched.
+ */
+
+#include <cstdio>
+#include "pico/stdlib.h"
+#include "hardware/clocks.h"
+#include "gpu_config.h"
+
+#ifdef RP2350GPU_HEADLESS_SELFTEST
+// ─── Headless build: only SSD1331 + ProtoGL rasterizer are needed ───────────
+#include "selftest/headless_selftest.h"
+
+int main() {
+    stdio_init_all();
+    printf("\n[ProtoGL GPU] RP2350 firmware starting...\n");
+    printf("[ProtoGL GPU] System clock: %lu MHz\n", clock_get_hz(clk_sys) / 1000000);
+    printf("[ProtoGL GPU] *** HEADLESS SELF-TEST MODE ***\n");
+    printf("[ProtoGL GPU] SSD1331 OLED on SPI0: CS=GPIO%u SCK=GPIO%u MOSI=GPIO%u DC=GPIO%u RST=GPIO%u\n",
+           GpuConfig::SSD1331_CS_PIN, GpuConfig::SSD1331_SCK_PIN,
+           GpuConfig::SSD1331_MOSI_PIN, GpuConfig::SSD1331_DC_PIN,
+           GpuConfig::SSD1331_RST_PIN);
+
+    HeadlessSelfTest::Run();  // never returns
+    return 0;
+}
+
+#else
+// ─── Normal build: full GPU pipeline (HUB75, Octal SPI, I2C, VRAM) ─────────
+#include "pico/multicore.h"
+#include "gpu_core.h"
+
+/// Self-test wait timeout: how long to wait for host SPI data before
+/// entering self-test mode. Set to 0 to skip self-test entirely.
+static constexpr uint32_t SELFTEST_WAIT_MS = 2000;
+
+/// Core 1 entry — delegates to tile scheduler (never returns).
+static void core1_entry() {
+    GpuCore::Core1Main();
+    while (true) { tight_loop_contents(); }
+}
+
+int main() {
+    stdio_init_all();
+
+    printf("\n[ProtoGL GPU] RP2350 firmware starting...\n");
+    printf("[ProtoGL GPU] System clock: %lu MHz\n", clock_get_hz(clk_sys) / 1000000);
+
+    // Initialize all GPU subsystems on Core 0
+    if (!GpuCore::Initialize()) {
+        printf("[ProtoGL GPU] ERROR: Initialization failed!\n");
+        while (true) { tight_loop_contents(); }
+    }
+
+    // Report VRAM mode
+    const char* vramModeStr = "unknown";
+    switch (GpuCore::GetVramMode()) {
+        case GpuCore::VramMode::SRAM_ONLY: vramModeStr = "SRAM_ONLY (VRAMless)"; break;
+        case GpuCore::VramMode::OPI_ONLY:  vramModeStr = "OPI_ONLY"; break;
+        case GpuCore::VramMode::QSPI_ONLY: vramModeStr = "QSPI_ONLY"; break;
+        case GpuCore::VramMode::DUAL_VRAM: vramModeStr = "DUAL_VRAM"; break;
+    }
+    printf("[ProtoGL GPU] VRAM mode: %s\n", vramModeStr);
+    printf("[ProtoGL GPU] Initialization complete.\n");
+
+    // Wait for host — enter self-test if no host detected
+    if (SELFTEST_WAIT_MS > 0 && !GpuCore::WaitForHost(SELFTEST_WAIT_MS)) {
+        GpuCore::RunSelfTest();
+        printf("[ProtoGL GPU] Exited self-test mode. Continuing to normal operation.\n");
+    }
+
+    printf("[ProtoGL GPU] Launching Core 1...\n");
+    multicore_launch_core1(core1_entry);
+    printf("[ProtoGL GPU] Core 1 launched. Entering main loop.\n");
+
+    GpuCore::Core0Main();
+    return 0;
+}
+
+#endif  // RP2350GPU_HEADLESS_SELFTEST

@@ -18,6 +18,7 @@
 
 #include "i2c_slave.h"
 #include "../gpu_config.h"
+#include "../scene_state.h"
 
 // Shared ProtoGL headers
 #include <PglTypes.h>
@@ -28,6 +29,7 @@
 #include "hardware/adc.h"
 #include "hardware/clocks.h"
 #include "hardware/vreg.h"
+#include "hardware/sync.h"
 #include "hardware/structs/qmi.h"
 #include "hardware/structs/xip_ctrl.h"
 #include "pico/i2c_slave.h"
@@ -52,6 +54,9 @@ static volatile bool     clearRequested = false;
 static volatile uint16_t clockRequestMHz  = 0;
 static volatile uint8_t  clockRequestVolt = 0;
 static volatile uint8_t  clockRequestFlags = 0;
+
+/// Pointer to the GPU scene state (set by SetSceneState, used for memory registers)
+static SceneState* g_sceneState = nullptr;
 
 /// Status response (updated by UpdateStatus)
 static PglStatusResponse statusResponse{};
@@ -203,9 +208,14 @@ static constexpr uint32_t QMI_PROBE_TIMEOUT = 300000;
 
 /// Track whether QMI probe timed out (used to early-exit the probe sequence).
 static volatile bool qmiProbeTimedOut = false;
+static uint32_t qmiProbeIrqState = 0;
+static bool qmiProbeIrqsDisabled = false;
 
-static void QmiProbeEnterDirect() {
+static void __not_in_flash_func(QmiProbeEnterDirect)() {
     qmiProbeTimedOut = false;
+    qmiProbeIrqState = save_and_disable_interrupts();
+    qmiProbeIrqsDisabled = true;
+
     // Temporarily disable XIP caching to enter direct mode
     xip_ctrl_hw->ctrl &= ~(XIP_CTRL_EN_SECURE_BITS | XIP_CTRL_EN_NONSECURE_BITS);
     // Enable QMI direct-mode CS1
@@ -213,29 +223,35 @@ static void QmiProbeEnterDirect() {
                         | QMI_DIRECT_CSR_CLKDIV_BITS  // max divider for safe probe
                         | (1u << QMI_DIRECT_CSR_ASSERT_CS1N_LSB);
     // Wait for direct mode to be ready (with timeout)
+    // NOTE: No printf allowed here — XIP is disabled, code runs from SRAM only.
     uint32_t timeout = QMI_PROBE_TIMEOUT;
     while (!(qmi_hw->direct_csr & QMI_DIRECT_CSR_TXEMPTY_BITS) && --timeout) {
         tight_loop_contents();
     }
     if (timeout == 0) {
-        printf("[VRAM] QMI direct-mode enter timed out\n");
         qmiProbeTimedOut = true;
     }
 }
 
-static void QmiProbeExitDirect() {
+static void __not_in_flash_func(QmiProbeExitDirect)() {
     // Deassert CS, disable direct mode
     qmi_hw->direct_csr = 0;
     // Re-enable XIP caching
     xip_ctrl_hw->ctrl |= (XIP_CTRL_EN_SECURE_BITS | XIP_CTRL_EN_NONSECURE_BITS);
     // Fence to ensure XIP is active before returning
     __compiler_memory_barrier();
+
+    if (qmiProbeIrqsDisabled) {
+        restore_interrupts(qmiProbeIrqState);
+        qmiProbeIrqsDisabled = false;
+    }
 }
 
 /// Transfer one byte via QMI direct mode (full-duplex SPI).
 /// If `isTx` is true, sends `txByte`; otherwise sends 0xFF and returns the response.
 /// Returns 0xFF on timeout (no device present).
-static uint8_t QmiProbeTransfer(uint8_t txByte, bool isTx) {
+/// NOTE: Runs from SRAM — must not call flash-resident code.
+static uint8_t __not_in_flash_func(QmiProbeTransfer)(uint8_t txByte, bool isTx) {
     if (qmiProbeTimedOut) return 0xFF;
 
     // Wait for TX ready (with timeout)
@@ -265,17 +281,17 @@ static uint8_t QmiProbeTransfer(uint8_t txByte, bool isTx) {
     return static_cast<uint8_t>(qmi_hw->direct_rx);
 }
 
-static bool ProbeQspiCs1() {
-    // Always attempt runtime QSPI CS1 auto-detection regardless of the
-    // QSPI_CS1_ENABLED compile-time flag.  The QMI peripheral on RP2350
-    // can safely probe CS1 even when nothing is connected — the RDID
-    // commands will return 0xFF (no response), which we handle gracefully.
-    // This enables VRAMless mode: the firmware auto-detects whatever memory
-    // is physically present at boot without needing recompilation.
-    //
-    // Note: QSPI_CS1_ENABLED is still respected for compile-time optimisation
-    // hints (e.g., the tier manager's weight tables), but it no longer gates
-    // the runtime probe.
+static bool __not_in_flash_func(ProbeQspiCs1)() {
+    // Respect compile-time board configuration.  Some boards do not wire CS1
+    // and probing it can stall early boot on certain hardware revisions.
+    if (!GpuConfig::QSPI_CS1_ENABLED) {
+        printf("[VRAM] QSPI CS1 auto-detect skipped (QSPI_CS1_ENABLED=false)\n");
+        return false;
+    }
+
+    // Runtime auto-detection uses QMI direct-mode RDID reads on CS1.
+    // It is gated by QSPI_CS1_ENABLED so board configs can explicitly disable
+    // this probe when CS1 is not routed or causes early-boot instability.
 
     QmiProbeEnterDirect();
 
@@ -469,6 +485,16 @@ static void ProcessRegisterWrite() {
             }
             break;
 
+        case PGL_REG_MEM_READ_ADDR:
+            // Host writes PglMemReadSetup to set the staging read address.
+            // The actual data staging is handled by CMD_MEM_READ_REQUEST in
+            // the command parser.  This register just resets the read cursor
+            // so the host can re-read staged data via PGL_REG_MEM_READ_DATA.
+            if (g_sceneState) {
+                g_sceneState->memStagingReadPos = 0;
+            }
+            break;
+
         default:
             break;
     }
@@ -510,6 +536,49 @@ static void PrepareRegisterRead() {
             memcpy((void*)readBuffer, (const void*)&extendedStatus,
                    sizeof(extendedStatus));
             readLen = sizeof(extendedStatus);
+            break;
+
+        case PGL_REG_MEM_TIER_INFO:
+            // Return cached memory tier info (updated each frame in gpu_core.cpp)
+            if (g_sceneState) {
+                memcpy((void*)readBuffer,
+                       (const void*)&g_sceneState->memTierInfo,
+                       sizeof(PglMemTierInfoResponse));
+                readLen = sizeof(PglMemTierInfoResponse);
+            } else {
+                readLen = 0;
+            }
+            break;
+
+        case PGL_REG_MEM_READ_DATA:
+            // Return the next 32-byte chunk from the memory staging buffer.
+            // Auto-increments the read position.
+            if (g_sceneState && g_sceneState->memStagingLength > 0) {
+                uint32_t pos = g_sceneState->memStagingReadPos;
+                uint32_t remaining = g_sceneState->memStagingLength - pos;
+                uint8_t chunk = (remaining < PGL_MEM_READ_CHUNK_SIZE)
+                              ? static_cast<uint8_t>(remaining)
+                              : PGL_MEM_READ_CHUNK_SIZE;
+                memcpy((void*)readBuffer,
+                       (const void*)&g_sceneState->memStagingBuffer[pos],
+                       chunk);
+                readLen = chunk;
+                g_sceneState->memStagingReadPos += chunk;
+            } else {
+                readLen = 0;
+            }
+            break;
+
+        case PGL_REG_MEM_ALLOC_RESULT:
+            // Return the result of the last CMD_MEM_ALLOC
+            if (g_sceneState) {
+                memcpy((void*)readBuffer,
+                       (const void*)&g_sceneState->lastAllocResult,
+                       sizeof(PglMemAllocResult));
+                readLen = sizeof(PglMemAllocResult);
+            } else {
+                readLen = 0;
+            }
             break;
 
         default:
@@ -595,7 +664,13 @@ bool I2CSlave::Initialize() {
     // Build static capability response (needed even without I2C for self-test)
     BuildCapabilityResponse();
 
-    // ── Skip I2C + VRAM probe when pins are disabled (0xFF) ──
+    // Probe external VRAM regardless of I2C availability.
+    // The QMI/PIO2 probes use hardware SPI, not I2C, so they work even when
+    // I2C pins are disabled.  This enables correct VRAM detection in
+    // VRAMless mode (Pico 2 with no I2C host but with PSRAM/MRAM attached).
+    ProbeExternalVram();
+
+    // ── Skip I2C bus init when pins are disabled (0xFF) ──
     if (GpuConfig::I2C_SDA_PIN == 0xFF || GpuConfig::I2C_SCL_PIN == 0xFF) {
         printf("[I2C] Disabled (no I2C pins assigned — Pico 2 mode)\n");
         return false;
@@ -612,9 +687,6 @@ bool I2CSlave::Initialize() {
     gpio_set_function(GpuConfig::I2C_SCL_PIN, GPIO_FUNC_I2C);
     gpio_pull_up(GpuConfig::I2C_SDA_PIN);
     gpio_pull_up(GpuConfig::I2C_SCL_PIN);
-
-    // Probe external VRAM (updates capability flags + extended status)
-    ProbeExternalVram();
 
     // Initialize the I2C slave with our handler callback
     // This sets the slave address and installs the IRQ handler
@@ -735,6 +807,12 @@ uint16_t I2CSlave::ConsumeClockRequest(uint8_t* outVoltage, uint8_t* outFlags) {
     clockRequestFlags = 0;
 
     return mhz;
+}
+
+// ─── Scene State Binding ────────────────────────────────────────────────────
+
+void I2CSlave::SetSceneState(SceneState* scene) {
+    g_sceneState = scene;
 }
 
 // ─── Shutdown ───────────────────────────────────────────────────────────────

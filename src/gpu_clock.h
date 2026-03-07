@@ -50,6 +50,7 @@ static constexpr ClockProfile kProfiles[] = {
     {  250,   0x0C, 1500, 6, 1 },  // VREG_VOLTAGE_1_15 — margined
     {  266,   0x0C, 1596, 6, 1 },  // VREG_VOLTAGE_1_15
     {  300,   0x0D, 1500, 5, 1 },  // VREG_VOLTAGE_1_20 — recommended max
+    {  360,   0x0F, 1440, 4, 1 },  // VREG_VOLTAGE_1_30 — aggressive overclock
 };
 
 static constexpr uint8_t kProfileCount = sizeof(kProfiles) / sizeof(kProfiles[0]);

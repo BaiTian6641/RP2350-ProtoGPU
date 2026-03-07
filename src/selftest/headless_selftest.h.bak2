@@ -1,0 +1,39 @@
+/**
+ * @file headless_selftest.h
+ * @brief Headless GPU self-test — renders ProtoGL scenes on an SSD1331
+ *        96×64 OLED without any host machine connection.
+ *
+ * Activated by the RP2350GPU_HEADLESS_SELFTEST build flag.
+ *
+ * Uses the full ProtoGL rendering pipeline (SceneState + Rasterizer) with
+ * meshes defined in memory:
+ *   - A gradient triangle (left side)
+ *   - A rotating cube with normal-map colouring (right side)
+ *   - A small solid-cyan triangle (below the cube)
+ *   - FPS counter in the upper-left corner
+ *   - CPU usage percentage in the upper-right corner
+ *
+ * This mode never exits — it runs an infinite render loop on Core 0.
+ * Core 1 is not launched (single-core operation).
+ */
+
+#pragma once
+
+namespace HeadlessSelfTest {
+
+/**
+ * @brief Enter the headless self-test render loop (never returns).
+ *
+ * Initialises the SSD1331 OLED and ProtoGL rasterizer, then continuously:
+ *   1. Clears the framebuffer
+ *   2. Builds the draw list (static triangle + rotating cube)
+ *   3. Runs PrepareFrame (transform → project → QuadTree)
+ *   4. Runs RasterizeRange (full 96×64 scanline band)
+ *   5. Overlays FPS and CPU usage text
+ *   6. Pushes the framebuffer to the SSD1331
+ *
+ * Call after GpuCore::Initialize() has completed.
+ */
+void Run();
+
+}  // namespace HeadlessSelfTest

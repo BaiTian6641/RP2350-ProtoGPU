@@ -11,6 +11,14 @@ set(CMAKE_CXX_STANDARD 17)
 # ─── Initialize the Pico SDK ────────────────────────────────────────────────
 pico_sdk_init()
 
+# ─── Headless Self-Test Option ───────────────────────────────────────────────
+# When enabled, the firmware boots into a standalone SSD1331 OLED display test
+# (rotating gradient triangle with FPS + CPU usage overlay) instead of the
+# normal host-driven render pipeline.  Useful for board bringup without an
+# ESP32-S3 host connected.
+option(RP2350GPU_HEADLESS_SELFTEST
+    "Build headless self-test mode (SSD1331 OLED triangle demo)" OFF)
+
 # ─── ProtoGL shared headers (wire-format types, parser, CRC) ────────────────
 set(PROTOGL_SHARED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../src")
 
@@ -35,6 +43,8 @@ add_executable(protogl_gpu
     src/memory/mem_qspi_psram.cpp
     src/memory/mem_tier.cpp
     src/selftest/gpu_selftest.cpp
+    src/selftest/ssd1331_driver.cpp
+    src/selftest/headless_selftest.cpp
 )
 
 target_include_directories(protogl_gpu PRIVATE
@@ -51,7 +61,9 @@ target_link_libraries(protogl_gpu
     hardware_dma
     hardware_i2c
     hardware_gpio
-    hardware_clocks    hardware_adc
+    hardware_clocks
+    hardware_adc
+    hardware_spi
     hardware_xip_cache)
 
 # ─── PIO programs ───────────────────────────────────────────────────────────
@@ -74,6 +86,14 @@ target_compile_definitions(protogl_gpu PRIVATE
     PICO_DEFAULT_UART_TX_PIN=16
     PICO_DEFAULT_UART_RX_PIN=17
 )
+
+# ─── Headless self-test compile flag ─────────────────────────────────────────
+if(RP2350GPU_HEADLESS_SELFTEST)
+    target_compile_definitions(protogl_gpu PRIVATE
+        RP2350GPU_HEADLESS_SELFTEST=1
+    )
+    message(STATUS "Headless self-test mode ENABLED (SSD1331 OLED)")
+endif()
 
 # ─── Generate UF2 for flashing ──────────────────────────────────────────────
 pico_add_extra_outputs(protogl_gpu)
