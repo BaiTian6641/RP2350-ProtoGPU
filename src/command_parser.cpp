@@ -3,7 +3,10 @@
  * @brief ProtoGL command buffer parser implementation for RP2350.
  *
  * Parses a ProtoGL wire-format frame and populates the GPU's SceneState
- * with meshes, materials, draw calls, camera state, etc.
+ * with meshes, materials, draw calls, camera state, 2D layer commands,
+ * memory defrag, persistence, and direct framebuffer writes.
+ *
+ * ProtoGL v0.7.2 — M12: 2D compositing, defrag, persistence, framebuffer write.
  */
 
 #include "command_parser.h"
@@ -12,6 +15,9 @@
 #include "memory/mem_opi_psram.h"
 #include "memory/mem_qspi_psram.h"
 #include "memory/mem_tier.h"
+#include "memory/mem_pool.h"
+#include "memory/flash_persist.h"
+#include "display/display_manager.h"
 
 // Shared ProtoGL headers (from lib/ProtoGL/src/)
 #include <PglTypes.h>
@@ -45,6 +51,16 @@ struct MemAllocEntry {
 static MemAllocEntry s_allocTable[PGL_MAX_MEM_ALLOCATIONS];
 static uint16_t      s_nextHandle = 0;
 
+// ─── M11: Display & Pool Subsystem State ────────────────────────────────────
+
+static DisplayManager*  s_displayMgr = nullptr;
+static MemPoolManager*  s_poolMgr    = nullptr;
+
+// ─── M12: Flash Persistence State ───────────────────────────────────────────
+
+static FlashPersistManager s_flashPersist;
+static bool                s_flashPersistInitialized = false;
+
 void CommandParser::InitMemory(OpiPsramDriver* opi, QspiPsramDriver* qspi,
                                 MemTierManager* tier,
                                 const uint16_t* frontBuf,
@@ -58,12 +74,24 @@ void CommandParser::InitMemory(OpiPsramDriver* opi, QspiPsramDriver* qspi,
     s_fbPixels    = fbPixels;
     s_nextHandle  = 0;
     std::memset(s_allocTable, 0, sizeof(s_allocTable));
+
+    // Initialize flash persistence manager (M12)
+    if (!s_flashPersistInitialized) {
+        s_flashPersist.Initialize(tier);
+        s_flashPersistInitialized = true;
+    }
 }
 
 void CommandParser::UpdateFramebufferPtrs(const uint16_t* frontBuf,
                                           const uint16_t* backBuf) {
     s_frontBuffer = frontBuf;
     s_backBuffer  = backBuf;
+}
+
+void CommandParser::InitDisplayAndPools(DisplayManager* displayMgr,
+                                         MemPoolManager* poolMgr) {
+    s_displayMgr = displayMgr;
+    s_poolMgr    = poolMgr;
 }
 
 // ─── Opcode Handlers (forward declarations) ─────────────────────────────────
@@ -98,6 +126,36 @@ static void HandleCreateShaderProgram(const uint8_t*& ptr, uint16_t payloadLen, 
 static void HandleDestroyShaderProgram(const uint8_t*& ptr, SceneState* scene);
 static void HandleBindShaderProgram(const uint8_t*& ptr, SceneState* scene);
 static void HandleSetShaderUniform(const uint8_t*& ptr, uint16_t payloadLen, SceneState* scene);
+
+// ── M12: 2D Layer & Draw Command handlers (0xA0 – 0xAC) ────────────────────
+static void HandleLayerCreate(const uint8_t*& ptr, SceneState* scene);
+static void HandleLayerDestroy(const uint8_t*& ptr, SceneState* scene);
+static void HandleLayerSetProps(const uint8_t*& ptr, SceneState* scene);
+static void HandleDrawRect2D(const uint8_t*& ptr, SceneState* scene);
+static void HandleDrawLine2D(const uint8_t*& ptr, SceneState* scene);
+static void HandleDrawCircle2D(const uint8_t*& ptr, SceneState* scene);
+static void HandleDrawSprite(const uint8_t*& ptr, SceneState* scene);
+static void HandleLayerClear(const uint8_t*& ptr, SceneState* scene);
+static void HandleDrawRoundedRect(const uint8_t*& ptr, SceneState* scene);
+static void HandleDrawArc(const uint8_t*& ptr, SceneState* scene);
+static void HandleDrawTriangle2D(const uint8_t*& ptr, SceneState* scene);
+
+// ── M11: Memory pool handlers (0x38 – 0x3B) ────────────────────────────────
+static void HandleMemPoolCreate(const uint8_t*& ptr, SceneState* scene);
+static void HandleMemPoolAlloc(const uint8_t*& ptr, SceneState* scene);
+static void HandleMemPoolFree(const uint8_t*& ptr, SceneState* scene);
+static void HandleMemPoolDestroy(const uint8_t*& ptr, SceneState* scene);
+
+// ── M11: Display driver handlers (0x90 – 0x91) ─────────────────────────────
+static void HandleDisplayConfigure(const uint8_t*& ptr, SceneState* scene);
+static void HandleDisplaySetRegion(const uint8_t*& ptr, SceneState* scene);
+
+// ── M12: Memory defrag, framebuffer write, persistence (0x3C, 0x45 – 0x48) ─
+static void HandleMemDefrag(const uint8_t*& ptr, SceneState* scene);
+static void HandleWriteFramebuffer(const uint8_t*& ptr, uint16_t payloadLen, SceneState* scene);
+static void HandlePersistResource(const uint8_t*& ptr, SceneState* scene);
+static void HandleRestoreResource(const uint8_t*& ptr, SceneState* scene);
+static void HandleQueryPersistence(const uint8_t*& ptr, SceneState* scene);
 
 // ─── Main Parser ────────────────────────────────────────────────────────────
 
@@ -224,6 +282,90 @@ CommandParser::ParseResult CommandParser::Parse(
                 break;
             case PGL_CMD_SET_SHADER_UNIFORM:
                 HandleSetShaderUniform(ptr, cmdHdr.payloadLength, scene);
+                break;
+
+            // ── M12: Memory defrag (0x3C) ───────────────────────────────
+            case PGL_CMD_MEM_DEFRAG:
+                HandleMemDefrag(ptr, scene);
+                break;
+
+            // ── M11: Memory pool commands (0x38 – 0x3B) ─────────────────
+            case PGL_CMD_MEM_POOL_CREATE:
+                HandleMemPoolCreate(ptr, scene);
+                break;
+            case PGL_CMD_MEM_POOL_ALLOC:
+                HandleMemPoolAlloc(ptr, scene);
+                break;
+            case PGL_CMD_MEM_POOL_FREE:
+                HandleMemPoolFree(ptr, scene);
+                break;
+            case PGL_CMD_MEM_POOL_DESTROY:
+                HandleMemPoolDestroy(ptr, scene);
+                break;
+
+            // ── M12: Direct framebuffer write (0x45) ────────────────────
+            case PGL_CMD_WRITE_FRAMEBUFFER:
+                HandleWriteFramebuffer(ptr, cmdHdr.payloadLength, scene);
+                break;
+
+            // ── M12: Resource persistence (0x46 – 0x48) ────────────────
+            case PGL_CMD_PERSIST_RESOURCE:
+                HandlePersistResource(ptr, scene);
+                break;
+            case PGL_CMD_RESTORE_RESOURCE:
+                HandleRestoreResource(ptr, scene);
+                break;
+            case PGL_CMD_QUERY_PERSISTENCE:
+                HandleQueryPersistence(ptr, scene);
+                break;
+
+            // ── M12: 2D Layer lifecycle (0xA0 – 0xA2) ──────────────────
+            case PGL_CMD_LAYER_CREATE:
+                HandleLayerCreate(ptr, scene);
+                break;
+            case PGL_CMD_LAYER_DESTROY:
+                HandleLayerDestroy(ptr, scene);
+                break;
+            case PGL_CMD_LAYER_SET_PROPS:
+                HandleLayerSetProps(ptr, scene);
+                break;
+
+            // ── M12: 2D Drawing primitives (0xA3 – 0xA6) ───────────────
+            case PGL_CMD_DRAW_RECT_2D:
+                HandleDrawRect2D(ptr, scene);
+                break;
+            case PGL_CMD_DRAW_LINE_2D:
+                HandleDrawLine2D(ptr, scene);
+                break;
+            case PGL_CMD_DRAW_CIRCLE_2D:
+                HandleDrawCircle2D(ptr, scene);
+                break;
+            case PGL_CMD_DRAW_SPRITE:
+                HandleDrawSprite(ptr, scene);
+                break;
+
+            // ── M12: 2D Utility (0xA9) ─────────────────────────────────
+            case PGL_CMD_LAYER_CLEAR:
+                HandleLayerClear(ptr, scene);
+                break;
+
+            // ── M12: 2D Extended primitives (0xAA – 0xAC) ──────────────
+            case PGL_CMD_DRAW_ROUNDED_RECT:
+                HandleDrawRoundedRect(ptr, scene);
+                break;
+            case PGL_CMD_DRAW_ARC:
+                HandleDrawArc(ptr, scene);
+                break;
+            case PGL_CMD_DRAW_TRIANGLE_2D:
+                HandleDrawTriangle2D(ptr, scene);
+                break;
+
+            // ── M11: Display driver commands (0x90 – 0x91) ──────────────
+            case PGL_CMD_DISPLAY_CONFIGURE:
+                HandleDisplayConfigure(ptr, scene);
+                break;
+            case PGL_CMD_DISPLAY_SET_REGION:
+                HandleDisplaySetRegion(ptr, scene);
                 break;
 
             default:
@@ -1190,5 +1332,479 @@ static void HandleMemCopy(const uint8_t*& ptr, SceneState* scene) {
         remaining -= chunk;
         srcOff += chunk;
         dstOff += chunk;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// M12 Handlers: 2D Layer Lifecycle (0xA0 – 0xA2)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void HandleLayerCreate(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdLayerCreate cmd;
+    PglReadStruct(ptr, cmd);
+
+    if (cmd.layerId == PGL_LAYER_3D || cmd.layerId >= PGL_MAX_LAYERS) {
+        printf("[Parser] LayerCreate: invalid layer %u\n", cmd.layerId);
+        return;
+    }
+
+    LayerSlot& layer = scene->layers[cmd.layerId];
+
+    // If already active with different dimensions, free the old buffer
+    if (layer.active && layer.pixels &&
+        (layer.width != cmd.width || layer.height != cmd.height)) {
+        scene->FreeLayerFramebuffer(cmd.layerId);
+    }
+
+    layer.active      = true;
+    layer.visible     = true;
+    layer.dirty       = false;
+    layer.width       = cmd.width;
+    layer.height      = cmd.height;
+    layer.pixelFormat = cmd.pixelFormat;
+    layer.blendMode   = cmd.blendMode;
+    layer.opacity     = cmd.opacity;
+    layer.offsetX     = 0;
+    layer.offsetY     = 0;
+
+    if (!scene->AllocLayerFramebuffer(cmd.layerId)) {
+        printf("[Parser] LayerCreate: failed to allocate FB for layer %u (%ux%u)\n",
+               cmd.layerId, cmd.width, cmd.height);
+        layer.active = false;
+        return;
+    }
+
+    scene->activeLayerCount = 0;
+    for (uint8_t i = 1; i < PGL_MAX_LAYERS; ++i) {
+        if (scene->layers[i].active) scene->activeLayerCount++;
+    }
+
+    printf("[Parser] LayerCreate: layer %u (%ux%u, blend=%u, opacity=%u)\n",
+           cmd.layerId, cmd.width, cmd.height, cmd.blendMode, cmd.opacity);
+}
+
+static void HandleLayerDestroy(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdLayerDestroy cmd;
+    PglReadStruct(ptr, cmd);
+
+    if (cmd.layerId == PGL_LAYER_3D || cmd.layerId >= PGL_MAX_LAYERS) {
+        printf("[Parser] LayerDestroy: invalid layer %u\n", cmd.layerId);
+        return;
+    }
+
+    scene->FreeLayerFramebuffer(cmd.layerId);
+    scene->layers[cmd.layerId] = {};  // Zero the slot
+
+    scene->activeLayerCount = 0;
+    for (uint8_t i = 1; i < PGL_MAX_LAYERS; ++i) {
+        if (scene->layers[i].active) scene->activeLayerCount++;
+    }
+}
+
+static void HandleLayerSetProps(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdLayerSetProps cmd;
+    PglReadStruct(ptr, cmd);
+
+    if (cmd.layerId >= PGL_MAX_LAYERS || !scene->layers[cmd.layerId].active) {
+        printf("[Parser] LayerSetProps: invalid/inactive layer %u\n", cmd.layerId);
+        return;
+    }
+
+    LayerSlot& layer = scene->layers[cmd.layerId];
+    layer.opacity   = cmd.opacity;
+    layer.blendMode = cmd.blendMode;
+    layer.offsetX   = cmd.offsetX;
+    layer.offsetY   = cmd.offsetY;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// M12 Handlers: 2D Drawing Primitives (0xA3 – 0xA6, 0xA9 – 0xAC)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Helper: validate layer ID and enqueue a 2D draw command.
+static bool Enqueue2D(SceneState* scene, uint8_t layerId, DrawCmd2DType type,
+                      const void* payload, size_t payloadSize) {
+    if (layerId >= PGL_MAX_LAYERS || !scene->layers[layerId].active) {
+        printf("[Parser] 2D cmd type %u: invalid/inactive layer %u\n", type, layerId);
+        return false;
+    }
+    DrawCmd2D cmd;
+    cmd.type    = type;
+    cmd.layerId = layerId;  // Store explicit layerId for Process2DDrawQueue
+    std::memcpy(&cmd.rect, payload, payloadSize);  // union starts at .rect
+    scene->layers[layerId].dirty = true;
+    return scene->Enqueue2DCmd(cmd);
+}
+
+static void HandleDrawRect2D(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdDrawRect2D cmd;
+    PglReadStruct(ptr, cmd);
+    Enqueue2D(scene, cmd.layerId, DRAW_CMD_2D_RECT, &cmd, sizeof(cmd));
+}
+
+static void HandleDrawLine2D(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdDrawLine2D cmd;
+    PglReadStruct(ptr, cmd);
+    Enqueue2D(scene, cmd.layerId, DRAW_CMD_2D_LINE, &cmd, sizeof(cmd));
+}
+
+static void HandleDrawCircle2D(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdDrawCircle2D cmd;
+    PglReadStruct(ptr, cmd);
+    Enqueue2D(scene, cmd.layerId, DRAW_CMD_2D_CIRCLE, &cmd, sizeof(cmd));
+}
+
+static void HandleDrawSprite(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdDrawSprite cmd;
+    PglReadStruct(ptr, cmd);
+    Enqueue2D(scene, cmd.layerId, DRAW_CMD_2D_SPRITE, &cmd, sizeof(cmd));
+}
+
+static void HandleLayerClear(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdLayerClear cmd;
+    PglReadStruct(ptr, cmd);
+    Enqueue2D(scene, cmd.layerId, DRAW_CMD_2D_CLEAR, &cmd, sizeof(cmd));
+}
+
+static void HandleDrawRoundedRect(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdDrawRoundedRect cmd;
+    PglReadStruct(ptr, cmd);
+    Enqueue2D(scene, cmd.layerId, DRAW_CMD_2D_ROUNDED_RECT, &cmd, sizeof(cmd));
+}
+
+static void HandleDrawArc(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdDrawArc cmd;
+    PglReadStruct(ptr, cmd);
+    Enqueue2D(scene, cmd.layerId, DRAW_CMD_2D_ARC, &cmd, sizeof(cmd));
+}
+
+static void HandleDrawTriangle2D(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdDrawTriangle2D cmd;
+    PglReadStruct(ptr, cmd);
+    Enqueue2D(scene, cmd.layerId, DRAW_CMD_2D_TRIANGLE, &cmd, sizeof(cmd));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// M11 Handlers: Memory Pool Commands (0x38 – 0x3B)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void HandleMemPoolCreate(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdMemPoolCreate cmd;
+    PglReadStruct(ptr, cmd);
+
+    if (!s_poolMgr) {
+        printf("[Parser] MemPoolCreate: pool manager not initialized\n");
+        scene->lastAllocResult.handle  = 0xFFFF;
+        scene->lastAllocResult.address = 0;
+        scene->lastAllocResult.status  = 0xFF;
+        return;
+    }
+
+    uint16_t handle = s_poolMgr->CreatePool(cmd.tier, cmd.blockSize,
+                                              cmd.blockCount, cmd.tag);
+
+    // Report result via I2C MEM_ALLOC_RESULT register
+    scene->lastAllocResult.handle  = handle;
+    scene->lastAllocResult.address = 0;  // Pool handle, not address
+    scene->lastAllocResult.status  = (handle != 0xFFFF) ? 0x00 : 0xFF;
+
+    printf("[Parser] MemPoolCreate: tier=%u blkSize=%u blkCount=%u tag=0x%04X → handle=%u\n",
+           cmd.tier, cmd.blockSize, cmd.blockCount, cmd.tag, handle);
+}
+
+static void HandleMemPoolAlloc(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdMemPoolAlloc cmd;
+    PglReadStruct(ptr, cmd);
+
+    if (!s_poolMgr) {
+        scene->lastAllocResult.handle  = cmd.poolHandle;
+        scene->lastAllocResult.address = 0xFFFF;
+        scene->lastAllocResult.status  = 0xFF;
+        return;
+    }
+
+    uint16_t blockIdx = s_poolMgr->Alloc(cmd.poolHandle);
+
+    // Report block index in the address field
+    scene->lastAllocResult.handle  = cmd.poolHandle;
+    scene->lastAllocResult.address = blockIdx;
+    scene->lastAllocResult.status  = (blockIdx != 0xFFFF) ? 0x00 : 0x01;  // 0x01 = exhausted
+}
+
+static void HandleMemPoolFree(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdMemPoolFree cmd;
+    PglReadStruct(ptr, cmd);
+
+    if (!s_poolMgr) return;
+
+    bool ok = s_poolMgr->Free(cmd.poolHandle, cmd.blockIndex);
+    if (!ok) {
+        printf("[Parser] MemPoolFree: failed pool=%u block=%u\n",
+               cmd.poolHandle, cmd.blockIndex);
+    }
+    (void)scene;
+}
+
+static void HandleMemPoolDestroy(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdMemPoolDestroy cmd;
+    PglReadStruct(ptr, cmd);
+
+    if (!s_poolMgr) return;
+
+    s_poolMgr->DestroyPool(cmd.poolHandle);
+    (void)scene;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// M11 Handlers: Display Driver Commands (0x90 – 0x91)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void HandleDisplayConfigure(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdDisplayConfigure cmd;
+    PglReadStruct(ptr, cmd);
+
+    if (!s_displayMgr) {
+        printf("[Parser] DisplayConfigure: display manager not initialized\n");
+        return;
+    }
+
+    bool ok = s_displayMgr->ConfigureDisplay(cmd);
+    if (!ok) {
+        printf("[Parser] DisplayConfigure: failed for slot %u type 0x%02X\n",
+               cmd.displayId, cmd.displayType);
+    }
+    (void)scene;
+}
+
+static void HandleDisplaySetRegion(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdDisplaySetRegion cmd;
+    PglReadStruct(ptr, cmd);
+
+    if (!s_displayMgr) {
+        printf("[Parser] DisplaySetRegion: display manager not initialized\n");
+        return;
+    }
+
+    s_displayMgr->SetRegion(cmd);
+    (void)scene;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// M12 Handlers: Memory Defrag (0x3C)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void HandleMemDefrag(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdMemDefrag cmd;
+    PglReadStruct(ptr, cmd);
+
+    // Update status to "active"
+    scene->defragStatus.state = PGL_DEFRAG_ACTIVE;
+    scene->defragStatus.tier  = cmd.tier;
+    scene->defragStatus.movedKB = 0;
+
+    if (!s_tier) {
+        printf("[Parser] MemDefrag: no tier manager — skipping\n");
+        scene->defragStatus.state = PGL_DEFRAG_COMPLETED;
+        return;
+    }
+
+    // Map wire tier value to MemTier enum
+    // PGL_TIER_AUTO (0xFF) → MemTier::NONE (defrag all tiers)
+    MemTier targetTier;
+    switch (cmd.tier) {
+        case 0:    targetTier = MemTier::SRAM;   break;
+        case 1:    targetTier = MemTier::QSPI_A; break;
+        case 2:    targetTier = MemTier::QSPI_B; break;
+        default:   targetTier = MemTier::NONE;    break;  // auto = all
+    }
+
+    uint16_t movedKB = 0;
+    uint16_t fragmentCount = 0;
+    uint16_t largestFreeKB = 0;
+
+    bool completed = s_tier->Defragment(
+        targetTier, cmd.mode, cmd.maxMoveKB,
+        movedKB, fragmentCount, largestFreeKB);
+
+    scene->defragStatus.movedKB       = movedKB;
+    scene->defragStatus.fragmentCount = fragmentCount;
+    scene->defragStatus.largestFreeKB = largestFreeKB;
+    scene->defragStatus.state = completed
+        ? PGL_DEFRAG_COMPLETED : PGL_DEFRAG_ACTIVE;
+
+    printf("[Parser] MemDefrag: tier=%u mode=%u maxMoveKB=%u → moved=%u KB, "
+           "fragments=%u, largestFree=%u KB, %s\n",
+           cmd.tier, cmd.mode, cmd.maxMoveKB, movedKB,
+           fragmentCount, largestFreeKB,
+           completed ? "completed" : "in-progress");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// M12 Handlers: Direct Framebuffer Write (0x45)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void HandleWriteFramebuffer(const uint8_t*& ptr, uint16_t payloadLen,
+                                   SceneState* scene) {
+    PglCmdWriteFramebufferHeader hdr;
+    PglReadStruct(ptr, hdr);
+
+    const uint32_t pixelDataBytes = payloadLen - sizeof(hdr);
+    const uint32_t expectedBytes  = uint32_t(hdr.w) * hdr.h * 2;  // RGB565
+
+    if (pixelDataBytes < expectedBytes) {
+        printf("[Parser] WriteFramebuffer: truncated data (%u < %u)\n",
+               pixelDataBytes, expectedBytes);
+        PglSkip(ptr, pixelDataBytes);
+        return;
+    }
+
+    // Determine target buffer
+    uint16_t* dst    = nullptr;
+    uint16_t  dstW   = 0;
+    uint16_t  dstH   = 0;
+
+    if (hdr.layerId == 0xFF) {
+        // Write directly to 3D back buffer
+        dst  = const_cast<uint16_t*>(s_backBuffer);
+        dstW = GpuConfig::PANEL_WIDTH;
+        dstH = GpuConfig::PANEL_HEIGHT;
+    } else if (hdr.layerId < PGL_MAX_LAYERS &&
+               scene->layers[hdr.layerId].active &&
+               scene->layers[hdr.layerId].pixels) {
+        LayerSlot& layer = scene->layers[hdr.layerId];
+        dst  = layer.pixels;
+        dstW = layer.width;
+        dstH = layer.height;
+        layer.dirty = true;
+    } else {
+        printf("[Parser] WriteFramebuffer: invalid layer %u\n", hdr.layerId);
+        PglSkip(ptr, pixelDataBytes);
+        return;
+    }
+
+    // Copy pixel data with clipping
+    const uint16_t* srcPixels = reinterpret_cast<const uint16_t*>(ptr);
+
+    for (uint16_t row = 0; row < hdr.h; ++row) {
+        int32_t dstY = hdr.y + row;
+        if (dstY < 0 || dstY >= dstH) { srcPixels += hdr.w; continue; }
+
+        int32_t sx = 0;
+        int32_t dx = hdr.x;
+        int32_t copyW = hdr.w;
+
+        // Left clipping
+        if (dx < 0) { sx = -dx; copyW += dx; dx = 0; }
+        // Right clipping
+        if (dx + copyW > dstW) { copyW = dstW - dx; }
+
+        if (copyW > 0) {
+            std::memcpy(&dst[dstY * dstW + dx],
+                        &srcPixels[sx],
+                        copyW * sizeof(uint16_t));
+        }
+        srcPixels += hdr.w;
+    }
+
+    PglSkip(ptr, pixelDataBytes);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// M12 Handlers: Resource Persistence (0x46 – 0x48)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void HandlePersistResource(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdPersistResource cmd;
+    PglReadStruct(ptr, cmd);
+
+    if (!s_flashPersistInitialized) {
+        printf("[Parser] PersistResource: flash persistence not initialized\n");
+        scene->persistStatus.state = PGL_PERSIST_ERROR;
+        PglSkip(ptr, 0);
+        return;
+    }
+
+    // Look up resource data via tier manager
+    const void* dataPtr = nullptr;
+    uint32_t dataSize = 0;
+
+    if (s_tier) {
+        MemRecord* rec = s_tier->FindRecord(cmd.resourceId);
+        if (rec && rec->sramPtr && rec->dataSize > 0) {
+            dataPtr  = rec->sramPtr;
+            dataSize = rec->dataSize;
+        }
+    }
+
+    if (!dataPtr || dataSize == 0) {
+        printf("[Parser] PersistResource: resource %u:%u not found in memory\n",
+               cmd.resourceClass, cmd.resourceId);
+        scene->persistStatus.state          = PGL_PERSIST_ERROR;
+        scene->persistStatus.lastResourceId = cmd.resourceId;
+        return;
+    }
+
+    bool queued = s_flashPersist.PersistResource(
+        cmd.resourceClass, cmd.resourceId, cmd.flags,
+        dataPtr, dataSize);
+
+    scene->persistStatus.lastResourceId = cmd.resourceId;
+    if (queued) {
+        scene->persistStatus.state = PGL_PERSIST_WRITING;
+        printf("[Parser] PersistResource: queued class=%u id=%u size=%lu\n",
+               cmd.resourceClass, cmd.resourceId, (unsigned long)dataSize);
+    } else {
+        scene->persistStatus.state = PGL_PERSIST_ERROR;
+        printf("[Parser] PersistResource: failed to queue class=%u id=%u\n",
+               cmd.resourceClass, cmd.resourceId);
+    }
+}
+
+static void HandleRestoreResource(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdRestoreResource cmd;
+    PglReadStruct(ptr, cmd);
+
+    if (!s_flashPersistInitialized) {
+        printf("[Parser] RestoreResource: flash persistence not initialized\n");
+        scene->persistStatus.state = PGL_PERSIST_ERROR;
+        return;
+    }
+
+    const void* restored = s_flashPersist.RestoreResource(
+        cmd.resourceClass, cmd.resourceId);
+
+    scene->persistStatus.lastResourceId = cmd.resourceId;
+    if (restored) {
+        scene->persistStatus.state = PGL_PERSIST_IDLE;
+        printf("[Parser] RestoreResource: restored class=%u id=%u\n",
+               cmd.resourceClass, cmd.resourceId);
+    } else {
+        scene->persistStatus.state = PGL_PERSIST_ERROR;
+        printf("[Parser] RestoreResource: failed class=%u id=%u\n",
+               cmd.resourceClass, cmd.resourceId);
+    }
+}
+
+static void HandleQueryPersistence(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdQueryPersistence cmd;
+    PglReadStruct(ptr, cmd);
+
+    if (s_flashPersistInitialized) {
+        s_flashPersist.GetStatus(scene->persistStatus);
+
+        // If querying a specific resource, check if it's persisted
+        if (cmd.resourceClass != 0xFF) {
+            bool persisted = s_flashPersist.IsResourcePersisted(
+                cmd.resourceClass, cmd.resourceId);
+            printf("[Parser] QueryPersistence: class=%u id=%u → %s\n",
+                   cmd.resourceClass, cmd.resourceId,
+                   persisted ? "persisted" : "not found");
+        } else {
+            printf("[Parser] QueryPersistence: manifest has %u entries\n",
+                   scene->persistStatus.manifestEntries);
+        }
+    } else {
+        printf("[Parser] QueryPersistence: not initialized\n");
+        scene->persistStatus.state = PGL_PERSIST_IDLE;
     }
 }

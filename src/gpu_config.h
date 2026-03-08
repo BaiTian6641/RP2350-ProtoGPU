@@ -110,110 +110,99 @@ static constexpr uint8_t  QUADTREE_MAX_DEPTH    = 6;   // reduced for 128×64 pa
 static constexpr uint8_t  QUADTREE_MAX_ENTITIES = 8;   // entities per leaf
 static constexpr uint16_t QUADTREE_MAX_NODES    = 256;  // total nodes (128×64 panel needs few subdivisions)
 
-// ─── External Memory: PIO2 Bus (Tier 1 — indirect, DMA) ────────────────────
+// ─── External QSPI VRAM (PIO2 — Dual Channel, RP2350B QFN-80 Only) ─────────
 // PIO2 is the last free PIO block (PIO0 = HUB75, PIO1 = Octal SPI bidir).
-// It can operate in three modes depending on the installed hardware:
+// It drives two independent QSPI channels, each with 2 chip selects:
 //
-//   Mode 1 — OPI PSRAM (APS6408L):
-//     8-bit wide bus (DQ0–DQ7 = GPIO 34–41), single CS.
-//     8 MB capacity, ~150 MB/s burst.  Indirect DMA access only.
+//   Channel A (Tier 1): PIO2 SM0+SM1, data GPIO 34-37, CLK GPIO 12,
+//                        CS0 GPIO 11, CS1 GPIO 38
+//   Channel B (Tier 2): PIO2 SM2+SM3, data GPIO 39-42, CLK GPIO 43,
+//                        CS0 GPIO 44, CS1 GPIO 45
 //
-//   Mode 2 — Dual QSPI MRAM (2 × MR10Q010):
-//     4-bit wide bus (DQ0–DQ3 = GPIO 34–37), two chip selects.
-//     CS0 = GPIO 11, CS1 = GPIO 38 (repurposed from upper OPI DQ4).
-//     256 KB total (128 KB per chip), ~52 MB/s per chip.
-//     No random-access penalty, non-volatile, unlimited endurance.
-//     Address bit 17 selects chip (0x00000–0x1FFFF = CS0, 0x20000–0x3FFFF = CS1).
+// Each chip-select is auto-detected at boot via 3-step RDID probe:
+//   MRAM (MR10Q010):  128 KB, 104 MHz, no random-access penalty, non-volatile
+//   PSRAM (APS6408L): 8 MB, 133 MHz, row-buffer miss penalty, volatile
 //
-//   Mode 3 — Single QSPI MRAM (1 × MR10Q010):
-//     4-bit wide bus (DQ0–DQ3 = GPIO 34–37), single CS = GPIO 11.
-//     128 KB capacity, ~52 MB/s.  Same MRAM benefits as Mode 2.
+// RP2350A (QFN-60, 30 GPIO): No GPIO 34+, set QSPI_VRAM_MODE = NONE.
+// RP2350B (QFN-80, 48 GPIO): Up to 2×2 = 4 external VRAM chips.
 //
-// All modes use GPIO 12 for CLK.  Set PIO2_MEM_MODE to select the mode;
-// set to NONE (0) if no external memory is on PIO2.
+// All access is indirect via PIO2 DMA (no XIP).
 
-/// PIO2 external memory operating mode.
-enum class Pio2MemMode : uint8_t {
-    NONE              = 0,  ///< PIO2 not used for external memory
-    OPI_PSRAM         = 1,  ///< 8-bit OPI: APS6408L (8 MB), DQ0-7 + CLK + CS
-    DUAL_QSPI_MRAM   = 2,  ///< 4-bit QSPI × 2: MR10Q010 (256 KB), DQ0-3 + CLK + CS0 + CS1
-    SINGLE_QSPI_MRAM = 3,  ///< 4-bit QSPI × 1: MR10Q010 (128 KB), DQ0-3 + CLK + CS
+/// QSPI VRAM operating mode.
+enum class QspiVramMode : uint8_t {
+    NONE           = 0,  ///< No external VRAM (RP2350A, or RP2350B unpopulated)
+    SINGLE_CHANNEL = 1,  ///< Channel A only (1–2 chips)
+    DUAL_CHANNEL   = 2,  ///< Channel A + Channel B (up to 2+2 chips)
 };
 
 // ── Master mode switch ──────────────────────────────────────────────────────
-static constexpr Pio2MemMode PIO2_MEM_MODE = Pio2MemMode::NONE;
+static constexpr QspiVramMode QSPI_VRAM_MODE = QspiVramMode::NONE;
 
-// ── Shared pins (all modes) ─────────────────────────────────────────────────
-static constexpr uint8_t  PIO2_MEM_CLK_PIN       = 12;     // CLK (all modes)
-static constexpr uint8_t  PIO2_MEM_CS0_PIN       = 11;     // CS# / CS0# (all modes)
-static constexpr uint8_t  PIO2_MEM_DATA_BASE_PIN = 34;     // DQ0 = GPIO34
+// ── Channel A pins (Tier 1) ─────────────────────────────────────────────────
+static constexpr uint8_t  QSPI_A_DATA_BASE_PIN = 34;     // DQ0 = GPIO34, DQ1-3 = 35-37
+static constexpr uint8_t  QSPI_A_DATA_PIN_COUNT = 4;
+static constexpr uint8_t  QSPI_A_CLK_PIN       = 12;
+static constexpr uint8_t  QSPI_A_CS0_PIN       = 11;     // First chip
+static constexpr uint8_t  QSPI_A_CS1_PIN       = 38;     // Second chip (optional)
+static constexpr uint8_t  QSPI_A_CHIP_COUNT    = 0;      // 0, 1, or 2 (set per board)
 
-// ── OPI PSRAM mode (Mode 1) ────────────────────────────────────────────────
-static constexpr uint8_t  OPI_PSRAM_DATA_PIN_COUNT = 8;     // DQ0–DQ7 = GPIO 34–41
-static constexpr uint32_t OPI_PSRAM_CLOCK_MHZ     = 75;     // PIO clock target (75–150 MHz)
-static constexpr uint32_t OPI_PSRAM_CAPACITY      = 8 * 1024 * 1024;  // 8 MB (APS6408L)
-static constexpr uint8_t  OPI_PSRAM_READ_LATENCY  = 5;      // Wait cycles after address
+// ── Channel B pins (Tier 2) ─────────────────────────────────────────────────
+static constexpr uint8_t  QSPI_B_DATA_BASE_PIN = 39;     // DQ0 = GPIO39, DQ1-3 = 40-42
+static constexpr uint8_t  QSPI_B_DATA_PIN_COUNT = 4;
+static constexpr uint8_t  QSPI_B_CLK_PIN       = 43;
+static constexpr uint8_t  QSPI_B_CS0_PIN       = 44;     // First chip
+static constexpr uint8_t  QSPI_B_CS1_PIN       = 45;     // Second chip (optional)
+static constexpr uint8_t  QSPI_B_CHIP_COUNT    = 0;      // 0, 1, or 2 (set per board)
 
-// ── QSPI MRAM mode (Mode 2 & 3) ────────────────────────────────────────────
-static constexpr uint8_t  QSPI_MRAM_DATA_PIN_COUNT = 4;     // DQ0–DQ3 = GPIO 34–37
-static constexpr uint8_t  QSPI_MRAM_CS1_PIN       = 38;     // Second CS for dual mode (GPIO38, reused from OPI DQ4)
+// ── Chip profiles (shared between channels) ─────────────────────────────────
 static constexpr uint32_t QSPI_MRAM_PIO_CLOCK_MHZ = 104;    // MR10Q010 max QSPI clock
 static constexpr uint32_t QSPI_MRAM_CHIP_CAPACITY = 128 * 1024;  // 128 KB per chip
 static constexpr uint8_t  QSPI_MRAM_PIO_READ_LAT  = 8;      // Dummy cycles for MRAM quad read
 static constexpr uint64_t QSPI_MRAM_PIO_RDID      = 0x076B111111ULL;  // MR10Q010 RDID
 
+static constexpr uint32_t QSPI_PSRAM_PIO_CLOCK_MHZ = 133;   // APS6408L max SDR clock
+static constexpr uint32_t QSPI_PSRAM_CHIP_CAPACITY = 8 * 1024 * 1024;  // 8 MB per chip
+static constexpr uint8_t  QSPI_PSRAM_PIO_READ_LAT  = 6;     // Dummy cycles for PSRAM quad read
+
 // ── Derived constants ───────────────────────────────────────────────────────
-/// Total capacity for the configured PIO2 mode.
-static constexpr uint32_t Pio2MemCapacity() {
-    return (PIO2_MEM_MODE == Pio2MemMode::OPI_PSRAM)         ? OPI_PSRAM_CAPACITY
-         : (PIO2_MEM_MODE == Pio2MemMode::DUAL_QSPI_MRAM)   ? (QSPI_MRAM_CHIP_CAPACITY * 2)
-         : (PIO2_MEM_MODE == Pio2MemMode::SINGLE_QSPI_MRAM) ? QSPI_MRAM_CHIP_CAPACITY
-         : 0;
+/// Whether any external VRAM is configured.
+static constexpr bool QspiVramEnabled() {
+    return QSPI_VRAM_MODE != QspiVramMode::NONE;
 }
-/// Data bus width for the configured PIO2 mode.
-static constexpr uint8_t Pio2DataPinCount() {
-    return (PIO2_MEM_MODE == Pio2MemMode::OPI_PSRAM) ? OPI_PSRAM_DATA_PIN_COUNT
-                                                       : QSPI_MRAM_DATA_PIN_COUNT;
-}
-/// Whether the configured PIO2 mode uses MRAM (no random-access penalty).
-static constexpr bool Pio2IsMram() {
-    return (PIO2_MEM_MODE == Pio2MemMode::DUAL_QSPI_MRAM)
-        || (PIO2_MEM_MODE == Pio2MemMode::SINGLE_QSPI_MRAM);
+/// Whether Channel B is active.
+static constexpr bool QspiChannelBEnabled() {
+    return QSPI_VRAM_MODE == QspiVramMode::DUAL_CHANNEL;
 }
 
 // ── Legacy aliases (backward compat) ────────────────────────────────────────
-static constexpr bool     OPI_PSRAM_ENABLED       = (PIO2_MEM_MODE == Pio2MemMode::OPI_PSRAM);
-static constexpr uint8_t  OPI_PSRAM_DATA_BASE_PIN = PIO2_MEM_DATA_BASE_PIN;
-static constexpr uint8_t  OPI_PSRAM_CLK_PIN       = PIO2_MEM_CLK_PIN;
-static constexpr uint8_t  OPI_PSRAM_CS_PIN        = PIO2_MEM_CS0_PIN;
+// Map old PIO2_MEM_MODE to new QSPI_VRAM_MODE for any code still referencing them.
+using Pio2MemMode = QspiVramMode;
+static constexpr QspiVramMode PIO2_MEM_MODE = QSPI_VRAM_MODE;
+static constexpr bool OPI_PSRAM_ENABLED = false;  // OPI mode removed
 
-// ─── QSPI CS1 Auto-Detection (Tier 2 — XIP mapped) ─────────────────────────
-// The RP2350's QMI CS1 slot supports auto-detection of installed memory.
-// At boot the firmware probes with chip-specific RDID commands:
+// ─── QSPI VRAM Chip Auto-Detection ──────────────────────────────────────────
+// At boot the firmware probes each chip-select with chip-specific RDID commands:
 //   1. MRAM RDID (0x4B + mode byte 0xFF) → Everspin MR10Q010 (128 KB)
 //   2. PSRAM RDID (0x9F)                  → AP Memory APS6408L (8 MB)
 //
-// The detected chip type determines:
+// Each of the 4 chip-selects (A-CS0, A-CS1, B-CS0, B-CS1) is probed
+// independently, allowing mixed MRAM/PSRAM per channel.
+//
+// The detected chip type determines per-chip:
 //   - Driver init sequence (MRAM needs WREN; PSRAM needs reset + QPI enable)
 //   - Capacity and clock configuration
-//   - Memory tier placement policy:
-//       MRAM:  No random-access penalty → LUTs, materials, textures demote
-//              to QSPI more aggressively, freeing SRAM for rasterizer data.
-//       PSRAM: Row-buffer miss penalty → random-access data prefers SRAM;
-//              sequential/burst data (large textures, meshes) suit QSPI.
-//
-// Set QSPI_CS1_ENABLED = true to enable CS1 probing at boot.
+//   - Memory tier placement policy weights
 
-/// Chip types identifiable on QMI CS1.
+/// Chip types identifiable on QSPI VRAM chip-selects.
 enum class QspiChipType : uint8_t {
-    NONE            = 0,     ///< Nothing detected (CS1 unpopulated)
+    NONE            = 0,     ///< Nothing detected (chip-select unpopulated)
     MRAM_MR10Q010   = 1,     ///< Everspin MR10Q010: 128 KB MRAM, 104 MHz
     PSRAM_APS6408L  = 2,     ///< AP Memory APS6408L-SQR: 8 MB PSRAM, 133 MHz
     PSRAM_ESP       = 3,     ///< ESP-PSRAM64H: 8 MB PSRAM, 84 MHz
     UNKNOWN_DEVICE  = 0xFE,  ///< RDID responded but unrecognized
 };
 
-/// Hardware profile for a detected QSPI CS1 chip — populated at boot.
+/// Hardware profile for a detected QSPI VRAM chip — populated at boot.
 struct QspiChipProfile {
     QspiChipType type               = QspiChipType::NONE;
     uint32_t capacityBytes          = 0;       ///< Chip capacity in bytes
@@ -227,7 +216,8 @@ struct QspiChipProfile {
 };
 
 // ── Known RDID signatures ───────────────────────────────────────────────────
-static constexpr uint64_t QSPI_RDID_MR10Q010 = 0x076B111111ULL;  // MRAM: cmd 0x4B
+static constexpr uint64_t QSPI_RDID_MR10Q010  = 0x076B111111ULL;  // MRAM: cmd 0x4B
+static constexpr uint64_t QSPI_RDID_APS6408L  = 0x000D5D0000ULL;  // PSRAM: cmd 0x9F
 
 // ── Built-in chip profiles (used by auto-detect at boot) ────────────────────
 static constexpr QspiChipProfile PROFILE_MR10Q010 = {
@@ -266,25 +256,16 @@ static constexpr QspiChipProfile PROFILE_ESP_PSRAM = {
     0,               // Vendor-specific
 };
 
-// ── CS1 compile-time flags ──────────────────────────────────────────────────
-static constexpr bool      QSPI_CS1_ENABLED  = false;  // Enable CS1 probing at boot
-static constexpr uintptr_t QSPI_CS1_XIP_BASE = 0x11000000;  // Fixed by RP2350 hardware
+// ── I2C1 HUD OLED Display ──────────────────────────────────────────────────
+// Secondary status display (SSD1306/SSD1309, 128×64 mono) on I2C1.
+// Shares the I2C1 bus with the host management I2C slave — uses a different
+// address.  The HUD driver renders GPU status (FPS, VRAM, temp) when idle.
 
-// ── Legacy aliases (backward compat — default to MR10Q010 values) ───────────
-// Runtime code should use the detected QspiChipProfile from GetQspiChipProfile().
-static constexpr bool      QSPI_MRAM_ENABLED      = QSPI_CS1_ENABLED;
-static constexpr uint32_t  QSPI_MRAM_CAPACITY     = 128 * 1024;
-static constexpr uint32_t  QSPI_MRAM_CLOCK_MHZ    = 104;
-static constexpr uint64_t  QSPI_MRAM_RDID         = QSPI_RDID_MR10Q010;
-static constexpr uintptr_t QSPI_MRAM_XIP_BASE     = QSPI_CS1_XIP_BASE;
-static constexpr uint8_t   QSPI_MRAM_READ_LATENCY = 8;
-static constexpr bool      QSPI_MRAM_DDR          = false;
-static constexpr bool      QSPI_PSRAM_ENABLED     = QSPI_CS1_ENABLED;
-static constexpr uint32_t  QSPI_PSRAM_CAPACITY    = QSPI_MRAM_CAPACITY;
-static constexpr uint32_t  QSPI_PSRAM_CLOCK_MHZ   = QSPI_MRAM_CLOCK_MHZ;
-static constexpr uintptr_t QSPI_PSRAM_XIP_BASE    = QSPI_CS1_XIP_BASE;
-static constexpr uint8_t   QSPI_PSRAM_READ_LATENCY = QSPI_MRAM_READ_LATENCY;
-static constexpr bool      QSPI_PSRAM_DDR         = QSPI_MRAM_DDR;
+static constexpr uint8_t  HUD_I2C_INSTANCE     = 1;      // i2c1 (shared with management I2C)
+static constexpr uint8_t  HUD_I2C_ADDRESS      = 0x3D;   // SSD1306 alternate address (A0 = VCC)
+static constexpr uint16_t HUD_WIDTH            = 128;
+static constexpr uint16_t HUD_HEIGHT           = 64;
+static constexpr bool     HUD_ENABLED          = false;   // Enable GPU-attached HUD display
 
 // ─── SSD1331 OLED Display (Headless Self-Test) ──────────────────────────────
 // Used only when RP2350GPU_HEADLESS_SELFTEST is defined.
@@ -309,9 +290,9 @@ static constexpr uint32_t SSD1331_SPI_BAUD = 32000000;  // 32 MHz SPI clock (req
 //   weight — rendering pipeline impact (higher = more critical)
 //   score  — per-frame access frequency (higher = more accessed)
 //
-// SRAM cache budget: portion of SRAM reserved for caching PIO2 external memory data.
+// SRAM cache budget: portion of SRAM reserved for caching QSPI VRAM data.
 // This is separate from framebuffers, Z-buffer, QuadTree, and pool allocators.
-// Only used when PIO2_MEM_MODE != NONE.
+// Only used when QSPI_VRAM_MODE != NONE.
 
 static constexpr uint32_t MEM_TIER_SRAM_CACHE_BUDGET = 64 * 1024;  // 64 KB cache arena
 static constexpr uint32_t MEM_TIER_CACHE_LINE_SIZE   = 4096;       // 4 KB per cache line
@@ -319,5 +300,19 @@ static constexpr uint8_t  MEM_TIER_ALPHA_WEIGHT      = 3;          // weight coe
 static constexpr uint8_t  MEM_TIER_BETA_SCORE        = 1;          // score coefficient
 static constexpr uint8_t  MEM_TIER_DEMOTION_THRESHOLD = 30;        // frames (~0.5s @ 60 FPS)
 static constexpr uint16_t MEM_TIER_PROMOTION_HYSTERESIS = 50;      // min priority to promote
+
+// ─── Flash Persistence (M12) ────────────────────────────────────────────────
+// RP2350 onboard flash region reserved for persisted GPU resources.
+// Uses the last FLASH_PERSIST_SIZE bytes of the flash chip.
+// The manifest and resource data share this region.
+
+static constexpr uint32_t FLASH_TOTAL_SIZE     = 4 * 1024 * 1024;  // 4 MB (typical W25Q32)
+static constexpr uint32_t FLASH_PERSIST_SIZE   = 512 * 1024;       // 512 KB reserved
+static constexpr uint32_t FLASH_PERSIST_OFFSET =                    // Offset from XIP_BASE
+    FLASH_TOTAL_SIZE - FLASH_PERSIST_SIZE;                          // = 0x00380000
+static constexpr uint16_t FLASH_MAX_ENTRIES    = 64;                // Max manifest entries
+static constexpr uint32_t FLASH_SECTOR_SIZE    = 4096;              // 4 KB erase sector
+static constexpr uint32_t FLASH_PAGE_SIZE      = 256;               // 256 B program page
+static constexpr uint8_t  FLASH_WRITEBACK_QUEUE_DEPTH = 4;          // Max pending writes
 
 }  // namespace GpuConfig

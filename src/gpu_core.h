@@ -15,20 +15,30 @@
 
 #include <cstdint>
 
-// Forward declarations for self-test VRAM access
-class OpiPsramDriver;
-class QspiPsramDriver;
+// Forward declarations for VRAM access
+class QspiVramDriver;
+
+// Legacy aliases
+using OpiPsramDriver  = QspiVramDriver;
+using QspiPsramDriver = QspiVramDriver;
 
 namespace GpuCore {
 
 // ─── Runtime VRAM Mode ──────────────────────────────────────────────────────
 
 /// Detected VRAM configuration — determined at boot after probing.
+/// RP2350B: up to 2 channels (A+B), each with 0-2 QSPI chips.
+/// RP2350A: no external VRAM (SRAM_ONLY).
 enum class VramMode : uint8_t {
-    SRAM_ONLY = 0,    ///< No external VRAM detected — pure internal SRAM
-    OPI_ONLY  = 1,    ///< PIO2 external memory only (OPI PSRAM or QSPI MRAM)
-    QSPI_ONLY = 2,    ///< QSPI CS1 memory only (XIP-mapped)
-    DUAL_VRAM = 3,    ///< Both PIO2 + QSPI CS1 present
+    SRAM_ONLY      = 0,  ///< No external VRAM detected — pure internal SRAM
+    QSPI_A_ONLY    = 1,  ///< Channel A only (1-2 chips)
+    QSPI_B_ONLY    = 2,  ///< Channel B only (unlikely, but possible)
+    DUAL_CHANNEL   = 3,  ///< Channel A + Channel B (up to 2+2 chips)
+
+    // Legacy aliases
+    OPI_ONLY  = QSPI_A_ONLY,   ///< @deprecated Use QSPI_A_ONLY
+    QSPI_ONLY = QSPI_B_ONLY,   ///< @deprecated Use QSPI_B_ONLY
+    DUAL_VRAM = DUAL_CHANNEL,   ///< @deprecated Use DUAL_CHANNEL
 };
 
 /**
@@ -104,11 +114,13 @@ bool WaitForHost(uint32_t timeoutMs);
 void RunSelfTest();
 
 /**
- * @brief Get pointers to the initialized VRAM drivers (for self-test).
+ * @brief Get pointer to the unified VRAM driver (for self-test).
  *
- * @param opiOut   Receives the OPI driver pointer (nullptr if not initialized).
- * @param qspiOut  Receives the QSPI driver pointer (nullptr if not initialized).
+ * @param vramOut  Receives the QspiVramDriver pointer (nullptr if not initialized).
  */
-void GetVramDrivers(OpiPsramDriver** opiOut, QspiPsramDriver** qspiOut);
+void GetVramDriver(QspiVramDriver** vramOut);
+
+/// @deprecated Legacy two-pointer interface.  Passes the same driver to both.
+void GetVramDrivers(QspiVramDriver** opiOut, QspiVramDriver** qspiOut);
 
 }  // namespace GpuCore

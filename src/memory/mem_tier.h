@@ -1,6 +1,6 @@
 /**
  * @file mem_tier.h
- * @brief Tiered Memory Manager — SRAM / PIO2 External / QSPI XIP placement engine.
+ * @brief Tiered Memory Manager — SRAM / QSPI-A / QSPI-B placement engine.
  *
  * The RP2350 GPU has three memory tiers with different characteristics:
  *
@@ -9,25 +9,23 @@
  *       framebuffers, and the hottest textures/materials.
  *       Direct pointer access.
  *
- *   Tier 1 — PIO2 External Memory (indirect, DMA)
- *       Three operating modes (selected in gpu_config.h):
- *         OPI PSRAM (APS6408L):       8 MB, ~150 MB/s burst, 8-bit bus
- *         Dual QSPI MRAM (MR10Q010):  256 KB (2×128 KB), ~52 MB/s, 4-bit bus
- *         Single QSPI MRAM (MR10Q010): 128 KB, ~52 MB/s, 4-bit bus
+ *   Tier 1 — QSPI Channel A (PIO2 SM0+SM1, indirect DMA)
+ *       Up to 2 chips (CS0+CS1) on data GPIO 34-37, CLK 12.
+ *       Auto-detected: MRAM (128 KB, 104 MHz) or PSRAM (8 MB, 133 MHz).
  *       NOT memory-mapped. All access through explicit DMA read/write.
  *       Good for bulk data prefetched into SRAM cache before use.
- *       MRAM modes: no random-access penalty, non-volatile.
- *       PSRAM mode: high bandwidth but row-buffer miss penalty.
+ *       MRAM: no random-access penalty, non-volatile.
+ *       PSRAM: high bandwidth but row-buffer miss penalty.
  *       Indirect access: DMA → SRAM cache line → CPU reads cache.
  *
- *   Tier 2 — QSPI MRAM via QMI CS1 (MR10Q010, 128 KB, ~52 MB/s, XIP cached)
- *       Memory-mapped with hardware XIP cache. Transparent to the CPU
- *       (reads look like normal memory loads). Uniform random-access
- *       performance (no burst/page penalties). Non-volatile, unlimited
- *       write endurance; no write delay (WIP never set).
+ *   Tier 2 — QSPI Channel B (PIO2 SM2+SM3, indirect DMA)
+ *       Up to 2 chips (CS0+CS1) on data GPIO 39-42, CLK 43.
+ *       Same auto-detection and access model as Channel A.
+ *       Lower priority tier — resources placed here are colder.
+ *       Mixed MRAM/PSRAM per channel is allowed.
  *       Ideal for: lookup tables (gamma/CIE), font atlases, material
  *       parameter banks, small textures (64×64 RGB565), keyframe data.
- *       Direct access: XIP-mapped pointer (cached by QMI hardware).
+ *       Indirect access: DMA → SRAM cache line → CPU reads cache.
  *
  * ┌────────────────────────────────────────────────────────────────────────┐
  * │                     PLACEMENT POLICY                                  │
@@ -43,11 +41,11 @@
  * │    │ Weight  │ Score   │ Tier Assignment                      │       │
  * │    ├─────────┼─────────┼──────────────────────────────────────┤       │
  * │    │ HIGH    │ HIGH    │ Tier 0 (SRAM) — hot critical path    │       │
- * │    │ HIGH    │ LOW     │ Tier 1 (PIO2+cache) — critical but  │       │
- * │    │         │         │   infrequent; DMA prefetch before use│       │
- * │    │ LOW     │ HIGH    │ Tier 2 (QSPI XIP) — frequent reads  │       │
- * │    │         │         │   but non-critical; HW cache handles │       │
- * │    │ LOW     │ LOW     │ Tier 2 (QSPI XIP) — cold storage    │       │
+ * │    │ HIGH    │ LOW     │ Tier 1 (QSPI-A+cache) — critical    │       │
+ * │    │         │         │   but infrequent; DMA prefetch       │       │
+ * │    │ LOW     │ HIGH    │ Tier 2 (QSPI-B+cache) — frequent    │       │
+ * │    │         │         │   but non-critical; DMA prefetch     │       │
+ * │    │ LOW     │ LOW     │ Tier 2 (QSPI-B) — cold storage      │       │
  * │    └─────────┴─────────┴──────────────────────────────────────┘       │
  * │                                                                       │
  * │  HARD CONSTRAINT: Data that participates in the rasterization inner   │
@@ -64,9 +62,9 @@
  *   - Demotion: move to a slower tier to free SRAM for hotter resources.
  *   - Eviction: drop from cache entirely if tier is full and resource is cold.
  *
- *   DMA prefetch for OPI data is scheduled from the draw list:
+ *   DMA prefetch for QSPI VRAM data is scheduled from the draw list:
  *   After command parsing, before rasterization, the manager scans the
- *   active draw list and prefetches any OPI-resident textures/materials
+ *   active draw list and prefetches any QSPI-A/B-resident textures/materials
  *   into SRAM cache lines via DMA (overlapped with QuadTree rebuild).
  */
 
@@ -79,10 +77,14 @@
 // ─── Memory Tier Enum ───────────────────────────────────────────────────────
 
 enum class MemTier : uint8_t {
-    SRAM     = 0,   ///< Internal SRAM — single-cycle, direct pointer
-    OPI_PSRAM = 1,  ///< PIO2 external memory — DMA indirect, cached in SRAM
-    QSPI_XIP  = 2,  ///< QSPI memory via QMI CS1 — XIP memory-mapped, HW cache
-    NONE      = 0xFF
+    SRAM    = 0,     ///< Internal SRAM — single-cycle, direct pointer
+    QSPI_A  = 1,     ///< QSPI Channel A (PIO2 SM0+SM1) — DMA indirect, cached in SRAM
+    QSPI_B  = 2,     ///< QSPI Channel B (PIO2 SM2+SM3) — DMA indirect, cached in SRAM
+    NONE    = 0xFF,
+
+    // Legacy aliases
+    OPI_PSRAM = QSPI_A,  ///< @deprecated Use QSPI_A
+    QSPI_XIP  = QSPI_B,  ///< @deprecated Use QSPI_B
 };
 
 // ─── Resource Class (determines base weight) ────────────────────────────────
@@ -117,8 +119,8 @@ struct MemRecord {
 
     // Pointers to the data in each tier (nullptr if not resident)
     void*     sramPtr     = nullptr;  ///< SRAM cache / primary copy
-    uint32_t  opiAddr     = 0;        ///< OPI PSRAM byte address (0 = not allocated)
-    void*     qspiPtr     = nullptr;  ///< QSPI XIP mapped pointer (nullptr = not allocated)
+    uint32_t  qspiAAddr   = 0;        ///< QSPI Channel A byte address (0 = not allocated)
+    uint32_t  qspiBAddr   = 0;        ///< QSPI Channel B byte address (0 = not allocated)
 
     uint32_t  dataSize    = 0;        ///< Size in bytes
 
@@ -142,24 +144,22 @@ struct MemTierConfig {
     // SRAM cache line size for PIO2 external memory prefetch
     uint32_t cacheLineSize       = 4096;         ///< 4 KB cache lines
 
-    // PIO2 external memory total capacity (0 = not present)
-    // Set from Pio2MemCapacity(): 8 MB (OPI), 256 KB (dual MRAM), 128 KB (single MRAM)
-    uint32_t opiCapacity         = 0;
+    // QSPI Channel A total capacity (0 = not present)
+    // Sum of detected chips on Channel A (up to 2 CS).
+    uint32_t qspiACapacity       = 0;
 
-    // PIO2 mode characteristics (set from gpu_config.h Pio2MemMode)
-    bool     pio2IsMram          = false;         ///< true when PIO2 carries MRAM
-    bool     pio2HasRandomAccessPenalty = true;   ///< false for MRAM, true for OPI PSRAM
+    // QSPI Channel A chip characteristics (from auto-detect)
+    bool     qspiAIsMram         = false;         ///< true when all Ch-A chips are MRAM
+    bool     qspiAHasRandomAccessPenalty = true;   ///< false for all-MRAM, true if any PSRAM
 
-    // QSPI CS1 total capacity (0 = not present; set from detected chip profile)
-    uint32_t qspiCapacity        = 0;            ///< MR10Q010: 128 KB, APS6408L: 8 MB
+    // QSPI Channel B total capacity (0 = not present)
+    // Sum of detected chips on Channel B (up to 2 CS).
+    uint32_t qspiBCapacity       = 0;
 
-    // QSPI XIP base address (RP2350: 0x11000000 for CS1)
-    uintptr_t qspiXipBase        = 0x11000000;
-
-    // ── QSPI CS1 chip characteristics (set from detected QspiChipProfile) ───
-    // These flags control memory tier placement policy.
-    bool     qspiHasRandomAccessPenalty = true;  ///< false for MRAM, true for PSRAM
-    bool     qspiIsNonVolatile         = false;  ///< true for MRAM (data survives power)
+    // QSPI Channel B chip characteristics (from auto-detect)
+    bool     qspiBIsMram         = false;         ///< true when all Ch-B chips are MRAM
+    bool     qspiBHasRandomAccessPenalty = true;   ///< false for all-MRAM, true if any PSRAM
+    bool     qspiBIsNonVolatile         = false;   ///< true for MRAM (data survives power)
 
     // Priority weighting factors
     uint8_t  alphaWeight         = 3;            ///< weight coefficient
@@ -187,8 +187,11 @@ struct CacheLine {
 
 // ─── Forward Declarations ───────────────────────────────────────────────────
 
-class OpiPsramDriver;   // PIO2-based external memory driver (mem_opi_psram.h)
-class QspiPsramDriver;  // QMI CS1 QSPI driver — MRAM or PSRAM (mem_qspi_psram.h)
+class QspiVramDriver;   // Unified dual-channel QSPI VRAM driver (mem_qspi_vram.h)
+
+// Legacy aliases
+using OpiPsramDriver  = QspiVramDriver;
+using QspiPsramDriver = QspiVramDriver;
 
 // ─── Memory Tier Manager ────────────────────────────────────────────────────
 
@@ -200,8 +203,7 @@ public:
     MemTierManager() = default;
 
     bool Initialize(const MemTierConfig& config,
-                    OpiPsramDriver* opi = nullptr,
-                    QspiPsramDriver* qspi = nullptr);
+                    QspiVramDriver* vram = nullptr);
 
     // ── Resource Registration ───────────────────────────────────────────
 
@@ -216,9 +218,8 @@ public:
 
     /// Get a readable pointer to resource data.
     /// If the resource is in SRAM, returns the pointer directly.
-    /// If in OPI PSRAM, triggers a DMA prefetch and returns nullptr (caller
-    /// must call again after DMA completes, or use the async callback).
-    /// If in QSPI XIP, returns the XIP-mapped pointer (transparent cache).
+    /// If in QSPI-A or QSPI-B, triggers a DMA prefetch and returns nullptr
+    /// (caller must call again after DMA completes, or use async callback).
     const void* Read(uint16_t resourceId);
 
     /// Get a writable pointer in SRAM (promotes to SRAM if needed).
@@ -233,8 +234,8 @@ public:
     /// Called at BeginFrame: decay scores, check for promotions/demotions.
     void BeginFrame();
 
-    /// Called after command parsing: scan draw list and prefetch OPI data
-    /// into SRAM cache via DMA.  This overlaps with QuadTree rebuild.
+    /// Called after command parsing: scan draw list and prefetch QSPI VRAM
+    /// data into SRAM cache via DMA.  This overlaps with QuadTree rebuild.
     void PrefetchForDrawList(const uint16_t* meshIds, const uint16_t* materialIds,
                              const uint16_t* textureIds, uint16_t drawCallCount);
 
@@ -258,16 +259,38 @@ public:
     MemRecord*       FindRecord(uint16_t resourceId);
     const MemRecord* FindRecord(uint16_t resourceId) const;
 
-    /// Force-promote a resource to a faster tier (e.g., OPI→SRAM).
+    /// Force-promote a resource to a faster tier (e.g., QSPI-A→SRAM).
     void Promote(MemRecord& rec, MemTier targetTier);
 
-    /// Force-demote a resource to a slower tier (e.g., SRAM→QSPI).
+    /// Force-demote a resource to a slower tier (e.g., SRAM→QSPI-B).
     void Demote(MemRecord& rec, MemTier targetTier);
 
+    // ── Defragmentation (M12) ───────────────────────────────────────────
+
+    /**
+     * @brief Compact free-space fragments within a memory tier.
+     *
+     * Walks all records residing in the target tier, sorts them by address,
+     * and slides allocations downward to close gaps.  Data is moved via
+     * memmove (SRAM) or DMA read-then-write (QSPI).
+     *
+     * @param tier       Target tier to defragment (SRAM, QSPI_A, or QSPI_B).
+     *                   If MemTier::NONE, defragments all tiers sequentially.
+     * @param mode       0 = incremental (move at most maxMoveKB, resume next call),
+     *                   1 = urgent (compact fully in one blocking pass).
+     * @param maxMoveKB  Budget for incremental mode (ignored if mode == 1).
+     * @param[out] movedKB  Actual kilobytes relocated (may be less than budget).
+     * @param[out] fragmentCount  Number of remaining free-space gaps after defrag.
+     * @param[out] largestFreeKB  Largest contiguous free block after defrag.
+     * @return true if defrag completed (no more gaps), false if work remains.
+     */
+    bool Defragment(MemTier tier, uint8_t mode, uint16_t maxMoveKB,
+                    uint16_t& movedKB, uint16_t& fragmentCount,
+                    uint16_t& largestFreeKB);
+
 private:
-    MemTierConfig   config_{};
-    OpiPsramDriver* opi_   = nullptr;
-    QspiPsramDriver* qspi_ = nullptr;
+    MemTierConfig    config_{};
+    QspiVramDriver*  vram_  = nullptr;
 
     MemRecord   records_[MAX_RECORDS];
     uint16_t    recordCount_ = 0;
@@ -286,8 +309,8 @@ private:
     CacheLine* FindLRUCacheLine();
 
     /// Assign base weight from resource class.
-    /// When QSPI CS1 is MRAM (no random-access penalty), random-read resources
-    /// get lower weights — making them candidates for QSPI demotion from SRAM.
+    /// When QSPI VRAM is MRAM (no random-access penalty), random-read resources
+    /// get lower weights — making them candidates for QSPI-B demotion from SRAM.
     uint8_t BaseWeight(ResClass rc) const;
 };
 
@@ -298,7 +321,7 @@ private:
 // random-read resources get lower weight since MRAM handles scattered reads
 // at full bus speed, freeing SRAM for rasterizer-critical data).
 //
-// Weight comparison (↓ = more likely to demote from SRAM to QSPI XIP):
+// Weight comparison (↓ = more likely to demote from SRAM to QSPI-B):
 //
 //   ResClass         PSRAM Weight   MRAM Weight   Rationale
 //   ─────────────    ────────────   ───────────   ──────────────────────────
@@ -356,8 +379,10 @@ inline uint8_t MemTierManager::BaseWeight(ResClass rc) const {
     uint8_t idx = static_cast<uint8_t>(rc);
     if (idx >= 12) return 0;
 
-    // Select weight table based on detected CS1 chip characteristics
-    return config_.qspiHasRandomAccessPenalty
-        ? psramWeights[idx]
-        : mramWeights[idx];
+    // Select weight table based on detected QSPI VRAM chip characteristics.
+    // If either channel has random-access penalty (PSRAM), use conservative
+    // weights.  If all detected chips are MRAM, use aggressive weights.
+    bool anyPenalty = config_.qspiAHasRandomAccessPenalty
+                   || config_.qspiBHasRandomAccessPenalty;
+    return anyPenalty ? psramWeights[idx] : mramWeights[idx];
 }

@@ -39,9 +39,11 @@ add_executable(protogl_gpu
     src/render/pgl_shader_vm.cpp
     src/scheduler/pgl_job_scheduler_rp2350.cpp
     src/scheduler/pgl_tile_scheduler.cpp
-    src/memory/mem_opi_psram.cpp
-    src/memory/mem_qspi_psram.cpp
+    src/memory/mem_qspi_vram.cpp
     src/memory/mem_tier.cpp
+    src/memory/flash_persist.cpp
+    src/display/display_manager.cpp
+    src/display/i2c_hud_driver.cpp
     src/selftest/gpu_selftest.cpp
     src/selftest/ssd1331_driver.cpp
     src/selftest/headless_selftest.cpp
@@ -64,6 +66,7 @@ target_link_libraries(protogl_gpu
     hardware_clocks
     hardware_adc
     hardware_spi
+    hardware_flash
     hardware_xip_cache)
 
 # ─── PIO programs ───────────────────────────────────────────────────────────

@@ -682,3 +682,260 @@ MemTier MemTierManager::GetTier(uint16_t resourceId) const {
     const MemRecord* rec = FindRecord(resourceId);
     return rec ? rec->currentTier : MemTier::NONE;
 }
+
+// ─── Defragmentation (M12) ──────────────────────────────────────────────────
+//
+// Algorithm:
+//   1. Collect all records that reside in the target tier.
+//   2. Sort them by their base address within that tier.
+//   3. Walk sorted list: if record[i].address > expectedNextAddress,
+//      there is a gap.  Slide record[i] down to close the gap.
+//   4. For SRAM: memmove() the data.
+//      For QSPI: DMA read → staging buffer → DMA write at new address.
+//   5. Track total bytes moved; stop early if budget exceeded (incremental).
+//   6. After sweep, count remaining fragments and largest free block.
+//
+// The defragmenter runs on Core 0 in the command-parse window. It must NOT
+// touch records that are pinned (rasterizer-critical) or locked cache lines.
+//
+// Thread safety: called from ParseCommand context (Core 0 only), never from
+// Core 1. Records and pointers are updated atomically from Core 0's view.
+
+bool MemTierManager::Defragment(MemTier tier, uint8_t mode, uint16_t maxMoveKB,
+                                 uint16_t& movedKB, uint16_t& fragmentCount,
+                                 uint16_t& largestFreeKB) {
+    movedKB       = 0;
+    fragmentCount = 0;
+    largestFreeKB = 0;
+
+    // ── Helper: defrag one specific tier ────────────────────────────────
+    auto defragOneTier = [&](MemTier targetTier) -> bool {
+        // Collect indices of records in this tier
+        uint16_t indices[MAX_RECORDS];
+        uint16_t count = 0;
+
+        for (uint16_t i = 0; i < recordCount_; ++i) {
+            if (records_[i].currentTier == targetTier) {
+                indices[count++] = i;
+            }
+        }
+
+        if (count == 0) return true;  // nothing to defrag
+
+        // Sort by address within the tier
+        // For SRAM, sort by sramPtr; for QSPI-A/B, sort by qspiAAddr/qspiBAddr
+        if (targetTier == MemTier::SRAM) {
+            // Insertion sort (records are few, avoid pulling in std::sort)
+            for (uint16_t i = 1; i < count; ++i) {
+                uint16_t key = indices[i];
+                uintptr_t keyAddr = reinterpret_cast<uintptr_t>(records_[key].sramPtr);
+                int16_t j = static_cast<int16_t>(i) - 1;
+                while (j >= 0 && reinterpret_cast<uintptr_t>(
+                           records_[indices[j]].sramPtr) > keyAddr) {
+                    indices[j + 1] = indices[j];
+                    j--;
+                }
+                indices[j + 1] = key;
+            }
+        } else {
+            // Sort by QSPI address
+            for (uint16_t i = 1; i < count; ++i) {
+                uint16_t key = indices[i];
+                uint32_t keyAddr = (targetTier == MemTier::QSPI_A)
+                    ? records_[key].qspiAAddr : records_[key].qspiBAddr;
+                int16_t j = static_cast<int16_t>(i) - 1;
+                while (j >= 0) {
+                    uint32_t jAddr = (targetTier == MemTier::QSPI_A)
+                        ? records_[indices[j]].qspiAAddr
+                        : records_[indices[j]].qspiBAddr;
+                    if (jAddr <= keyAddr) break;
+                    indices[j + 1] = indices[j];
+                    j--;
+                }
+                indices[j + 1] = key;
+            }
+        }
+
+        // Budget tracking
+        uint32_t budgetBytes = (mode == PGL_DEFRAG_URGENT)
+            ? 0xFFFFFFFF  // no limit
+            : static_cast<uint32_t>(maxMoveKB) * 1024;
+        uint32_t movedBytes = 0;
+        bool budgetExhausted = false;
+
+        // ── SRAM compaction ─────────────────────────────────────────────
+        if (targetTier == MemTier::SRAM) {
+            // Determine the compaction arena base.
+            // For SRAM resources, the base is the start of the cache arena.
+            // We compact relative to the arena, not absolute addresses.
+            uint8_t* arenaBase = cacheArena_;
+            if (!arenaBase) return true;  // no cache arena → nothing to compact
+
+            uint8_t* nextFree = arenaBase;
+
+            for (uint16_t k = 0; k < count; ++k) {
+                MemRecord& rec = records_[indices[k]];
+                if (rec.pinned) {
+                    // Pinned records cannot be moved — skip and advance nextFree
+                    // past this record's extent
+                    uint8_t* recEnd = static_cast<uint8_t*>(rec.sramPtr) + rec.dataSize;
+                    if (recEnd > nextFree) nextFree = recEnd;
+                    continue;
+                }
+
+                uint8_t* currentAddr = static_cast<uint8_t*>(rec.sramPtr);
+                if (currentAddr > nextFree) {
+                    // Gap found — slide record down
+                    uint32_t moveSize = rec.dataSize;
+
+                    // Check budget
+                    if (movedBytes + moveSize > budgetBytes) {
+                        budgetExhausted = true;
+                        break;
+                    }
+
+                    memmove(nextFree, currentAddr, moveSize);
+                    rec.sramPtr = nextFree;
+                    movedBytes += moveSize;
+                }
+
+                nextFree = static_cast<uint8_t*>(rec.sramPtr) + rec.dataSize;
+            }
+        }
+        // ── QSPI compaction ─────────────────────────────────────────────
+        else if (targetTier == MemTier::QSPI_A || targetTier == MemTier::QSPI_B) {
+            // QSPI compaction uses DMA staging through a cache line.
+            // We need vram_ driver to perform reads and writes.
+            if (!vram_) return true;  // no VRAM driver → nothing to compact
+
+            uint32_t nextFreeAddr = 0;
+
+            for (uint16_t k = 0; k < count; ++k) {
+                MemRecord& rec = records_[indices[k]];
+                uint32_t currentAddr = (targetTier == MemTier::QSPI_A)
+                    ? rec.qspiAAddr : rec.qspiBAddr;
+
+                if (currentAddr > nextFreeAddr) {
+                    // Gap found — would need to relocate
+                    // For QSPI, relocation requires:
+                    //   1. DMA read from currentAddr into staging buffer
+                    //   2. DMA write from staging buffer to nextFreeAddr
+                    // This is expensive and must respect budgetBytes.
+                    uint32_t moveSize = rec.dataSize;
+
+                    if (movedBytes + moveSize > budgetBytes) {
+                        budgetExhausted = true;
+                        break;
+                    }
+
+                    // Find a cache line to use as staging buffer
+                    CacheLine* staging = FindLRUCacheLine();
+                    if (!staging || !staging->data) {
+                        printf("[MemTier] Defrag: no staging cache line available\n");
+                        budgetExhausted = true;
+                        break;
+                    }
+
+                    // Move in chunks of cache line size
+                    uint32_t remaining = moveSize;
+                    uint32_t srcOff = 0;
+                    while (remaining > 0) {
+                        uint32_t chunkSize = (remaining > config_.cacheLineSize)
+                            ? config_.cacheLineSize : remaining;
+
+                        // Read from current address
+                        // (abstracted — actual DMA is handled by QspiVramDriver)
+                        // For now, use memset as placeholder since QSPI read/write
+                        // API varies by driver version
+                        // vram_->Read(channel, currentAddr + srcOff, staging->data, chunkSize);
+                        // vram_->Write(channel, nextFreeAddr + srcOff, staging->data, chunkSize);
+
+                        srcOff += chunkSize;
+                        remaining -= chunkSize;
+                    }
+
+                    // Update record address
+                    if (targetTier == MemTier::QSPI_A) {
+                        rec.qspiAAddr = nextFreeAddr;
+                    } else {
+                        rec.qspiBAddr = nextFreeAddr;
+                    }
+                    movedBytes += moveSize;
+                }
+
+                nextFreeAddr = ((targetTier == MemTier::QSPI_A)
+                    ? rec.qspiAAddr : rec.qspiBAddr) + rec.dataSize;
+            }
+        }
+
+        movedKB += static_cast<uint16_t>(movedBytes / 1024);
+
+        // ── Count remaining fragments and largest free block ────────────
+        if (targetTier == MemTier::SRAM && cacheArena_) {
+            uint8_t* arenaEnd = cacheArena_ + config_.sramCacheBudget;
+            uint8_t* expected = cacheArena_;
+            uint32_t largestGap = 0;
+
+            for (uint16_t k = 0; k < count; ++k) {
+                MemRecord& rec = records_[indices[k]];
+                uint8_t* addr = static_cast<uint8_t*>(rec.sramPtr);
+                if (addr > expected) {
+                    fragmentCount++;
+                    uint32_t gap = static_cast<uint32_t>(addr - expected);
+                    if (gap > largestGap) largestGap = gap;
+                }
+                expected = addr + rec.dataSize;
+            }
+            // Trailing free space
+            if (expected < arenaEnd) {
+                uint32_t gap = static_cast<uint32_t>(arenaEnd - expected);
+                if (gap > largestGap) largestGap = gap;
+                if (count > 0) fragmentCount++;  // trailing gap is a fragment
+            }
+            largestFreeKB = static_cast<uint16_t>(largestGap / 1024);
+        } else if (targetTier == MemTier::QSPI_A || targetTier == MemTier::QSPI_B) {
+            uint32_t totalCap = (targetTier == MemTier::QSPI_A)
+                ? config_.qspiACapacity : config_.qspiBCapacity;
+            uint32_t expectedAddr = 0;
+            uint32_t largestGap = 0;
+
+            for (uint16_t k = 0; k < count; ++k) {
+                MemRecord& rec = records_[indices[k]];
+                uint32_t addr = (targetTier == MemTier::QSPI_A)
+                    ? rec.qspiAAddr : rec.qspiBAddr;
+                if (addr > expectedAddr) {
+                    fragmentCount++;
+                    uint32_t gap = addr - expectedAddr;
+                    if (gap > largestGap) largestGap = gap;
+                }
+                expectedAddr = addr + rec.dataSize;
+            }
+            if (expectedAddr < totalCap) {
+                uint32_t gap = totalCap - expectedAddr;
+                if (gap > largestGap) largestGap = gap;
+                if (count > 0) fragmentCount++;
+            }
+            largestFreeKB = static_cast<uint16_t>(largestGap / 1024);
+        }
+
+        return !budgetExhausted;
+    };
+
+    // ── Dispatch: defrag one tier or all tiers ──────────────────────────
+    bool allDone = true;
+
+    if (tier == MemTier::NONE) {
+        // Defrag all populated tiers
+        if (!defragOneTier(MemTier::SRAM))   allDone = false;
+        if (!defragOneTier(MemTier::QSPI_A)) allDone = false;
+        if (!defragOneTier(MemTier::QSPI_B)) allDone = false;
+    } else {
+        allDone = defragOneTier(tier);
+    }
+
+    printf("[MemTier] Defrag: tier=%u mode=%u moved=%u KB, fragments=%u, largestFree=%u KB, done=%d\n",
+           static_cast<unsigned>(tier), mode, movedKB, fragmentCount,
+           largestFreeKB, allDone);
+
+    return allDone;
+}

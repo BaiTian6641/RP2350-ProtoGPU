@@ -19,6 +19,8 @@
 #include "i2c_slave.h"
 #include "../gpu_config.h"
 #include "../scene_state.h"
+#include "../display/display_manager.h"
+#include "../memory/mem_pool.h"
 
 // Shared ProtoGL headers
 #include <PglTypes.h>
@@ -57,6 +59,13 @@ static volatile uint8_t  clockRequestFlags = 0;
 
 /// Pointer to the GPU scene state (set by SetSceneState, used for memory registers)
 static SceneState* g_sceneState = nullptr;
+
+/// M11: Display and pool manager pointers (set by SetDisplayAndPools)
+static DisplayManager*  g_displayMgr = nullptr;
+static MemPoolManager*  g_poolMgr    = nullptr;
+
+/// M11: Currently selected pool handle for PGL_REG_MEM_POOL_STATUS
+static uint16_t g_selectedPoolHandle = 0;
 
 /// Status response (updated by UpdateStatus)
 static PglStatusResponse statusResponse{};
@@ -495,6 +504,31 @@ static void ProcessRegisterWrite() {
             }
             break;
 
+        // ── M12: Writable registers ────────────────────────────────────
+        case PGL_REG_DMA_FILL_THRESHOLD:
+            // Host writes 2-byte LE threshold value
+            if (g_sceneState && writeLen >= 2) {
+                uint16_t val;
+                memcpy(&val, writeBuffer, sizeof(uint16_t));
+                g_sceneState->dmaFillThreshold = val;
+            }
+            break;
+
+        // ── M11: Display & Pool select registers ────────────────────────
+        case PGL_REG_DISPLAY_MODE:
+            // Write: uint8_t displayId → select active display slot for queries
+            if (g_displayMgr && writeLen >= 1) {
+                g_displayMgr->selectedSlot = data[0];
+            }
+            break;
+
+        case PGL_REG_MEM_POOL_STATUS:
+            // Write: uint16_t poolHandle → select pool for status query
+            if (writeLen >= 2) {
+                memcpy(&g_selectedPoolHandle, (const void*)data, sizeof(uint16_t));
+            }
+            break;
+
         default:
             break;
     }
@@ -576,6 +610,92 @@ static void PrepareRegisterRead() {
                        (const void*)&g_sceneState->lastAllocResult,
                        sizeof(PglMemAllocResult));
                 readLen = sizeof(PglMemAllocResult);
+            } else {
+                readLen = 0;
+            }
+            break;
+
+        // ── M11: Display Mode, Caps, Pool Status ────────────────────────
+        case PGL_REG_DISPLAY_MODE:
+            // Read: returns current active display type (PglDisplayType) for selected slot
+            if (g_displayMgr) {
+                readBuffer[0] = g_displayMgr->GetDisplayType(g_displayMgr->selectedSlot);
+                readLen = 1;
+            } else {
+                readBuffer[0] = PGL_DISPLAY_NONE;
+                readLen = 1;
+            }
+            break;
+
+        case PGL_REG_DISPLAY_CAPS:
+            // Read: PglDisplayCaps (16 bytes) for selected display slot
+            if (g_displayMgr) {
+                PglDisplayCaps caps;
+                g_displayMgr->GetCaps(g_displayMgr->selectedSlot, caps);
+                memcpy((void*)readBuffer, (const void*)&caps, sizeof(PglDisplayCaps));
+                readLen = sizeof(PglDisplayCaps);
+            } else {
+                memset((void*)readBuffer, 0, sizeof(PglDisplayCaps));
+                readLen = sizeof(PglDisplayCaps);
+            }
+            break;
+
+        case PGL_REG_MEM_POOL_STATUS:
+            // Read: PglMemPoolStatusResponse (12 bytes) for selected pool
+            if (g_poolMgr) {
+                PglMemPoolStatusResponse resp;
+                g_poolMgr->GetStatus(g_selectedPoolHandle, resp);
+                memcpy((void*)readBuffer, (const void*)&resp, sizeof(resp));
+                readLen = sizeof(resp);
+            } else {
+                PglMemPoolStatusResponse resp = {};
+                resp.status = PGL_POOL_INVALID_HANDLE;
+                memcpy((void*)readBuffer, (const void*)&resp, sizeof(resp));
+                readLen = sizeof(resp);
+            }
+            break;
+
+        // ── M12: Defrag, Persistence, Dirty Stats, DMA Threshold ────────
+        case PGL_REG_MEM_DEFRAG_STATUS:
+            if (g_sceneState) {
+                memcpy((void*)readBuffer,
+                       (const void*)&g_sceneState->defragStatus,
+                       sizeof(PglMemDefragStatusResponse));
+                readLen = sizeof(PglMemDefragStatusResponse);
+            } else {
+                readLen = 0;
+            }
+            break;
+
+        case PGL_REG_MEM_PERSIST_STATUS:
+            if (g_sceneState) {
+                memcpy((void*)readBuffer,
+                       (const void*)&g_sceneState->persistStatus,
+                       sizeof(PglMemPersistStatusResponse));
+                readLen = sizeof(PglMemPersistStatusResponse);
+            } else {
+                readLen = 0;
+            }
+            break;
+
+        case PGL_REG_DIRTY_STATS:
+            if (g_sceneState) {
+                memcpy((void*)readBuffer,
+                       (const void*)&g_sceneState->dirtyStats,
+                       sizeof(PglDirtyStatsResponse));
+                readLen = sizeof(PglDirtyStatsResponse);
+            } else {
+                readLen = 0;
+            }
+            break;
+
+        case PGL_REG_DMA_FILL_THRESHOLD:
+            // Read: returns current threshold as 2-byte LE value
+            if (g_sceneState) {
+                memcpy((void*)readBuffer,
+                       (const void*)&g_sceneState->dmaFillThreshold,
+                       sizeof(uint16_t));
+                readLen = sizeof(uint16_t);
             } else {
                 readLen = 0;
             }
@@ -813,6 +933,11 @@ uint16_t I2CSlave::ConsumeClockRequest(uint8_t* outVoltage, uint8_t* outFlags) {
 
 void I2CSlave::SetSceneState(SceneState* scene) {
     g_sceneState = scene;
+}
+
+void I2CSlave::SetDisplayAndPools(DisplayManager* displayMgr, MemPoolManager* poolMgr) {
+    g_displayMgr = displayMgr;
+    g_poolMgr    = poolMgr;
 }
 
 // ─── Shutdown ───────────────────────────────────────────────────────────────

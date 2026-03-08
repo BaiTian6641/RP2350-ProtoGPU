@@ -44,10 +44,15 @@
 #include "transport/octal_spi_rx.h"
 #include "transport/i2c_slave.h"
 #include "render/screenspace_effects.h"
+#include "render/rasterizer_2d.h"
 #include "profiling/perf_counters.h"
-#include "memory/mem_opi_psram.h"
-#include "memory/mem_qspi_psram.h"
+#include "memory/mem_qspi_vram.h"
 #include "memory/mem_tier.h"
+#include "memory/mem_pool.h"
+#include "display/display_manager.h"
+#include "display/hub75_display_driver.h"
+#include "display/i2c_hud_driver.h"
+#include "memory/flash_persist.h"
 #include "selftest/gpu_selftest.h"
 extern const GpuConfig::QspiChipProfile& GetQspiChipProfile();
 #endif
@@ -91,12 +96,21 @@ static float    elapsedTimeS  = 0.0f;
 
 #ifndef RP2350GPU_HEADLESS_SELFTEST
 
-static OpiPsramDriver*  g_opiDriverPtr  = nullptr;
-static QspiPsramDriver* g_qspiDriverPtr = nullptr;
+static QspiVramDriver*  g_vramDriverPtr = nullptr;
 
-static OpiPsramDriver   opiDriver;
-static QspiPsramDriver  qspiDriver;
+static QspiVramDriver   vramDriver;
 static MemTierManager   memTierManager;
+
+/// M11: Display abstraction layer
+static DisplayManager      displayManager;
+static Hub75DisplayDriver  hub75Display;
+static I2cHudDriver        hudDisplay;
+
+/// M11: Memory pool manager
+static MemPoolManager      memPoolManager;
+
+/// M12: Flash persistence manager
+static FlashPersistManager flashPersist;
 
 static uint32_t droppedFrames = 0;
 
@@ -115,6 +129,177 @@ static constexpr uint32_t PERF_REPORT_INTERVAL = 60;
 static uint16_t g_ssd1331Fb[GpuConfig::SSD1331_WIDTH * GpuConfig::SSD1331_HEIGHT];
 
 #endif // RP2350GPU_HEADLESS_SELFTEST
+
+// ═══════════════════════════════════════════════════════════════════════════
+// M12: 2D Layer Processing — execute queued draw commands, then composite.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#ifndef RP2350GPU_HEADLESS_SELFTEST
+
+/// Process the queued 2D draw commands, dispatching each to Rasterizer2D.
+static void Process2DDrawQueue(SceneState* scene) {
+    if (scene->drawCmd2DCount == 0) return;
+
+    for (uint16_t i = 0; i < scene->drawCmd2DCount; ++i) {
+        const DrawCmd2D& cmd = scene->drawCmds2D[i];
+
+        // Use the explicit layerId field set during enqueue
+        uint8_t layerId = cmd.layerId;
+
+        if (layerId >= PGL_MAX_LAYERS || !scene->layers[layerId].active ||
+            !scene->layers[layerId].pixels) {
+            continue;
+        }
+
+        const LayerSlot& layer = scene->layers[layerId];
+        Rasterizer2D::Target target;
+        target.pixels = layer.pixels;
+        target.width  = layer.width;
+        target.height = layer.height;
+
+        switch (cmd.type) {
+            case DRAW_CMD_2D_RECT:
+                Rasterizer2D::DrawRect(target, cmd.rect.x, cmd.rect.y,
+                                       cmd.rect.w, cmd.rect.h,
+                                       cmd.rect.color, cmd.rect.filled != 0);
+                break;
+            case DRAW_CMD_2D_LINE:
+                Rasterizer2D::DrawLine(target, cmd.line.x0, cmd.line.y0,
+                                       cmd.line.x1, cmd.line.y1,
+                                       cmd.line.color);
+                break;
+            case DRAW_CMD_2D_CIRCLE:
+                Rasterizer2D::DrawCircle(target, cmd.circle.cx, cmd.circle.cy,
+                                         cmd.circle.radius, cmd.circle.color,
+                                         cmd.circle.filled != 0);
+                break;
+            case DRAW_CMD_2D_SPRITE: {
+                // Look up texture in scene state for source pixels
+                uint16_t texId = cmd.sprite.textureId;
+                if (texId < GpuConfig::MAX_TEXTURES &&
+                    scene->textures[texId].active &&
+                    scene->textures[texId].pixels) {
+                    Rasterizer2D::DrawSprite(
+                        target, cmd.sprite.x, cmd.sprite.y,
+                        reinterpret_cast<const uint16_t*>(scene->textures[texId].pixels),
+                        scene->textures[texId].width,
+                        scene->textures[texId].height,
+                        (cmd.sprite.flags & PGL_SPRITE_FLIP_H) != 0,
+                        (cmd.sprite.flags & PGL_SPRITE_FLIP_V) != 0);
+                }
+                break;
+            }
+            case DRAW_CMD_2D_CLEAR:
+                Rasterizer2D::Clear(target, cmd.clear.color);
+                break;
+            case DRAW_CMD_2D_ROUNDED_RECT:
+                Rasterizer2D::DrawRoundedRect(target,
+                    cmd.roundedRect.x, cmd.roundedRect.y,
+                    cmd.roundedRect.w, cmd.roundedRect.h,
+                    cmd.roundedRect.radius, cmd.roundedRect.color,
+                    cmd.roundedRect.filled != 0);
+                break;
+            case DRAW_CMD_2D_ARC:
+                Rasterizer2D::DrawArc(target, cmd.arc.cx, cmd.arc.cy,
+                                      cmd.arc.radius,
+                                      cmd.arc.startAngleDeg, cmd.arc.endAngleDeg,
+                                      cmd.arc.color);
+                break;
+            case DRAW_CMD_2D_TRIANGLE:
+                Rasterizer2D::DrawTriangle(target,
+                    cmd.triangle.x0, cmd.triangle.y0,
+                    cmd.triangle.x1, cmd.triangle.y1,
+                    cmd.triangle.x2, cmd.triangle.y2,
+                    cmd.triangle.color);
+                break;
+        }
+    }
+}
+
+/// Composite 2D layers over the 3D back buffer in ascending layer order.
+/// Uses alpha blending based on each layer's blend mode and opacity.
+static void CompositeLayers(uint16_t* backBuf, uint16_t panelW, uint16_t panelH,
+                            SceneState* scene) {
+    if (scene->activeLayerCount == 0) return;
+
+    for (uint8_t layerId = 1; layerId < PGL_MAX_LAYERS; ++layerId) {
+        const LayerSlot& layer = scene->layers[layerId];
+        if (!layer.active || !layer.visible || !layer.pixels || layer.opacity == 0) {
+            continue;
+        }
+
+        // Compute overlap region between layer (with offset) and back buffer
+        int32_t srcStartX = 0, srcStartY = 0;
+        int32_t dstStartX = layer.offsetX, dstStartY = layer.offsetY;
+        int32_t copyW = layer.width, copyH = layer.height;
+
+        // Left/top clipping
+        if (dstStartX < 0) { srcStartX = -dstStartX; copyW += dstStartX; dstStartX = 0; }
+        if (dstStartY < 0) { srcStartY = -dstStartY; copyH += dstStartY; dstStartY = 0; }
+        // Right/bottom clipping
+        if (dstStartX + copyW > panelW) copyW = panelW - dstStartX;
+        if (dstStartY + copyH > panelH) copyH = panelH - dstStartY;
+
+        if (copyW <= 0 || copyH <= 0) continue;
+
+        // Fully opaque fast path — memcpy rows
+        if (layer.opacity == 255 && layer.blendMode == PGL_LAYER_BLEND_ALPHA) {
+            for (int32_t row = 0; row < copyH; ++row) {
+                uint16_t* dst = &backBuf[(dstStartY + row) * panelW + dstStartX];
+                const uint16_t* src = &layer.pixels[(srcStartY + row) * layer.width + srcStartX];
+                std::memcpy(dst, src, copyW * sizeof(uint16_t));
+            }
+            continue;
+        }
+
+        // Per-pixel blending path
+        const uint8_t alpha = layer.opacity;
+        for (int32_t row = 0; row < copyH; ++row) {
+            uint16_t* dst = &backBuf[(dstStartY + row) * panelW + dstStartX];
+            const uint16_t* src = &layer.pixels[(srcStartY + row) * layer.width + srcStartX];
+
+            for (int32_t col = 0; col < copyW; ++col) {
+                uint16_t srcPx = src[col];
+                uint16_t dstPx = dst[col];
+
+                switch (layer.blendMode) {
+                    case PGL_LAYER_BLEND_ALPHA:
+                    default:
+                        dst[col] = Rasterizer2D::BlendRGB565(srcPx, dstPx, alpha);
+                        break;
+
+                    case PGL_LAYER_BLEND_ADDITIVE: {
+                        // Additive: clamp(src + dst)
+                        uint16_t sr = (srcPx >> 11) & 0x1F, sg = (srcPx >> 5) & 0x3F, sb = srcPx & 0x1F;
+                        uint16_t dr = (dstPx >> 11) & 0x1F, dg = (dstPx >> 5) & 0x3F, db = dstPx & 0x1F;
+                        sr = (sr * alpha) >> 8; sg = (sg * alpha) >> 8; sb = (sb * alpha) >> 8;
+                        uint16_t r = (sr + dr > 31) ? 31 : sr + dr;
+                        uint16_t g = (sg + dg > 63) ? 63 : sg + dg;
+                        uint16_t b = (sb + db > 31) ? 31 : sb + db;
+                        dst[col] = (r << 11) | (g << 5) | b;
+                        break;
+                    }
+                    case PGL_LAYER_BLEND_MULTIPLY: {
+                        // Multiply: (src * dst) / max_channel
+                        uint16_t sr = (srcPx >> 11) & 0x1F, sg = (srcPx >> 5) & 0x3F, sb = srcPx & 0x1F;
+                        uint16_t dr = (dstPx >> 11) & 0x1F, dg = (dstPx >> 5) & 0x3F, db = dstPx & 0x1F;
+                        uint16_t r = (sr * dr) / 31;
+                        uint16_t g = (sg * dg) / 63;
+                        uint16_t b = (sb * db) / 31;
+                        // Apply opacity as lerp between result and original dst
+                        r = dr + (((int16_t)r - dr) * alpha >> 8);
+                        g = dg + (((int16_t)g - dg) * alpha >> 8);
+                        b = db + (((int16_t)b - db) * alpha >> 8);
+                        dst[col] = (r << 11) | (g << 5) | b;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#endif // !RP2350GPU_HEADLESS_SELFTEST
 
 // ─── Initialization ─────────────────────────────────────────────────────────
 
@@ -161,6 +346,20 @@ bool GpuCore::Initialize() {
     printf("[GpuCore] HUB75 display initialized (%ux%u, 1/%u scan, %u-bit BCM)\n",
            GpuConfig::PANEL_WIDTH, GpuConfig::PANEL_HEIGHT,
            GpuConfig::SCAN_ROWS, GpuConfig::COLOR_DEPTH);
+
+    // Display manager — register HUB75 as primary display (slot 0)
+    displayManager.Init();
+    displayManager.RegisterDriver(0, &hub75Display);
+    printf("[GpuCore] DisplayManager initialized — HUB75 registered in slot 0\n");
+
+    // I2C HUD OLED (slot 1) — non-fatal
+    if (hudDisplay.Init(nullptr)) {
+        displayManager.RegisterDriver(1, &hudDisplay);
+        printf("[GpuCore] I2C HUD initialized on slot 1 (addr 0x%02X)\n",
+               I2cHudDriver::DEFAULT_I2C_ADDR);
+    } else {
+        printf("[GpuCore] WARNING: I2C HUD init failed (non-fatal)\n");
+    }
 
     // Octal SPI transceiver (PIO + DMA, bidirectional)
     if (!OctalSpiRx::Initialize()) {
@@ -218,72 +417,55 @@ bool GpuCore::Initialize() {
     // Performance counters (DWT cycle counter)
     PerfCounters::Initialize();
 
-    // Memory subsystem (PIO2 external + QSPI CS1 + tier manager)
+    // Memory subsystem (QSPI VRAM channels + tier manager)
     {
-        // Initialize PIO2 external memory driver (if configured)
-        OpiPsramDriver* opiPtr = nullptr;
-        if (GpuConfig::PIO2_MEM_MODE != GpuConfig::Pio2MemMode::NONE) {
-            OpiPsramConfig opiCfg = {};
-            opiCfg.mode           = static_cast<Pio2MemMode>(
-                                        static_cast<uint8_t>(GpuConfig::PIO2_MEM_MODE));
-            opiCfg.pioInstance    = 2;
-            opiCfg.dataBasePin    = GpuConfig::PIO2_MEM_DATA_BASE_PIN;
-            opiCfg.dataPinCount   = GpuConfig::Pio2DataPinCount();
-            opiCfg.clkPin         = GpuConfig::PIO2_MEM_CLK_PIN;
-            opiCfg.cs0Pin         = GpuConfig::PIO2_MEM_CS0_PIN;
-            opiCfg.cs1Pin         = GpuConfig::QSPI_MRAM_CS1_PIN;
-            opiCfg.readLatency    = GpuConfig::Pio2IsMram()
-                                  ? GpuConfig::QSPI_MRAM_PIO_READ_LAT
-                                  : GpuConfig::OPI_PSRAM_READ_LATENCY;
-            opiCfg.clockMHz       = GpuConfig::Pio2IsMram()
-                                  ? GpuConfig::QSPI_MRAM_PIO_CLOCK_MHZ
-                                  : GpuConfig::OPI_PSRAM_CLOCK_MHZ;
-            opiCfg.capacityBytes  = GpuConfig::Pio2MemCapacity();
-            opiCfg.chipCapacity   = GpuConfig::Pio2IsMram()
-                                  ? GpuConfig::QSPI_MRAM_CHIP_CAPACITY : 0;
-            opiCfg.chipCount      = (GpuConfig::PIO2_MEM_MODE ==
-                                     GpuConfig::Pio2MemMode::DUAL_QSPI_MRAM) ? 2 : 1;
-            opiCfg.isMram              = GpuConfig::Pio2IsMram();
-            opiCfg.hasRandomAccessPenalty = !GpuConfig::Pio2IsMram();
-            opiCfg.isNonVolatile       = GpuConfig::Pio2IsMram();
-            opiCfg.needsWrenBeforeWrite = GpuConfig::Pio2IsMram();
-            opiCfg.expectedRdid        = GpuConfig::Pio2IsMram()
-                                       ? GpuConfig::QSPI_MRAM_PIO_RDID : 0;
+        // Initialize QSPI VRAM driver (dual-channel PIO2)
+        QspiVramDriver* vramPtr = nullptr;
 
-            if (opiDriver.Initialize(opiCfg)) {
-                opiPtr = &opiDriver;
-                printf("[GpuCore] PIO2 external memory initialized (%lu KB, %s)\n",
-                       (unsigned long)(opiCfg.capacityBytes / 1024),
-                       opiCfg.isMram ? "MRAM" : "PSRAM");
-            } else {
-                printf("[GpuCore] WARNING: PIO2 external memory init failed\n");
-            }
-        }
+        if (GpuConfig::QspiVramEnabled()) {
+            // Channel A
+            if (GpuConfig::QSPI_A_CHIP_COUNT > 0) {
+                QspiVramChannelConfig cfgA = {};
+                cfgA.channel       = QspiChannel::A;
+                cfgA.pioInstance   = 2;
+                cfgA.dataBasePin   = GpuConfig::QSPI_A_DATA_BASE_PIN;
+                cfgA.dataPinCount  = GpuConfig::QSPI_A_DATA_PIN_COUNT;
+                cfgA.clkPin        = GpuConfig::QSPI_A_CLK_PIN;
+                cfgA.cs0Pin        = GpuConfig::QSPI_A_CS0_PIN;
+                cfgA.cs1Pin        = GpuConfig::QSPI_A_CS1_PIN;
+                cfgA.chipCount     = GpuConfig::QSPI_A_CHIP_COUNT;
 
-        // Initialize QSPI CS1 driver (if auto-detected by ProbeQspiCs1)
-        QspiPsramDriver* qspiPtr = nullptr;
-        {
-            const auto& chipProfile = GetQspiChipProfile();
-            if (chipProfile.type != GpuConfig::QspiChipType::NONE) {
-                QspiPsramConfig qspiCfg = {};
-                qspiCfg.xipBase        = GpuConfig::QSPI_CS1_XIP_BASE;
-                qspiCfg.capacityBytes  = chipProfile.capacityBytes;
-                qspiCfg.clockMHz       = chipProfile.maxClockMHz;
-                qspiCfg.readLatency    = chipProfile.readLatencyDummy;
-                qspiCfg.chipType       = static_cast<uint8_t>(chipProfile.type);
-                qspiCfg.hasRandomAccessPenalty = chipProfile.hasRandomAccessPenalty;
-                qspiCfg.isNonVolatile  = chipProfile.isNonVolatile;
-                qspiCfg.needsWrenBeforeWrite = chipProfile.needsWrenBeforeWrite;
-                qspiCfg.needsRefresh   = chipProfile.needsRefresh;
-                qspiCfg.expectedRdid   = chipProfile.deviceId;
+                // TODO: Populate cfgA.chips[] from auto-detect probe at boot
+                // For now, use built-in profiles from gpu_config.h
 
-                if (qspiDriver.Initialize(qspiCfg)) {
-                    qspiPtr = &qspiDriver;
-                    printf("[GpuCore] QSPI CS1 memory initialized (%lu KB, %s)\n",
-                           (unsigned long)(qspiCfg.capacityBytes / 1024),
-                           chipProfile.hasRandomAccessPenalty ? "PSRAM" : "MRAM");
+                if (vramDriver.InitChannel(cfgA)) {
+                    vramPtr = &vramDriver;
+                    printf("[GpuCore] QSPI VRAM Channel A initialized\n");
                 } else {
-                    printf("[GpuCore] WARNING: QSPI CS1 memory init failed\n");
+                    printf("[GpuCore] WARNING: QSPI VRAM Channel A init failed\n");
+                }
+            }
+
+            // Channel B (only in DUAL_CHANNEL mode)
+            if (GpuConfig::QspiChannelBEnabled() &&
+                GpuConfig::QSPI_B_CHIP_COUNT > 0) {
+                QspiVramChannelConfig cfgB = {};
+                cfgB.channel       = QspiChannel::B;
+                cfgB.pioInstance   = 2;
+                cfgB.dataBasePin   = GpuConfig::QSPI_B_DATA_BASE_PIN;
+                cfgB.dataPinCount  = GpuConfig::QSPI_B_DATA_PIN_COUNT;
+                cfgB.clkPin        = GpuConfig::QSPI_B_CLK_PIN;
+                cfgB.cs0Pin        = GpuConfig::QSPI_B_CS0_PIN;
+                cfgB.cs1Pin        = GpuConfig::QSPI_B_CS1_PIN;
+                cfgB.chipCount     = GpuConfig::QSPI_B_CHIP_COUNT;
+
+                // TODO: Populate cfgB.chips[] from auto-detect probe at boot
+
+                if (vramDriver.InitChannel(cfgB)) {
+                    if (!vramPtr) vramPtr = &vramDriver;
+                    printf("[GpuCore] QSPI VRAM Channel B initialized\n");
+                } else {
+                    printf("[GpuCore] WARNING: QSPI VRAM Channel B init failed\n");
                 }
             }
         }
@@ -296,31 +478,37 @@ bool GpuCore::Initialize() {
         tierCfg.betaScore           = GpuConfig::MEM_TIER_BETA_SCORE;
         tierCfg.demotionThreshold   = GpuConfig::MEM_TIER_DEMOTION_THRESHOLD;
         tierCfg.promotionHysteresis = GpuConfig::MEM_TIER_PROMOTION_HYSTERESIS;
-        tierCfg.opiCapacity  = opiPtr  ? opiPtr->GetCapacity()  : 0;
-        tierCfg.pio2IsMram   = opiPtr  ? opiPtr->IsMram()       : false;
-        tierCfg.pio2HasRandomAccessPenalty = opiPtr ? opiPtr->HasRandomAccessPenalty() : true;
-        tierCfg.qspiCapacity = qspiPtr ? qspiPtr->GetCapacity() : 0;
-        tierCfg.qspiXipBase  = GpuConfig::QSPI_CS1_XIP_BASE;
-        tierCfg.qspiHasRandomAccessPenalty = qspiPtr ? qspiPtr->HasRandomAccessPenalty() : true;
-        tierCfg.qspiIsNonVolatile          = qspiPtr ? qspiPtr->IsNonVolatile()          : false;
+
+        if (vramPtr) {
+            tierCfg.qspiACapacity = vramPtr->GetCapacity(QspiChannel::A);
+            tierCfg.qspiAIsMram   = vramPtr->IsMram(QspiChannel::A);
+            tierCfg.qspiAHasRandomAccessPenalty =
+                vramPtr->HasRandomAccessPenalty(QspiChannel::A);
+
+            tierCfg.qspiBCapacity = vramPtr->GetCapacity(QspiChannel::B);
+            tierCfg.qspiBIsMram   = vramPtr->IsMram(QspiChannel::B);
+            tierCfg.qspiBHasRandomAccessPenalty =
+                vramPtr->HasRandomAccessPenalty(QspiChannel::B);
+            tierCfg.qspiBIsNonVolatile =
+                vramPtr->IsNonVolatile(QspiChannel::B);
+        }
 
         // VRAMless mode detection
         {
-            bool hasOpi  = (opiPtr != nullptr);
-            bool hasQspi = (qspiPtr != nullptr);
+            bool hasA = vramPtr && vramPtr->IsChannelInitialized(QspiChannel::A);
+            bool hasB = vramPtr && vramPtr->IsChannelInitialized(QspiChannel::B);
 
-            if (hasOpi && hasQspi) {
-                g_vramMode = VramMode::DUAL_VRAM;
-            } else if (hasOpi) {
-                g_vramMode = VramMode::OPI_ONLY;
-            } else if (hasQspi) {
-                g_vramMode = VramMode::QSPI_ONLY;
+            if (hasA && hasB) {
+                g_vramMode = VramMode::DUAL_CHANNEL;
+            } else if (hasA) {
+                g_vramMode = VramMode::QSPI_A_ONLY;
+            } else if (hasB) {
+                g_vramMode = VramMode::QSPI_B_ONLY;
             } else {
                 g_vramMode = VramMode::SRAM_ONLY;
             }
 
-            g_opiDriverPtr  = opiPtr;
-            g_qspiDriverPtr = qspiPtr;
+            g_vramDriverPtr = vramPtr;
 
             if (g_vramMode == VramMode::SRAM_ONLY) {
                 tierCfg.sramCacheBudget = 0;
@@ -341,23 +529,38 @@ bool GpuCore::Initialize() {
                        (unsigned)(GpuConfig::LAYOUT_COORD_POOL_SIZE * 8 / 1024));
             } else {
                 const char* modeStr =
-                    (g_vramMode == VramMode::DUAL_VRAM) ? "DUAL (PIO2 + QSPI)" :
-                    (g_vramMode == VramMode::OPI_ONLY)  ? "PIO2 only" :
-                    (g_vramMode == VramMode::QSPI_ONLY) ? "QSPI CS1 only" : "?";
+                    (g_vramMode == VramMode::DUAL_CHANNEL)  ? "DUAL (QSPI-A + QSPI-B)" :
+                    (g_vramMode == VramMode::QSPI_A_ONLY)   ? "QSPI-A only" :
+                    (g_vramMode == VramMode::QSPI_B_ONLY)   ? "QSPI-B only" : "?";
                 printf("[GpuCore] VRAM mode: %s\n", modeStr);
                 printf("[GpuCore] SRAM cache budget: %u KB\n",
                        (unsigned)(tierCfg.sramCacheBudget / 1024));
             }
         }
 
-        memTierManager.Initialize(tierCfg, opiPtr, qspiPtr);
+        memTierManager.Initialize(tierCfg, vramPtr);
 
         CommandParser::InitMemory(
-            opiPtr, qspiPtr, &memTierManager,
+            vramPtr, vramPtr, &memTierManager,
             frontBuffer, backBuffer,
             GpuConfig::FRAMEBUF_PIXELS);
 
         printf("[GpuCore] Memory subsystem initialized\n");
+    }
+
+    // Wire display manager and memory pools to command parser and I2C
+    CommandParser::InitDisplayAndPools(&displayManager, &memPoolManager);
+    I2CSlave::SetDisplayAndPools(&displayManager, &memPoolManager);
+    printf("[GpuCore] Display and pool managers wired to parser + I2C\n");
+
+    // Flash persistence (M12) — load manifest, auto-restore persisted resources
+    if (flashPersist.Initialize(&memTierManager)) {
+        uint16_t restored = flashPersist.AutoRestore();
+        if (restored > 0) {
+            printf("[GpuCore] Auto-restored %u resources from flash\n", restored);
+        }
+    } else {
+        printf("[GpuCore] WARNING: Flash persistence init failed (non-fatal)\n");
     }
 
     // Deassert IRQ — GPU initialized and ready
@@ -614,16 +817,28 @@ void GpuCore::Core0Main() {
             &sceneState, elapsedTimeS);
         PerfCounters::End(PerfStage::Shaders);
 
+        // ── 2D layer rendering + compositing (M12) ──
+        // Process queued 2D draw commands, then composite layers over 3D output.
+        if (sceneState.drawCmd2DCount > 0 || sceneState.activeLayerCount > 0) {
+            Process2DDrawQueue(&sceneState);
+            CompositeLayers(backBuffer, GpuConfig::PANEL_WIDTH,
+                            GpuConfig::PANEL_HEIGHT, &sceneState);
+        }
+
         // ── Swap framebuffers ──
         PerfCounters::Begin(PerfStage::Swap);
         uint16_t* temp = frontBuffer;
         frontBuffer = backBuffer;
         backBuffer = temp;
         Hub75Driver::SetFramebuffer(frontBuffer);
+        displayManager.SetPrimaryFramebuffer(frontBuffer);
         CommandParser::UpdateFramebufferPtrs(frontBuffer, backBuffer);
 
         // ── Memory tier: end-of-frame flush ──
         memTierManager.EndFrame();
+
+        // ── Flash persistence: process writeback queue (one per frame) ──
+        flashPersist.ProcessWritebackQueue();
 
         // ── Update flow control (IRQ pin) with hysteresis ──
         // IRQ is active-low: asserted (0) = backpressure, deasserted (1) = OK
@@ -683,16 +898,41 @@ void GpuCore::Core0Main() {
             ti.sramTotalKB = 520;
             ti.sramFreeKB  = static_cast<uint16_t>(
                 520 - (memTierManager.GetSramCacheUsed() / 1024));
+            // Channel A (QSPI-A)
+            bool chAInit = vramDriver.IsChannelInitialized(QspiChannel::A);
             ti.opiTotalKB = static_cast<uint16_t>(
-                opiDriver.IsInitialized() ? opiDriver.GetCapacity() / 1024 : 0);
+                chAInit ? vramDriver.GetCapacity(QspiChannel::A) / 1024 : 0);
             ti.opiFreeKB  = static_cast<uint16_t>(
-                opiDriver.IsInitialized() ? opiDriver.Available() / 1024 : 0);
-            ti.opiEnabled = opiDriver.IsInitialized() ? 1 : 0;
+                chAInit ? vramDriver.Available(QspiChannel::A) / 1024 : 0);
+            ti.opiEnabled = chAInit ? 1 : 0;
+            // Channel B (QSPI-B)
+            bool chBInit = vramDriver.IsChannelInitialized(QspiChannel::B);
             ti.qspiTotalKB = static_cast<uint16_t>(
-                qspiDriver.IsInitialized() ? qspiDriver.GetCapacity() / 1024 : 0);
+                chBInit ? vramDriver.GetCapacity(QspiChannel::B) / 1024 : 0);
             ti.qspiFreeKB  = static_cast<uint16_t>(
-                qspiDriver.IsInitialized() ? qspiDriver.Available() / 1024 : 0);
-            ti.qspiEnabled = qspiDriver.IsInitialized() ? 1 : 0;
+                chBInit ? vramDriver.Available(QspiChannel::B) / 1024 : 0);
+            ti.qspiEnabled = chBInit ? 1 : 0;
+        }
+
+        // ── Update HUD OLED (one page per frame) ──
+        if (displayManager.GetDriver(1) != nullptr) {
+            uint16_t vramUsed = static_cast<uint16_t>(
+                memTierManager.GetSramCacheUsed() / 1024);
+            uint16_t vramTotal = 520;  // SRAM total KB
+            uint16_t frameUs = static_cast<uint16_t>(
+                PerfCounters::stages[static_cast<uint8_t>(
+                    PerfStage::FrameTotal)].LastUs());
+            float htempC = I2CSlave::ReadTemperature();
+            int8_t htempCi = static_cast<int8_t>(htempC);
+            uint8_t cpuPct = (measuredFps > 0 && frameUs > 0)
+                ? static_cast<uint8_t>(
+                      (uint32_t)frameUs * measuredFps / 10000)
+                : 0;
+            if (cpuPct > 100) cpuPct = 100;
+            hudDisplay.RenderStatus(
+                measuredFps, vramUsed, vramTotal,
+                cpuPct, htempCi, frameUs);
+            hudDisplay.PollRefresh();  // one 128-byte page per frame
         }
 
         // ── Periodic profiling report ──
@@ -724,13 +964,21 @@ GpuCore::VramMode GpuCore::GetVramMode() {
     return g_vramMode;
 }
 
-void GpuCore::GetVramDrivers(OpiPsramDriver** opiOut, QspiPsramDriver** qspiOut) {
+void GpuCore::GetVramDriver(QspiVramDriver** vramOut) {
+#ifdef RP2350GPU_HEADLESS_SELFTEST
+    if (vramOut) *vramOut = nullptr;
+#else
+    if (vramOut) *vramOut = g_vramDriverPtr;
+#endif
+}
+
+void GpuCore::GetVramDrivers(QspiVramDriver** opiOut, QspiVramDriver** qspiOut) {
 #ifdef RP2350GPU_HEADLESS_SELFTEST
     if (opiOut)  *opiOut  = nullptr;
     if (qspiOut) *qspiOut = nullptr;
 #else
-    if (opiOut)  *opiOut  = g_opiDriverPtr;
-    if (qspiOut) *qspiOut = g_qspiDriverPtr;
+    if (opiOut)  *opiOut  = g_vramDriverPtr;
+    if (qspiOut) *qspiOut = g_vramDriverPtr;
 #endif
 }
 
@@ -769,14 +1017,14 @@ bool GpuCore::WaitForHost(uint32_t timeoutMs) {
 void GpuCore::RunSelfTest() {
     printf("\n[GpuCore] === Entering Self-Test Mode ===\n");
     printf("[GpuCore] VRAM mode: %s\n",
-           g_vramMode == VramMode::SRAM_ONLY ? "SRAM_ONLY (VRAMless)" :
-           g_vramMode == VramMode::OPI_ONLY  ? "OPI_ONLY" :
-           g_vramMode == VramMode::QSPI_ONLY ? "QSPI_ONLY" :
-           g_vramMode == VramMode::DUAL_VRAM ? "DUAL_VRAM" : "?");
+           g_vramMode == VramMode::SRAM_ONLY    ? "SRAM_ONLY (VRAMless)" :
+           g_vramMode == VramMode::QSPI_A_ONLY  ? "QSPI_A_ONLY" :
+           g_vramMode == VramMode::QSPI_B_ONLY  ? "QSPI_B_ONLY" :
+           g_vramMode == VramMode::DUAL_CHANNEL  ? "DUAL_CHANNEL" : "?");
 
     GpuSelfTest::SelfTestResult result = GpuSelfTest::RunAll(
         frontBuffer, backBuffer, zBuffer,
-        g_opiDriverPtr, g_qspiDriverPtr,
+        g_vramDriverPtr, g_vramDriverPtr,
         GpuConfig::PANEL_WIDTH, GpuConfig::PANEL_HEIGHT);
 
     printf("[GpuCore] Self-test complete. Holding display (waiting for host)...\n");

@@ -18,6 +18,8 @@ struct SceneState;
 class OpiPsramDriver;
 class QspiPsramDriver;
 class MemTierManager;
+class MemPoolManager;
+class DisplayManager;
 
 namespace CommandParser {
 
@@ -56,6 +58,16 @@ void InitMemory(OpiPsramDriver* opi, QspiPsramDriver* qspi,
  * CMD_FRAMEBUFFER_CAPTURE captures the correct buffer.
  */
 void UpdateFramebufferPtrs(const uint16_t* frontBuf, const uint16_t* backBuf);
+
+/**
+ * @brief Initialize M11 display and pool subsystem pointers.
+ *
+ * Must be called after DisplayManager and MemPoolManager are created.
+ *
+ * @param displayMgr  Display manager singleton.
+ * @param poolMgr     Memory pool manager.
+ */
+void InitDisplayAndPools(DisplayManager* displayMgr, MemPoolManager* poolMgr);
 
 /**
  * @brief Parse a complete ProtoGL frame and update the scene state.

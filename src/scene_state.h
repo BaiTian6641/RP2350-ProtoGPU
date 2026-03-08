@@ -1,25 +1,29 @@
 /**
  * @file scene_state.h
- * @brief GPU-side scene resource tables and memory pools for RP2350.
+ * @brief GPU-side scene resource tables, memory pools, and 2D layer state for RP2350.
  *
  * Holds all persistent resources (meshes, materials, textures, layouts) and
- * per-frame state (draw list, cameras).  Large data lives in typed bump pools
- * so that slot metadata stays small (~40 B per mesh slot) and we stay well
- * within the RP2350's 520 KB SRAM budget.
+ * per-frame state (draw list, cameras, 2D layers, 2D draw commands).
+ * Large data lives in typed bump pools so that slot metadata stays small
+ * (~40 B per mesh slot) and we stay well within the RP2350's 520 KB SRAM budget.
  *
  * Memory layout (approximate):
  *   Pools (persistent):   ~130 KB
  *   Pool (per-frame):      ~24 KB
  *   Slot arrays:            ~40 KB
- *   Total scene state:    ~194 KB
+ *   2D layer FBs:           ~16 KB per layer (128×64 RGB565)
+ *   Total scene state:    ~210 KB (with 1 active 2D layer)
  *
  * Framebuffers, Z-buffer, QuadTree, code, and stack use the rest of SRAM.
+ *
+ * M12 additions: LayerSlot, DrawCmd2D queue, defrag/persist status caches.
  */
 
 #pragma once
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <PglTypes.h>
@@ -178,6 +182,66 @@ struct DrawCall {
     PglVec3*     overrideVertices    = nullptr;  // → SceneState::frameVertexPool
 };
 
+// ─── 2D Layer State (M12) ──────────────────────────────────────────────────
+// Each LayerSlot owns a framebuffer (128×64 RGB565 = 16 KB) that the 2D
+// rasterizer draws into.  Layer 0 is reserved for the 3D pipeline's back
+// buffer and is never allocated here.  Layers 1–7 are user-created via
+// CMD_LAYER_CREATE.  After all draw commands execute, the compositor alpha-
+// blends visible layers in ascending order onto the final display buffer.
+
+struct LayerSlot {
+    bool     active      = false;
+    bool     visible     = true;
+    bool     dirty       = false;     ///< Set true when any draw cmd targets this layer
+
+    uint16_t width       = 0;
+    uint16_t height      = 0;
+    uint8_t  pixelFormat = 0;         ///< PglDisplayPixelFormat (usually RGB565)
+    uint8_t  blendMode   = 0;         ///< PglLayerBlendMode
+    uint8_t  opacity     = 255;       ///< 0 = fully transparent, 255 = fully opaque
+
+    int16_t  offsetX     = 0;         ///< Compositing offset X (signed pixels)
+    int16_t  offsetY     = 0;         ///< Compositing offset Y (signed pixels)
+
+    uint16_t* pixels     = nullptr;   ///< Layer framebuffer (RGB565), heap-allocated
+};
+
+// ─── 2D Draw Command Queue (M12) ───────────────────────────────────────────
+// During command parsing, 2D draw commands are deferred into a fixed-size queue
+// instead of executing immediately.  gpu_core then processes the queue once per
+// frame, routing each command to the Rasterizer2D.  This decouples parsing from
+// rendering and lets us batch-sort by layer if needed.
+
+enum DrawCmd2DType : uint8_t {
+    DRAW_CMD_2D_RECT           = 0,
+    DRAW_CMD_2D_LINE           = 1,
+    DRAW_CMD_2D_CIRCLE         = 2,
+    DRAW_CMD_2D_SPRITE         = 3,
+    DRAW_CMD_2D_CLEAR          = 4,
+    DRAW_CMD_2D_ROUNDED_RECT   = 5,
+    DRAW_CMD_2D_ARC            = 6,
+    DRAW_CMD_2D_TRIANGLE       = 7,
+};
+
+struct DrawCmd2D {
+    DrawCmd2DType type;
+    uint8_t       layerId;   ///< Explicit layer ID (set during enqueue, avoids fragile union peeking)
+
+    union {
+        PglCmdDrawRect2D       rect;          // 12 bytes
+        PglCmdDrawLine2D       line;          // 11 bytes
+        PglCmdDrawCircle2D     circle;        // 10 bytes
+        PglCmdDrawSprite       sprite;        //  8 bytes
+        PglCmdLayerClear       clear;         //  3 bytes
+        PglCmdDrawRoundedRect  roundedRect;   // 14 bytes
+        PglCmdDrawArc          arc;           // 13 bytes
+        PglCmdDrawTriangle2D   triangle;      // 15 bytes  (largest member)
+    };
+};
+// sizeof(DrawCmd2D) = 1 (type) + 1 (layerId) + 15 (largest union member) = 17 bytes
+// With packing: compiler may pad to 17. 128 commands × 17 bytes ≈ 2.2 KB per-frame budget
+static_assert(sizeof(DrawCmd2D) <= 20, "DrawCmd2D should be compact (≤20 bytes)");
+
 // ─── Scene State ────────────────────────────────────────────────────────────
 // The main GPU-side data structure.  Owned by gpu_core.cpp (static lifetime).
 
@@ -194,6 +258,20 @@ struct SceneState {
 
     // ── Programmable shader programs ────────────────────────────────────────
     ShaderProgram   shaderPrograms[PGL_MAX_SHADER_PROGRAMS];
+
+    // ── 2D Compositing Layers (M12) ────────────────────────────────────────
+    LayerSlot       layers[PGL_MAX_LAYERS];          // layers[0] is 3D (not user-allocated)
+    uint8_t         activeLayerCount = 0;            // Number of active layers (excl. layer 0)
+
+    // ── 2D Draw Command Queue (M12, per-frame) ─────────────────────────────
+    DrawCmd2D       drawCmds2D[PGL_MAX_2D_DRAW_CMDS]; // Queued 2D commands for this frame
+    uint16_t        drawCmd2DCount = 0;                // Current queue depth
+
+    // ── Defrag / Persistence / Dirty-rect Status Caches (M12, I2C readback) ─
+    PglMemDefragStatusResponse   defragStatus   = {};
+    PglMemPersistStatusResponse  persistStatus  = {};
+    PglDirtyStatsResponse        dirtyStats     = {};
+    uint16_t                     dmaFillThreshold = 64; // PGL_REG_DMA_FILL_THRESHOLD (pixels)
 
     // ── Frame info ──────────────────────────────────────────────────────────
     uint32_t frameNumber = 0;
@@ -236,6 +314,23 @@ struct SceneState {
         frameNumber   = 0;
         frameTimeUs   = 0;
 
+        // Free 2D layer framebuffers and reset layer slots
+        for (uint8_t i = 0; i < PGL_MAX_LAYERS; ++i) {
+            if (layers[i].pixels) {
+                free(layers[i].pixels);
+            }
+        }
+        std::memset(layers, 0, sizeof(layers));
+        activeLayerCount = 0;
+        drawCmd2DCount   = 0;
+        std::memset(drawCmds2D, 0, sizeof(drawCmds2D));
+
+        // Reset M12 status caches
+        defragStatus     = {};
+        persistStatus    = {};
+        dirtyStats       = {};
+        dmaFillThreshold = 64;
+
         vertexPool.Reset();
         indexPool.Reset();
         uvVertexPool.Reset();
@@ -252,12 +347,18 @@ struct SceneState {
     }
 
     /// Per-frame reset — clears draw list and frame pool; persistent resources
-    /// (meshes, materials, textures, layouts) survive.
+    /// (meshes, materials, textures, layouts, layers) survive.
     void BeginFrame(uint32_t newFrameNumber) {
         frameNumber   = newFrameNumber;
         drawCallCount = 0;
         std::memset(drawList, 0, sizeof(drawList));
         frameVertexPool.Reset();
+
+        // Reset 2D draw queue and layer dirty flags (layers themselves persist)
+        drawCmd2DCount = 0;
+        for (uint8_t i = 0; i < PGL_MAX_LAYERS; ++i) {
+            layers[i].dirty = false;
+        }
     }
 
     // ── Pool allocation helpers (called by command_parser) ──────────────────
@@ -269,6 +370,35 @@ struct SceneState {
     uint8_t*   AllocTexturePixels(uint32_t bytes)   { return texturePool.Allocate(bytes); }
     PglVec2*   AllocLayoutCoords(uint16_t count)    { return layoutCoordPool.Allocate(count); }
     PglVec3*   AllocFrameVertices(uint16_t count)   { return frameVertexPool.Allocate(count); }
+
+    // ── 2D Layer Helpers ────────────────────────────────────────────────────
+
+    /// Enqueue a 2D draw command.  Returns true if queued, false if full.
+    bool Enqueue2DCmd(const DrawCmd2D& cmd) {
+        if (drawCmd2DCount >= PGL_MAX_2D_DRAW_CMDS) return false;
+        drawCmds2D[drawCmd2DCount++] = cmd;
+        return true;
+    }
+
+    /// Allocate a layer framebuffer.  Returns true on success.
+    bool AllocLayerFramebuffer(uint8_t layerId) {
+        if (layerId == 0 || layerId >= PGL_MAX_LAYERS) return false;
+        LayerSlot& l = layers[layerId];
+        if (l.pixels) return true;  // Already allocated
+        uint32_t bytes = uint32_t(l.width) * l.height * 2;  // RGB565
+        if (bytes == 0) return false;
+        l.pixels = static_cast<uint16_t*>(malloc(bytes));
+        if (!l.pixels) return false;
+        std::memset(l.pixels, 0, bytes);
+        return true;
+    }
+
+    /// Free a layer framebuffer.
+    void FreeLayerFramebuffer(uint8_t layerId) {
+        if (layerId == 0 || layerId >= PGL_MAX_LAYERS) return;
+        LayerSlot& l = layers[layerId];
+        if (l.pixels) { free(l.pixels); l.pixels = nullptr; }
+    }
 
     // ── Pool deallocation helpers (simple stack-style) ──────────────────────
 

@@ -17,6 +17,8 @@
 #include <cstdint>
 
 struct SceneState;  // forward declaration for memory register readback
+class DisplayManager;
+class MemPoolManager;
 
 namespace I2CSlave {
 
@@ -105,6 +107,13 @@ uint16_t ConsumeClockRequest(uint8_t* outVoltage = nullptr, uint8_t* outFlags = 
  * for the lifetime of the I2C slave.
  */
 void SetSceneState(SceneState* scene);
+
+/**
+ * @brief Set display and pool manager pointers for M11 register support.
+ *
+ * Must be called after DisplayManager and MemPoolManager are initialised.
+ */
+void SetDisplayAndPools(DisplayManager* displayMgr, MemPoolManager* poolMgr);
 
 /**
  * @brief Shut down I2C slave.
