@@ -58,7 +58,7 @@ public:
     }
 
     uint8_t GetPixelFormat() const override {
-        return PGL_DISPLAY_FMT_RGB565;
+        return PGL_PIXFMT_RGB565;
     }
 
     DisplayTimingInfo GetTimingInfo() const override {
@@ -73,7 +73,7 @@ public:
         caps.displayType   = PGL_DISPLAY_HUB75;
         caps.width         = GpuConfig::PANEL_WIDTH;     // 128
         caps.height        = GpuConfig::PANEL_HEIGHT;    // 64
-        caps.pixelFormat   = PGL_DISPLAY_FMT_RGB565;
+        caps.pixelFormat   = PGL_PIXFMT_RGB565;
         caps.maxBrightness = 255;
         caps.flags         = 0;  // No partial update, no vsync callback
         caps.refreshHz     = static_cast<uint16_t>(Hub75Driver::GetRefreshRate());

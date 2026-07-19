@@ -25,9 +25,9 @@ namespace I2CSlave {
 /**
  * @brief Initialize hardware I2C slave at the configured address.
  *
- * Also initialises the ADC temperature sensor and probes for external
- * VRAM (OPI PSRAM on PIO2, QSPI MRAM on QMI CS1).  Detected VRAM is
- * reported in the capability response and extended status.
+ * Also initialises the ADC temperature sensor and reports the configured
+ * external VRAM channels (QSPI-A / QSPI-B on the unified QspiVramDriver).
+ * Detected VRAM is reported in the capability response and extended status.
  *
  * @return true on success.
  */

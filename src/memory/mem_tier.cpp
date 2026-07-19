@@ -5,22 +5,27 @@
  * Implements the MemTierManager class declared in mem_tier.h.
  * Manages resource placement across three memory tiers:
  *   Tier 0 — SRAM (520 KB, 1-cycle, direct)
- *   Tier 1 — PIO2 External (OPI PSRAM / QSPI MRAM, indirect DMA)
- *   Tier 2 — QSPI CS1 XIP (memory-mapped, HW cache)
+ *   Tier 1 — QSPI Channel A (PIO2 SM0+SM1, indirect DMA)
+ *   Tier 2 — QSPI Channel B (PIO2 SM2+SM3, indirect DMA)
+ *
+ * Both external tiers live on the single dual-channel QspiVramDriver
+ * (mem_qspi_vram.h).  There is no XIP memory-mapping: all external access
+ * is explicit per-channel DMA (ReadSync/WriteSync/Prefetch).
  *
  * Core algorithms:
  *   - Weight-based initial placement (from ResClass → base weight)
  *   - Score-based runtime adaptation (access frequency tracking)
  *   - Promotion: slow tier → fast tier when priority rises
  *   - Demotion: fast tier → slow tier when priority drops or SRAM pressure
- *   - DMA prefetch pipeline for PIO2-resident data before rasterization
+ *   - DMA prefetch pipeline for QSPI-resident data before rasterization
  *   - LRU cache line management for the SRAM cache arena
  */
 
 #include "mem_tier.h"
-#include "mem_opi_psram.h"
-#include "mem_qspi_psram.h"
+#include "mem_qspi_vram.h"
 #include "../gpu_config.h"
+
+#include <PglTypes.h>  // PGL_DEFRAG_URGENT
 
 #include <cstdio>
 #include <cstring>
@@ -29,11 +34,9 @@
 // ─── Initialization ─────────────────────────────────────────────────────────
 
 bool MemTierManager::Initialize(const MemTierConfig& config,
-                                 OpiPsramDriver* opi,
-                                 QspiPsramDriver* qspi) {
+                                 QspiVramDriver* vram) {
     config_ = config;
-    opi_    = opi;
-    qspi_  = qspi;
+    vram_   = vram;
 
     recordCount_ = 0;
     frameCounter_ = 0;
@@ -45,8 +48,7 @@ bool MemTierManager::Initialize(const MemTierConfig& config,
 
     // Allocate SRAM cache arena
     // Only allocate when external memory is configured — saves 64 KB BSS otherwise.
-    if constexpr (GpuConfig::PIO2_MEM_MODE != GpuConfig::Pio2MemMode::NONE
-               || GpuConfig::QSPI_CS1_ENABLED) {
+    if constexpr (GpuConfig::QspiVramEnabled()) {
         static uint8_t s_cacheArena[GpuConfig::MEM_TIER_SRAM_CACHE_BUDGET]
             __attribute__((aligned(4)));
         cacheArena_ = s_cacheArena;
@@ -60,22 +62,30 @@ bool MemTierManager::Initialize(const MemTierConfig& config,
 
     for (uint16_t i = 0; i < MAX_CACHE_LINES; ++i) {
         cacheLines_[i] = CacheLine{};  // reset
-        if (i < lineCount) {
+        if (cacheArena_ && i < lineCount) {
             cacheLines_[i].data = cacheArena_ + (i * config_.cacheLineSize);
         }
     }
 
     printf("[MemTier] Initialized: sramCache=%lu KB (%lu lines × %lu B), "
-           "opi=%s (%lu KB), qspi=%s (%lu KB)\n",
+           "qspiA=%s (%lu KB), qspiB=%s (%lu KB)\n",
            (unsigned long)(config_.sramCacheBudget / 1024),
            (unsigned long)lineCount,
            (unsigned long)config_.cacheLineSize,
-           opi_ ? "present" : "none",
-           (unsigned long)(config_.opiCapacity / 1024),
-           qspi_ ? "present" : "none",
-           (unsigned long)(config_.qspiCapacity / 1024));
+           (vram_ && vram_->IsChannelInitialized(QspiChannel::A)) ? "present" : "none",
+           (unsigned long)(config_.qspiACapacity / 1024),
+           (vram_ && vram_->IsChannelInitialized(QspiChannel::B)) ? "present" : "none",
+           (unsigned long)(config_.qspiBCapacity / 1024));
 
     return true;
+}
+
+// ─── Tier ↔ Channel Mapping ─────────────────────────────────────────────────
+// The unified QspiVramDriver manages both external tiers; each MemTier maps
+// to one QSPI channel on that single driver instance.
+
+static QspiChannel ChannelForTier(MemTier tier) {
+    return (tier == MemTier::QSPI_B) ? QspiChannel::B : QspiChannel::A;
 }
 
 // ─── Resource Registration ──────────────────────────────────────────────────
@@ -109,8 +119,8 @@ uint16_t MemTierManager::Register(uint16_t resourceId, ResClass resClass,
     rec.dataSize = dataSize;
     rec.currentTier = MemTier::NONE;
     rec.sramPtr = nullptr;
-    rec.opiAddr = 0;
-    rec.qspiPtr = nullptr;
+    rec.qspiAAddr = 0;
+    rec.qspiBAddr = 0;
     rec.dirty = false;
     rec.pinned = false;
     rec.framesSinceAccess = 0;
@@ -125,23 +135,26 @@ uint16_t MemTierManager::Register(uint16_t resourceId, ResClass resClass,
         // The actual SRAM pointer is managed by the SceneState pools — the tier
         // manager just tracks which tier the resource "belongs to."
         rec.currentTier = MemTier::SRAM;
-    } else if (ideal == MemTier::OPI_PSRAM && opi_ && opi_->IsInitialized()) {
-        // Try to allocate in PIO2 external memory
-        uint32_t addr = opi_->Alloc(dataSize, 4);
+    } else if (ideal == MemTier::QSPI_A && vram_ &&
+               vram_->IsChannelInitialized(QspiChannel::A)) {
+        // Try to allocate in QSPI Channel A external memory
+        uint32_t addr = vram_->Alloc(QspiChannel::A, dataSize, 4);
         if (addr != 0xFFFFFFFF) {
-            rec.opiAddr = addr;
-            rec.currentTier = MemTier::OPI_PSRAM;
+            rec.qspiAAddr = addr;
+            rec.currentTier = MemTier::QSPI_A;
         } else {
-            // Fallback to SRAM if OPI is full
+            // Fallback to SRAM if Channel A is full
             rec.currentTier = MemTier::SRAM;
         }
-    } else if (ideal == MemTier::QSPI_XIP && qspi_ && qspi_->IsInitialized()) {
-        // Try to allocate in QSPI XIP
-        uint32_t offset = qspi_->Alloc(dataSize, 4);
-        if (offset != 0xFFFFFFFF) {
-            rec.qspiPtr = reinterpret_cast<void*>(config_.qspiXipBase + offset);
-            rec.currentTier = MemTier::QSPI_XIP;
+    } else if (ideal == MemTier::QSPI_B && vram_ &&
+               vram_->IsChannelInitialized(QspiChannel::B)) {
+        // Try to allocate in QSPI Channel B external memory
+        uint32_t addr = vram_->Alloc(QspiChannel::B, dataSize, 4);
+        if (addr != 0xFFFFFFFF) {
+            rec.qspiBAddr = addr;
+            rec.currentTier = MemTier::QSPI_B;
         } else {
+            // Fallback to SRAM if Channel B is full
             rec.currentTier = MemTier::SRAM;
         }
     } else {
@@ -163,13 +176,11 @@ void MemTierManager::Unregister(uint16_t resourceId) {
     }
 
     // Free external memory allocations
-    if (rec->opiAddr != 0 && rec->opiAddr != 0xFFFFFFFF && opi_) {
-        opi_->Free(rec->opiAddr);
+    if (rec->qspiAAddr != 0 && rec->qspiAAddr != 0xFFFFFFFF && vram_) {
+        vram_->Free(QspiChannel::A, rec->qspiAAddr);
     }
-    if (rec->qspiPtr != nullptr && qspi_) {
-        uint32_t offset = static_cast<uint32_t>(
-            reinterpret_cast<uintptr_t>(rec->qspiPtr) - config_.qspiXipBase);
-        qspi_->Free(offset);
+    if (rec->qspiBAddr != 0 && rec->qspiBAddr != 0xFFFFFFFF && vram_) {
+        vram_->Free(QspiChannel::B, rec->qspiBAddr);
     }
 
     // Zero out the record
@@ -217,29 +228,29 @@ MemTier MemTierManager::ComputeIdealTier(const MemRecord& rec) const {
 
     // Weight-based placement:
     //   HIGH weight + HIGH score → SRAM (hot critical-path data)
-    //   HIGH weight + LOW score  → PIO2 (critical but infrequent, DMA prefetch)
-    //   LOW weight  + HIGH score → QSPI XIP (frequent but non-critical, HW cache)
-    //   LOW weight  + LOW score  → QSPI XIP (cold storage)
+    //   HIGH weight + LOW score  → QSPI-A (critical but infrequent, DMA prefetch)
+    //   LOW weight  + HIGH score → QSPI-B (frequent but non-critical, DMA prefetch)
+    //   LOW weight  + LOW score  → QSPI-B (cold storage)
 
     uint16_t priority = rec.priority;
 
     // Tier thresholds (configurable via config_)
     // Higher priority → faster tier
-    static constexpr uint16_t SRAM_THRESHOLD = 500;     // priority >= 500 → SRAM
-    static constexpr uint16_t OPI_THRESHOLD  = 200;     // priority >= 200 → PIO2
+    static constexpr uint16_t SRAM_THRESHOLD   = 500;   // priority >= 500 → SRAM
+    static constexpr uint16_t QSPI_A_THRESHOLD = 200;   // priority >= 200 → QSPI-A
 
     if (priority >= SRAM_THRESHOLD) {
         return MemTier::SRAM;
     }
 
-    // If PIO2 external memory is available, use it for medium-priority data
-    if (config_.opiCapacity > 0 && priority >= OPI_THRESHOLD) {
-        return MemTier::OPI_PSRAM;
+    // If QSPI Channel A is available, use it for medium-priority data
+    if (config_.qspiACapacity > 0 && priority >= QSPI_A_THRESHOLD) {
+        return MemTier::QSPI_A;
     }
 
-    // If QSPI is available, use it for low-priority data
-    if (config_.qspiCapacity > 0) {
-        return MemTier::QSPI_XIP;
+    // If QSPI Channel B is available, use it for low-priority data
+    if (config_.qspiBCapacity > 0) {
+        return MemTier::QSPI_B;
     }
 
     // No external memory — everything stays in SRAM
@@ -258,8 +269,11 @@ const void* MemTierManager::Read(uint16_t resourceId) {
         case MemTier::SRAM:
             return rec->sramPtr;
 
-        case MemTier::OPI_PSRAM: {
-            // Data is in PIO2 external memory — check if cached in SRAM
+        case MemTier::QSPI_A:
+        case MemTier::QSPI_B: {
+            // Data is in external QSPI memory — check if cached in SRAM.
+            // Both channels are indirect-DMA only in the QspiVram model
+            // (no XIP memory-mapping), so both tiers resolve via the cache.
             for (uint16_t i = 0; i < MAX_CACHE_LINES; ++i) {
                 CacheLine& cl = cacheLines_[i];
                 if (cl.resourceId == resourceId && !cl.locked) {
@@ -272,10 +286,6 @@ const void* MemTierManager::Read(uint16_t resourceId) {
             // Caller should call PrefetchForDrawList() or ReadSync manually.
             return nullptr;
         }
-
-        case MemTier::QSPI_XIP:
-            // XIP-mapped: return the memory-mapped pointer directly
-            return rec->qspiPtr;
 
         default:
             return nullptr;
@@ -353,61 +363,44 @@ void MemTierManager::PrefetchForDrawList(const uint16_t* meshIds,
                                           const uint16_t* materialIds,
                                           const uint16_t* textureIds,
                                           uint16_t drawCallCount) {
-    if (!opi_ || !opi_->IsInitialized()) return;
+    if (!vram_ || !vram_->IsAnyChannelInitialized()) return;
+
+    // Prefetch the first cache line of one resource from its external tier.
+    auto prefetchResource = [&](uint16_t resourceId) {
+        MemRecord* rec = FindRecord(resourceId);
+        if (!rec || rec->dataSize == 0) return;
+
+        MemTier tier = rec->currentTier;
+        if (tier != MemTier::QSPI_A && tier != MemTier::QSPI_B) return;
+
+        QspiChannel ch = ChannelForTier(tier);
+        uint32_t addr = (tier == MemTier::QSPI_A) ? rec->qspiAAddr : rec->qspiBAddr;
+        if (addr == 0 || !vram_->IsChannelInitialized(ch)) return;
+
+        CacheLine* cl = AllocCacheLine(rec->resourceId, rec->dataSize);
+        if (cl) {
+            cl->locked = true;
+            uint32_t chunkSize = (rec->dataSize < config_.cacheLineSize)
+                               ? rec->dataSize : config_.cacheLineSize;
+            vram_->Prefetch(ch, addr, cl->data, chunkSize);
+            cl->size = chunkSize;
+            cl->srcOffset = 0;
+        }
+    };
 
     for (uint16_t i = 0; i < drawCallCount; ++i) {
-        // Prefetch mesh data
-        if (meshIds) {
-            MemRecord* rec = FindRecord(meshIds[i]);
-            if (rec && rec->currentTier == MemTier::OPI_PSRAM && rec->opiAddr != 0) {
-                CacheLine* cl = AllocCacheLine(rec->resourceId, rec->dataSize);
-                if (cl) {
-                    cl->locked = true;
-                    uint32_t chunkSize = (rec->dataSize < config_.cacheLineSize)
-                                       ? rec->dataSize : config_.cacheLineSize;
-                    opi_->Prefetch(rec->opiAddr, cl->data, chunkSize);
-                    cl->size = chunkSize;
-                    cl->srcOffset = 0;
-                }
-            }
-        }
-
-        // Prefetch material data
-        if (materialIds) {
-            MemRecord* rec = FindRecord(materialIds[i]);
-            if (rec && rec->currentTier == MemTier::OPI_PSRAM && rec->opiAddr != 0) {
-                CacheLine* cl = AllocCacheLine(rec->resourceId, rec->dataSize);
-                if (cl) {
-                    cl->locked = true;
-                    uint32_t chunkSize = (rec->dataSize < config_.cacheLineSize)
-                                       ? rec->dataSize : config_.cacheLineSize;
-                    opi_->Prefetch(rec->opiAddr, cl->data, chunkSize);
-                    cl->size = chunkSize;
-                    cl->srcOffset = 0;
-                }
-            }
-        }
-
-        // Prefetch texture data
-        if (textureIds) {
-            MemRecord* rec = FindRecord(textureIds[i]);
-            if (rec && rec->currentTier == MemTier::OPI_PSRAM && rec->opiAddr != 0) {
-                CacheLine* cl = AllocCacheLine(rec->resourceId, rec->dataSize);
-                if (cl) {
-                    cl->locked = true;
-                    uint32_t chunkSize = (rec->dataSize < config_.cacheLineSize)
-                                       ? rec->dataSize : config_.cacheLineSize;
-                    opi_->Prefetch(rec->opiAddr, cl->data, chunkSize);
-                    cl->size = chunkSize;
-                    cl->srcOffset = 0;
-                }
-            }
-        }
+        // Prefetch mesh, material, and texture data
+        if (meshIds)     prefetchResource(meshIds[i]);
+        if (materialIds) prefetchResource(materialIds[i]);
+        if (textureIds)  prefetchResource(textureIds[i]);
     }
 
     // Wait for all prefetches to complete before rasterization starts
-    if (opi_) {
-        opi_->WaitDma();
+    if (vram_->IsChannelInitialized(QspiChannel::A)) {
+        vram_->WaitDma(QspiChannel::A);
+    }
+    if (vram_->IsChannelInitialized(QspiChannel::B)) {
+        vram_->WaitDma(QspiChannel::B);
     }
 
     // Unlock all cache lines (rasterizer can now read them)
@@ -429,12 +422,14 @@ void MemTierManager::EndFrame() {
         }
 
         // Write back to the appropriate tier
-        if (rec->currentTier == MemTier::OPI_PSRAM && opi_ && opi_->IsInitialized()) {
-            opi_->WriteSync(rec->opiAddr + cl.srcOffset, cl.data, cl.size);
-        } else if (rec->currentTier == MemTier::QSPI_XIP && qspi_ && qspi_->IsInitialized()) {
-            uint32_t offset = static_cast<uint32_t>(
-                reinterpret_cast<uintptr_t>(rec->qspiPtr) - config_.qspiXipBase);
-            qspi_->Write(offset + cl.srcOffset, cl.data, cl.size);
+        if (rec->currentTier == MemTier::QSPI_A && vram_ &&
+            vram_->IsChannelInitialized(QspiChannel::A)) {
+            vram_->WriteSync(QspiChannel::A, rec->qspiAAddr + cl.srcOffset,
+                             cl.data, cl.size);
+        } else if (rec->currentTier == MemTier::QSPI_B && vram_ &&
+                   vram_->IsChannelInitialized(QspiChannel::B)) {
+            vram_->WriteSync(QspiChannel::B, rec->qspiBAddr + cl.srcOffset,
+                             cl.data, cl.size);
         }
 
         cl.dirty = false;
@@ -456,33 +451,24 @@ void MemTierManager::Promote(MemRecord& rec, MemTier targetTier) {
 
     // When promoting to SRAM from an external tier, load the data via cache
     if (targetTier == MemTier::SRAM && rec.dataSize > 0) {
-        if (oldTier == MemTier::OPI_PSRAM && opi_ && opi_->IsInitialized() &&
-            rec.opiAddr != 0 && rec.opiAddr != 0xFFFFFFFF) {
-            // Allocate a SRAM cache line and DMA copy from OPI
-            CacheLine* cl = AllocCacheLine(rec.resourceId, rec.dataSize);
-            if (cl && cl->data) {
-                uint32_t copySize = (rec.dataSize <= config_.cacheLineSize)
-                                        ? rec.dataSize : config_.cacheLineSize;
-                opi_->ReadSync(rec.opiAddr, cl->data, copySize);
-                cl->srcOffset = 0;
-                cl->size = copySize;
-                cl->dirty = false;
-                cl->lastUsedFrame = static_cast<uint8_t>(frameCounter_ & 0xFF);
-                rec.sramPtr = cl->data;
-            }
-        } else if (oldTier == MemTier::QSPI_XIP && qspi_ && qspi_->IsInitialized() &&
-                   rec.qspiPtr != nullptr) {
-            // QSPI XIP is memory-mapped — allocate cache line and memcpy
-            CacheLine* cl = AllocCacheLine(rec.resourceId, rec.dataSize);
-            if (cl && cl->data) {
-                uint32_t copySize = (rec.dataSize <= config_.cacheLineSize)
-                                        ? rec.dataSize : config_.cacheLineSize;
-                memcpy(cl->data, rec.qspiPtr, copySize);
-                cl->srcOffset = 0;
-                cl->size = copySize;
-                cl->dirty = false;
-                cl->lastUsedFrame = static_cast<uint8_t>(frameCounter_ & 0xFF);
-                rec.sramPtr = cl->data;
+        if ((oldTier == MemTier::QSPI_A || oldTier == MemTier::QSPI_B) && vram_) {
+            QspiChannel ch = ChannelForTier(oldTier);
+            uint32_t addr = (oldTier == MemTier::QSPI_A) ? rec.qspiAAddr
+                                                         : rec.qspiBAddr;
+            if (vram_->IsChannelInitialized(ch) &&
+                addr != 0 && addr != 0xFFFFFFFF) {
+                // Allocate a SRAM cache line and DMA copy from the QSPI channel
+                CacheLine* cl = AllocCacheLine(rec.resourceId, rec.dataSize);
+                if (cl && cl->data) {
+                    uint32_t copySize = (rec.dataSize <= config_.cacheLineSize)
+                                            ? rec.dataSize : config_.cacheLineSize;
+                    vram_->ReadSync(ch, addr, cl->data, copySize);
+                    cl->srcOffset = 0;
+                    cl->size = copySize;
+                    cl->dirty = false;
+                    cl->lastUsedFrame = static_cast<uint8_t>(frameCounter_ & 0xFF);
+                    rec.sramPtr = cl->data;
+                }
             }
         }
     }
@@ -502,36 +488,27 @@ void MemTierManager::Demote(MemRecord& rec, MemTier targetTier) {
 
     MemTier oldTier = rec.currentTier;
 
-    // If demoting from SRAM to PIO2, write data to external memory first
-    if (oldTier == MemTier::SRAM && targetTier == MemTier::OPI_PSRAM) {
-        if (opi_ && opi_->IsInitialized() && rec.sramPtr && rec.dataSize > 0) {
-            // Allocate in OPI if not already allocated
-            if (rec.opiAddr == 0) {
-                rec.opiAddr = opi_->Alloc(rec.dataSize, 4);
+    // If demoting from SRAM to an external tier, write data out first
+    if (oldTier == MemTier::SRAM &&
+        (targetTier == MemTier::QSPI_A || targetTier == MemTier::QSPI_B)) {
+        QspiChannel ch = ChannelForTier(targetTier);
+        // Can't demote to a tier whose channel isn't up — keep the record in
+        // SRAM rather than flipping the tier while its data has no home.
+        if (!vram_ || !vram_->IsChannelInitialized(ch)) return;
+
+        if (rec.sramPtr && rec.dataSize > 0) {
+            uint32_t& tierAddr = (targetTier == MemTier::QSPI_A)
+                                 ? rec.qspiAAddr : rec.qspiBAddr;
+            // Allocate in the target tier if not already allocated
+            if (tierAddr == 0) {
+                tierAddr = vram_->Alloc(ch, rec.dataSize, 4);
             }
-            if (rec.opiAddr != 0xFFFFFFFF && rec.opiAddr != 0) {
-                opi_->WriteSync(rec.opiAddr, rec.sramPtr, rec.dataSize);
+            if (tierAddr != 0xFFFFFFFF && tierAddr != 0) {
+                vram_->WriteSync(ch, tierAddr, rec.sramPtr, rec.dataSize);
             } else {
-                // OPI full — can't demote
+                // External tier full — can't demote
                 return;
             }
-        }
-    }
-
-    // If demoting from SRAM to QSPI, write data via XIP write-through
-    if (oldTier == MemTier::SRAM && targetTier == MemTier::QSPI_XIP) {
-        if (qspi_ && qspi_->IsInitialized() && rec.sramPtr && rec.dataSize > 0) {
-            if (!rec.qspiPtr) {
-                uint32_t offset = qspi_->Alloc(rec.dataSize, 4);
-                if (offset != 0xFFFFFFFF) {
-                    rec.qspiPtr = reinterpret_cast<void*>(config_.qspiXipBase + offset);
-                } else {
-                    return;  // QSPI full
-                }
-            }
-            uint32_t offset = static_cast<uint32_t>(
-                reinterpret_cast<uintptr_t>(rec.qspiPtr) - config_.qspiXipBase);
-            qspi_->Write(offset, rec.sramPtr, rec.dataSize);
         }
     }
 
@@ -572,17 +549,19 @@ CacheLine* MemTierManager::AllocCacheLine(uint16_t resourceId, uint32_t size) {
         // Write back if dirty
         if (lru->dirty && lru->resourceId != 0xFFFF) {
             MemRecord* rec = FindRecord(lru->resourceId);
-            if (rec) {
-                if (opi_ && opi_->IsInitialized() &&
-                    rec->currentTier == MemTier::OPI_PSRAM &&
-                    rec->opiAddr != 0 && rec->opiAddr != 0xFFFFFFFF) {
-                    opi_->WriteSync(rec->opiAddr + lru->srcOffset, lru->data, lru->size);
-                } else if (qspi_ && qspi_->IsInitialized() &&
-                           rec->currentTier == MemTier::QSPI_XIP && rec->qspiPtr) {
-                    uint32_t offset = static_cast<uint32_t>(
-                        reinterpret_cast<uintptr_t>(rec->qspiPtr) - config_.qspiXipBase)
-                        + lru->srcOffset;
-                    qspi_->Write(offset, lru->data, lru->size);
+            if (rec && vram_) {
+                if (rec->currentTier == MemTier::QSPI_A &&
+                    rec->qspiAAddr != 0 && rec->qspiAAddr != 0xFFFFFFFF &&
+                    vram_->IsChannelInitialized(QspiChannel::A)) {
+                    vram_->WriteSync(QspiChannel::A,
+                                     rec->qspiAAddr + lru->srcOffset,
+                                     lru->data, lru->size);
+                } else if (rec->currentTier == MemTier::QSPI_B &&
+                           rec->qspiBAddr != 0 && rec->qspiBAddr != 0xFFFFFFFF &&
+                           vram_->IsChannelInitialized(QspiChannel::B)) {
+                    vram_->WriteSync(QspiChannel::B,
+                                     rec->qspiBAddr + lru->srcOffset,
+                                     lru->data, lru->size);
                 }
             }
         }
@@ -631,8 +610,8 @@ CacheLine* MemTierManager::FindLRUCacheLine() {
 // ─── Diagnostics ────────────────────────────────────────────────────────────
 
 void MemTierManager::PrintStats() const {
-    uint16_t sramCount = 0, opiCount = 0, qspiCount = 0;
-    uint32_t sramBytes = 0, opiBytes = 0, qspiBytes = 0;
+    uint16_t sramCount = 0, qspiACount = 0, qspiBCount = 0;
+    uint32_t sramBytes = 0, qspiABytes = 0, qspiBBytes = 0;
 
     for (uint16_t i = 0; i < recordCount_; ++i) {
         const MemRecord& rec = records_[i];
@@ -641,13 +620,13 @@ void MemTierManager::PrintStats() const {
                 sramCount++;
                 sramBytes += rec.dataSize;
                 break;
-            case MemTier::OPI_PSRAM:
-                opiCount++;
-                opiBytes += rec.dataSize;
+            case MemTier::QSPI_A:
+                qspiACount++;
+                qspiABytes += rec.dataSize;
                 break;
-            case MemTier::QSPI_XIP:
-                qspiCount++;
-                qspiBytes += rec.dataSize;
+            case MemTier::QSPI_B:
+                qspiBCount++;
+                qspiBBytes += rec.dataSize;
                 break;
             default:
                 break;
@@ -659,12 +638,12 @@ void MemTierManager::PrintStats() const {
         if (cacheLines_[i].resourceId != 0xFFFF) cacheUsed++;
     }
 
-    printf("[MemTier] Resources: %u total (%u SRAM/%lu KB, %u PIO2/%lu KB, "
-           "%u QSPI/%lu KB). Cache: %u/%u lines used.\n",
+    printf("[MemTier] Resources: %u total (%u SRAM/%lu KB, %u QSPI-A/%lu KB, "
+           "%u QSPI-B/%lu KB). Cache: %u/%u lines used.\n",
            recordCount_,
            sramCount, (unsigned long)(sramBytes / 1024),
-           opiCount, (unsigned long)(opiBytes / 1024),
-           qspiCount, (unsigned long)(qspiBytes / 1024),
+           qspiACount, (unsigned long)(qspiABytes / 1024),
+           qspiBCount, (unsigned long)(qspiBBytes / 1024),
            cacheUsed, MAX_CACHE_LINES);
 }
 
@@ -806,7 +785,10 @@ bool MemTierManager::Defragment(MemTier tier, uint8_t mode, uint16_t maxMoveKB,
         else if (targetTier == MemTier::QSPI_A || targetTier == MemTier::QSPI_B) {
             // QSPI compaction uses DMA staging through a cache line.
             // We need vram_ driver to perform reads and writes.
-            if (!vram_) return true;  // no VRAM driver → nothing to compact
+            QspiChannel ch = ChannelForTier(targetTier);
+            if (!vram_ || !vram_->IsChannelInitialized(ch)) {
+                return true;  // tier's channel not up → nothing to compact
+            }
 
             uint32_t nextFreeAddr = 0;
 
@@ -816,8 +798,7 @@ bool MemTierManager::Defragment(MemTier tier, uint8_t mode, uint16_t maxMoveKB,
                     ? rec.qspiAAddr : rec.qspiBAddr;
 
                 if (currentAddr > nextFreeAddr) {
-                    // Gap found — would need to relocate
-                    // For QSPI, relocation requires:
+                    // Gap found — relocate via DMA staging:
                     //   1. DMA read from currentAddr into staging buffer
                     //   2. DMA write from staging buffer to nextFreeAddr
                     // This is expensive and must respect budgetBytes.
@@ -836,23 +817,48 @@ bool MemTierManager::Defragment(MemTier tier, uint8_t mode, uint16_t maxMoveKB,
                         break;
                     }
 
+                    // Detach the staging line from whatever it was caching —
+                    // flush it first if dirty so no writeback data is lost.
+                    if (staging->resourceId != 0xFFFF && staging->dirty) {
+                        MemRecord* owner = FindRecord(staging->resourceId);
+                        if (owner &&
+                            (owner->currentTier == MemTier::QSPI_A ||
+                             owner->currentTier == MemTier::QSPI_B)) {
+                            QspiChannel ownerCh = ChannelForTier(owner->currentTier);
+                            uint32_t ownerAddr = (owner->currentTier == MemTier::QSPI_A)
+                                ? owner->qspiAAddr : owner->qspiBAddr;
+                            if (ownerAddr != 0 && ownerAddr != 0xFFFFFFFF &&
+                                vram_->IsChannelInitialized(ownerCh)) {
+                                vram_->WriteSync(ownerCh,
+                                                 ownerAddr + staging->srcOffset,
+                                                 staging->data, staging->size);
+                            }
+                        }
+                    }
+                    FreeCacheLine(staging);
+
                     // Move in chunks of cache line size
                     uint32_t remaining = moveSize;
                     uint32_t srcOff = 0;
+                    bool moveFailed = false;
                     while (remaining > 0) {
                         uint32_t chunkSize = (remaining > config_.cacheLineSize)
                             ? config_.cacheLineSize : remaining;
 
-                        // Read from current address
-                        // (abstracted — actual DMA is handled by QspiVramDriver)
-                        // For now, use memset as placeholder since QSPI read/write
-                        // API varies by driver version
-                        // vram_->Read(channel, currentAddr + srcOff, staging->data, chunkSize);
-                        // vram_->Write(channel, nextFreeAddr + srcOff, staging->data, chunkSize);
+                        if (!vram_->ReadSync(ch, currentAddr + srcOff,
+                                             staging->data, chunkSize) ||
+                            !vram_->WriteSync(ch, nextFreeAddr + srcOff,
+                                              staging->data, chunkSize)) {
+                            printf("[MemTier] Defrag: DMA move failed at +%lu\n",
+                                   (unsigned long)srcOff);
+                            moveFailed = true;
+                            break;
+                        }
 
                         srcOff += chunkSize;
                         remaining -= chunkSize;
                     }
+                    if (moveFailed) break;
 
                     // Update record address
                     if (targetTier == MemTier::QSPI_A) {

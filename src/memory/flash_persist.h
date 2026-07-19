@@ -70,7 +70,7 @@ struct FlashManifestEntry {
     uint32_t originalSize;      ///< Original (uncompressed) size
     uint32_t crc32;             ///< CRC-32 of the persisted data
     uint8_t  tier;              ///< Original memory tier
-    uint8_t  reserved[7];       ///< Pad to 32 bytes
+    uint8_t  reserved[11];      ///< Pad to 32 bytes
 };
 static_assert(sizeof(FlashManifestEntry) == 32, "FlashManifestEntry must be 32 bytes");
 
@@ -238,4 +238,3 @@ private:
     uint32_t AllocDataSpace(uint32_t size);
 };
 
-#endif // FLASH_PERSIST_H — intentionally not used, #pragma once above

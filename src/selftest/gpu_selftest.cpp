@@ -15,8 +15,7 @@
 #include "gpu_selftest.h"
 #include "../gpu_config.h"
 #include "../display/hub75_driver.h"
-#include "../memory/mem_opi_psram.h"
-#include "../memory/mem_qspi_psram.h"
+#include "../memory/mem_qspi_vram.h"
 
 #include "pico/stdlib.h"
 
@@ -196,35 +195,36 @@ static bool TestMath() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// OPI PSRAM Memory Test (PIO2 — Tier 1, indirect DMA/sync access)
+// QSPI Channel A Memory Test (Tier 1 — indirect DMA via unified QspiVramDriver)
 // ═══════════════════════════════════════════════════════════════════════════
 
 VramTestResult TestOpiVram(OpiPsramDriver* drv) {
     VramTestResult result = {};
 
-    if (!drv || !drv->IsInitialized()) {
-        printf("[SelfTest] OPI VRAM: not present - skipped\n");
+    // Legacy "OPI" test = Channel A of the unified dual-channel QspiVramDriver.
+    if (!drv || !drv->IsChannelInitialized(QspiChannel::A)) {
+        printf("[SelfTest] QSPI-A VRAM: not present - skipped\n");
         result.present = false;
         result.pass = true;   // N/A counts as pass
         return result;
     }
 
     result.present = true;
-    printf("[SelfTest] OPI VRAM memory test (%lu KB total, %lu KB free)...\n",
-           (unsigned long)(drv->GetCapacity() / 1024),
-           (unsigned long)(drv->Available() / 1024));
+    printf("[SelfTest] QSPI-A VRAM memory test (%lu KB total, %lu KB free)...\n",
+           (unsigned long)(drv->GetCapacity(QspiChannel::A) / 1024),
+           (unsigned long)(drv->Available(QspiChannel::A) / 1024));
 
     static constexpr uint32_t TEST_SIZE = 1024;  // 1 KB test region
 
     // Ensure enough space
-    if (drv->Available() < TEST_SIZE) {
+    if (drv->Available(QspiChannel::A) < TEST_SIZE) {
         printf("[SelfTest]   FAIL: insufficient space (%lu bytes available)\n",
-               (unsigned long)drv->Available());
+               (unsigned long)drv->Available(QspiChannel::A));
         result.pass = false;
         return result;
     }
 
-    uint32_t testAddr = drv->Alloc(TEST_SIZE, 4);
+    uint32_t testAddr = drv->Alloc(QspiChannel::A, TEST_SIZE, 4);
     result.testedBytes = TEST_SIZE;
     bool pass = true;
 
@@ -236,10 +236,10 @@ VramTestResult TestOpiVram(OpiPsramDriver* drv) {
     for (int bit = 0; bit < 8 && pass; ++bit) {
         uint8_t pattern = (1u << bit);
         memset(writeBuf, pattern, sizeof(writeBuf));
-        drv->WriteSync(testAddr, writeBuf, sizeof(writeBuf));
+        drv->WriteSync(QspiChannel::A, testAddr, writeBuf, sizeof(writeBuf));
         Hub75Driver::PollRefresh();
         memset(readBuf, 0, sizeof(readBuf));
-        drv->ReadSync(testAddr, readBuf, sizeof(readBuf));
+        drv->ReadSync(QspiChannel::A, testAddr, readBuf, sizeof(readBuf));
         Hub75Driver::PollRefresh();
 
         for (uint32_t i = 0; i < sizeof(writeBuf); ++i) {
@@ -260,10 +260,10 @@ VramTestResult TestOpiVram(OpiPsramDriver* drv) {
         for (int bit = 0; bit < 8 && pass; ++bit) {
             uint8_t pattern = (uint8_t)(~(1u << bit));
             memset(writeBuf, pattern, sizeof(writeBuf));
-            drv->WriteSync(testAddr, writeBuf, sizeof(writeBuf));
+            drv->WriteSync(QspiChannel::A, testAddr, writeBuf, sizeof(writeBuf));
             Hub75Driver::PollRefresh();
             memset(readBuf, 0xFF, sizeof(readBuf));
-            drv->ReadSync(testAddr, readBuf, sizeof(readBuf));
+            drv->ReadSync(QspiChannel::A, testAddr, readBuf, sizeof(readBuf));
             Hub75Driver::PollRefresh();
 
             for (uint32_t i = 0; i < sizeof(writeBuf); ++i) {
@@ -286,7 +286,7 @@ VramTestResult TestOpiVram(OpiPsramDriver* drv) {
         // Write unique pattern at each 4-byte aligned offset
         for (uint32_t off = 0; off < TEST_SIZE; off += 4) {
             uint32_t pattern = off ^ 0xDEADBEEFu;
-            drv->WriteSync(testAddr + off, &pattern, 4);
+            drv->WriteSync(QspiChannel::A, testAddr + off, &pattern, 4);
             if ((off & 0x3F) == 0) Hub75Driver::PollRefresh();
         }
 
@@ -294,7 +294,7 @@ VramTestResult TestOpiVram(OpiPsramDriver* drv) {
         for (uint32_t off = 0; off < TEST_SIZE && pass; off += 4) {
             uint32_t expected = off ^ 0xDEADBEEFu;
             uint32_t readVal = 0;
-            drv->ReadSync(testAddr + off, &readVal, 4);
+            drv->ReadSync(QspiChannel::A, testAddr + off, &readVal, 4);
 
             if (readVal != expected) {
                 printf("[SelfTest]     FAIL at offset 0x%04X: expected 0x%08X, got 0x%08X\n",
@@ -318,7 +318,7 @@ VramTestResult TestOpiVram(OpiPsramDriver* drv) {
             for (uint32_t i = 0; i < chunk; ++i) {
                 writeBuf[i] = (uint8_t)((off + i) & 0xFF);
             }
-            drv->WriteSync(testAddr + off, writeBuf, chunk);
+            drv->WriteSync(QspiChannel::A, testAddr + off, writeBuf, chunk);
             Hub75Driver::PollRefresh();
         }
 
@@ -326,7 +326,7 @@ VramTestResult TestOpiVram(OpiPsramDriver* drv) {
         for (uint32_t off = 0; off < TEST_SIZE && pass; off += sizeof(readBuf)) {
             uint32_t chunk = TEST_SIZE - off;
             if (chunk > sizeof(readBuf)) chunk = sizeof(readBuf);
-            drv->ReadSync(testAddr + off, readBuf, chunk);
+            drv->ReadSync(QspiChannel::A, testAddr + off, readBuf, chunk);
 
             for (uint32_t i = 0; i < chunk && pass; ++i) {
                 uint8_t expected = (uint8_t)((off + i) & 0xFF);
@@ -342,43 +342,46 @@ VramTestResult TestOpiVram(OpiPsramDriver* drv) {
         }
     }
 
-    drv->Free(testAddr);
+    drv->Free(QspiChannel::A, testAddr);
     result.pass = pass;
-    printf("[SelfTest] OPI VRAM test: %s (tested %u bytes, %u errors)\n",
+    printf("[SelfTest] QSPI-A VRAM test: %s (tested %u bytes, %u errors)\n",
            pass ? "PASSED" : "FAILED", (unsigned)result.testedBytes,
            (unsigned)result.errorCount);
     return result;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// QSPI CS1 Memory Test (Tier 2 — XIP mapped)
+// QSPI Channel B Memory Test (Tier 2 — indirect DMA via unified QspiVramDriver)
 // ═══════════════════════════════════════════════════════════════════════════
 
 VramTestResult TestQspiVram(QspiPsramDriver* drv) {
     VramTestResult result = {};
 
-    if (!drv || !drv->IsInitialized()) {
-        printf("[SelfTest] QSPI VRAM: not present - skipped\n");
+    // Legacy "QSPI" test = Channel B of the unified dual-channel
+    // QspiVramDriver.  The old QMI CS1 XIP path no longer exists — Channel B
+    // uses the same indirect ReadSync/WriteSync DMA model as Channel A.
+    if (!drv || !drv->IsChannelInitialized(QspiChannel::B)) {
+        printf("[SelfTest] QSPI-B VRAM: not present - skipped\n");
         result.present = false;
         result.pass = true;   // N/A counts as pass
         return result;
     }
 
     result.present = true;
-    printf("[SelfTest] QSPI VRAM memory test (%lu KB total, %lu KB free)...\n",
-           (unsigned long)(drv->GetCapacity() / 1024),
-           (unsigned long)(drv->Available() / 1024));
+    printf("[SelfTest] QSPI-B VRAM memory test (%lu KB total, %lu KB free)...\n",
+           (unsigned long)(drv->GetCapacity(QspiChannel::B) / 1024),
+           (unsigned long)(drv->Available(QspiChannel::B) / 1024));
 
     static constexpr uint32_t TEST_SIZE = 1024;  // 1 KB test region
 
-    if (drv->Available() < TEST_SIZE) {
+    if (drv->Available(QspiChannel::B) < TEST_SIZE) {
         printf("[SelfTest]   FAIL: insufficient space (%lu bytes available)\n",
-               (unsigned long)drv->Available());
+               (unsigned long)drv->Available(QspiChannel::B));
         result.pass = false;
         return result;
     }
 
-    uint32_t testOffset = drv->Alloc(TEST_SIZE, 4);
+    uint32_t testOffset = drv->Alloc(QspiChannel::B, TEST_SIZE, 4);
     result.testedBytes = TEST_SIZE;
     bool pass = true;
 
@@ -390,10 +393,10 @@ VramTestResult TestQspiVram(QspiPsramDriver* drv) {
     for (int bit = 0; bit < 8 && pass; ++bit) {
         uint8_t pattern = (1u << bit);
         memset(writeBuf, pattern, sizeof(writeBuf));
-        drv->Write(testOffset, writeBuf, sizeof(writeBuf));
+        drv->WriteSync(QspiChannel::B, testOffset, writeBuf, sizeof(writeBuf));
         Hub75Driver::PollRefresh();
         memset(readBuf, 0, sizeof(readBuf));
-        drv->Read(testOffset, readBuf, sizeof(readBuf));
+        drv->ReadSync(QspiChannel::B, testOffset, readBuf, sizeof(readBuf));
         Hub75Driver::PollRefresh();
 
         for (uint32_t i = 0; i < sizeof(writeBuf); ++i) {
@@ -414,10 +417,10 @@ VramTestResult TestQspiVram(QspiPsramDriver* drv) {
         for (int bit = 0; bit < 8 && pass; ++bit) {
             uint8_t pattern = (uint8_t)(~(1u << bit));
             memset(writeBuf, pattern, sizeof(writeBuf));
-            drv->Write(testOffset, writeBuf, sizeof(writeBuf));
+            drv->WriteSync(QspiChannel::B, testOffset, writeBuf, sizeof(writeBuf));
             Hub75Driver::PollRefresh();
             memset(readBuf, 0xFF, sizeof(readBuf));
-            drv->Read(testOffset, readBuf, sizeof(readBuf));
+            drv->ReadSync(QspiChannel::B, testOffset, readBuf, sizeof(readBuf));
             Hub75Driver::PollRefresh();
 
             for (uint32_t i = 0; i < sizeof(writeBuf); ++i) {
@@ -439,14 +442,14 @@ VramTestResult TestQspiVram(QspiPsramDriver* drv) {
 
         for (uint32_t off = 0; off < TEST_SIZE; off += 4) {
             uint32_t pattern = off ^ 0xCAFEBEEFu;
-            drv->Write(testOffset + off, &pattern, 4);
+            drv->WriteSync(QspiChannel::B, testOffset + off, &pattern, 4);
             if ((off & 0x3F) == 0) Hub75Driver::PollRefresh();
         }
 
         for (uint32_t off = 0; off < TEST_SIZE && pass; off += 4) {
             uint32_t expected = off ^ 0xCAFEBEEFu;
             uint32_t readVal = 0;
-            drv->Read(testOffset + off, &readVal, 4);
+            drv->ReadSync(QspiChannel::B, testOffset + off, &readVal, 4);
 
             if (readVal != expected) {
                 printf("[SelfTest]     FAIL at offset 0x%04X: expected 0x%08X, got 0x%08X\n",
@@ -469,14 +472,14 @@ VramTestResult TestQspiVram(QspiPsramDriver* drv) {
             for (uint32_t i = 0; i < chunk; ++i) {
                 writeBuf[i] = (uint8_t)((off + i) & 0xFF);
             }
-            drv->Write(testOffset + off, writeBuf, chunk);
+            drv->WriteSync(QspiChannel::B, testOffset + off, writeBuf, chunk);
             Hub75Driver::PollRefresh();
         }
 
         for (uint32_t off = 0; off < TEST_SIZE && pass; off += sizeof(readBuf)) {
             uint32_t chunk = TEST_SIZE - off;
             if (chunk > sizeof(readBuf)) chunk = sizeof(readBuf);
-            drv->Read(testOffset + off, readBuf, chunk);
+            drv->ReadSync(QspiChannel::B, testOffset + off, readBuf, chunk);
 
             for (uint32_t i = 0; i < chunk && pass; ++i) {
                 uint8_t expected = (uint8_t)((off + i) & 0xFF);
@@ -492,9 +495,9 @@ VramTestResult TestQspiVram(QspiPsramDriver* drv) {
         }
     }
 
-    drv->Free(testOffset);
+    drv->Free(QspiChannel::B, testOffset);
     result.pass = pass;
-    printf("[SelfTest] QSPI VRAM test: %s (tested %u bytes, %u errors)\n",
+    printf("[SelfTest] QSPI-B VRAM test: %s (tested %u bytes, %u errors)\n",
            pass ? "PASSED" : "FAILED", (unsigned)result.testedBytes,
            (unsigned)result.errorCount);
     return result;
@@ -510,10 +513,10 @@ void TestAllVram(OpiPsramDriver* opiDriver, QspiPsramDriver* qspiDriver,
     opiResult  = TestOpiVram(opiDriver);
     qspiResult = TestQspiVram(qspiDriver);
     printf("[SelfTest] === VRAM Memory Check Complete ===\n");
-    printf("[SelfTest] OPI:  %s%s\n",
+    printf("[SelfTest] QSPI-A: %s%s\n",
            opiResult.present ? "" : "(not present) ",
            opiResult.pass ? "PASS" : "FAIL");
-    printf("[SelfTest] QSPI: %s%s\n",
+    printf("[SelfTest] QSPI-B: %s%s\n",
            qspiResult.present ? "" : "(not present) ",
            qspiResult.pass ? "PASS" : "FAIL");
 }
@@ -540,8 +543,12 @@ SelfTestResult RunAll(uint16_t* frontBuffer, uint16_t* backBuffer,
     printf("  ProtoGL GPU Self-Test v1.0\n");
     printf("========================================\n");
     printf("  Panel: %ux%u\n", width, height);
-    printf("  OPI VRAM:  %s\n", (opiDriver && opiDriver->IsInitialized()) ? "present" : "not detected");
-    printf("  QSPI VRAM: %s\n", (qspiDriver && qspiDriver->IsInitialized()) ? "present" : "not detected");
+    // Both driver handles are the same unified QspiVramDriver instance —
+    // "OPI" tests Channel A, "QSPI" tests Channel B.
+    printf("  QSPI-A VRAM: %s\n",
+           (opiDriver && opiDriver->IsChannelInitialized(QspiChannel::A)) ? "present" : "not detected");
+    printf("  QSPI-B VRAM: %s\n",
+           (qspiDriver && qspiDriver->IsChannelInitialized(QspiChannel::B)) ? "present" : "not detected");
     printf("========================================\n\n");
 
     // ── Clear display and show header ───────────────────────────────────
@@ -558,8 +565,8 @@ SelfTestResult RunAll(uint16_t* frontBuffer, uint16_t* backBuffer,
     FillBar(BAR_MATH_Y0, BAR_MATH_Y1, result.mathPass ? CLR_GREEN : CLR_RED);
     QuickRefresh();
 
-    // ── Test 2: OPI VRAM ────────────────────────────────────────────────
-    bool opiPresent = (opiDriver && opiDriver->IsInitialized());
+    // ── Test 2: QSPI-A VRAM (legacy "OPI" slot) ─────────────────────────
+    bool opiPresent = (opiDriver && opiDriver->IsChannelInitialized(QspiChannel::A));
     FillBar(BAR_OPI_Y0, BAR_OPI_Y1, opiPresent ? CLR_YELLOW : CLR_DARK_GRAY);
     QuickRefresh();
 
@@ -569,8 +576,8 @@ SelfTestResult RunAll(uint16_t* frontBuffer, uint16_t* backBuffer,
             result.opiResult.pass ? CLR_GREEN : CLR_RED);
     QuickRefresh();
 
-    // ── Test 3: QSPI VRAM ──────────────────────────────────────────────
-    bool qspiPresent = (qspiDriver && qspiDriver->IsInitialized());
+    // ── Test 3: QSPI-B VRAM (legacy "QSPI" slot) ───────────────────────
+    bool qspiPresent = (qspiDriver && qspiDriver->IsChannelInitialized(QspiChannel::B));
     FillBar(BAR_QSPI_Y0, BAR_QSPI_Y1, qspiPresent ? CLR_YELLOW : CLR_DARK_GRAY);
     QuickRefresh();
 
@@ -614,12 +621,12 @@ SelfTestResult RunAll(uint16_t* frontBuffer, uint16_t* backBuffer,
     printf("  Self-Test Results\n");
     printf("========================================\n");
     printf("  Math:     %s\n", result.mathPass ? "PASS" : "FAIL");
-    printf("  OPI VRAM: %s", result.opiResult.pass ? "PASS" : "FAIL");
+    printf("  QSPI-A VRAM: %s", result.opiResult.pass ? "PASS" : "FAIL");
     if (!result.opiResult.present) printf(" (not present)");
     else printf(" (%u bytes tested, %u errors)", (unsigned)result.opiResult.testedBytes,
                 (unsigned)result.opiResult.errorCount);
     printf("\n");
-    printf("  QSPI VRAM: %s", result.qspiResult.pass ? "PASS" : "FAIL");
+    printf("  QSPI-B VRAM: %s", result.qspiResult.pass ? "PASS" : "FAIL");
     if (!result.qspiResult.present) printf(" (not present)");
     else printf(" (%u bytes tested, %u errors)", (unsigned)result.qspiResult.testedBytes,
                 (unsigned)result.qspiResult.errorCount);

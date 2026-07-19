@@ -22,6 +22,13 @@
 #include "hardware/sync.h"
 #include "pico/stdlib.h"
 
+// The Pico SDK's hardware/flash.h defines FLASH_PAGE_SIZE / FLASH_SECTOR_SIZE
+// as object-like macros, which would replace the GpuConfig member names used
+// below (GpuConfig::FLASH_PAGE_SIZE → GpuConfig::(1u << 8)). Drop them — this
+// TU only needs flash_range_erase/program, not the SDK's size macros.
+#undef FLASH_PAGE_SIZE
+#undef FLASH_SECTOR_SIZE
+
 #include <cstdio>
 #include <cstring>
 

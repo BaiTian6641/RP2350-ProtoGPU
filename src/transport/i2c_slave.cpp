@@ -31,9 +31,6 @@
 #include "hardware/adc.h"
 #include "hardware/clocks.h"
 #include "hardware/vreg.h"
-#include "hardware/sync.h"
-#include "hardware/structs/qmi.h"
-#include "hardware/structs/xip_ctrl.h"
 #include "pico/i2c_slave.h"
 
 #include <cstring>
@@ -110,318 +107,111 @@ static void BuildCapabilityResponse() {
 }
 
 // ─── VRAM Detection ─────────────────────────────────────────────────────────
-// Probes OPI PSRAM (PIO2) and QSPI CS1 memory (QMI) at boot to determine what
-// external memory is physically present.  CS1 auto-detection uses real SPI
-// RDID transactions via the QMI direct-mode interface:
-//   1. MRAM RDID (0x4B + mode byte 0xFF) → MR10Q010 profile
-//   2. PSRAM RDID (0x9F)                  → APS6408L / ESP-PSRAM profile
-// Results are stored in the capability response flags and extended status.
-// Full driver initialization uses the results from these probes.
+// Reports which external QSPI VRAM channels are configured in gpu_config.h.
+//
+// In the unified QspiVram model (mem_qspi_vram.h) there is no 8-bit OPI bus
+// and no QMI CS1 XIP chip: both external tiers are QSPI channels on the
+// single PIO2-driven QspiVramDriver.  Real chip detection (per-chip-select
+// RDID probe: MRAM 0x4B / PSRAM 0x9F) happens inside
+// QspiVramDriver::InitChannel(), which runs later in GpuCore::Initialize().
+// At this early boot stage we can only report compile-time configuration;
+// capacities stay 0 until the driver probe completes.  Authoritative
+// per-channel totals then flow to the host each frame via
+// PGL_REG_MEM_TIER_INFO (updated in gpu_core.cpp).
 
 static uint8_t detectedVramFlags = 0;
 
-/// Runtime-detected QSPI CS1 chip profile (set by ProbeQspiCs1).
+/// QSPI chip profile placeholder — runtime chip profiles now live in the
+/// QspiVramDriver per chip-select (see QspiVramDriver::GetChipConfig()).
+/// Retained for modules that still query the legacy accessor; always
+/// reports "no chip detected" at this pre-driver-init stage.
 static GpuConfig::QspiChipProfile g_qspiChipProfile = {};
 
-/// Accessor for other modules (mem_tier.h, mem_qspi_psram.h).
+/// Accessor for other modules (mem_tier.h, mem_qspi_vram.h).
 const GpuConfig::QspiChipProfile& GetQspiChipProfile() {
     return g_qspiChipProfile;
 }
 
 /**
- * @brief Probe PIO2 external memory (OPI PSRAM or QSPI MRAM).
+ * @brief Check whether QSPI Channel A (Tier 1) is configured.
  *
- * Checks PIO2_MEM_MODE from gpu_config.h and validates pin configuration.
- * The actual device verification (RDID) happens during OpiPsramDriver::Initialize()
- * in gpu_core.cpp.  At this early probe stage, we check compile-time config and
- * pin validity to determine if the hardware *should* be present.
+ * Channel A replaces the old PIO2 OPI bus in the QspiVram model.
+ * Per-chip-select RDID verification is deferred to
+ * QspiVramDriver::InitChannel() — here we only validate compile-time config.
  *
- * Returns true if the PIO2 memory hardware is expected to be present.
+ * Returns true if Channel A hardware is expected to be present.
  */
-static bool ProbePio2Memory() {
-    if (GpuConfig::PIO2_MEM_MODE == GpuConfig::Pio2MemMode::NONE) return false;
+static bool ProbeQspiChannelA() {
+    if (!GpuConfig::QspiVramEnabled()) return false;
+    if (GpuConfig::QSPI_A_CHIP_COUNT == 0) return false;
+    if (GpuConfig::QSPI_A_CS0_PIN == 0xFF) return false;
 
-    switch (GpuConfig::PIO2_MEM_MODE) {
-    case GpuConfig::Pio2MemMode::OPI_PSRAM: {
-        // OPI PSRAM (APS6408L): verify CS pin is configured.
-        // Full RDID verification via the 8-bit PIO bus happens during
-        // OpiPsramDriver::Initialize() where the PIO program is loaded.
-        bool detected = (GpuConfig::PIO2_MEM_CS0_PIN != 0xFF);
-        if (detected) {
-            printf("[VRAM] PIO2 OPI PSRAM probe: CS=%u configured "
-                   "(capacity=%lu KB, RDID deferred to driver init)\n",
-                   GpuConfig::PIO2_MEM_CS0_PIN,
-                   (unsigned long)(GpuConfig::OPI_PSRAM_CAPACITY / 1024));
-        }
-        return detected;
-    }
-
-    case GpuConfig::Pio2MemMode::DUAL_QSPI_MRAM: {
-        // Dual QSPI MRAM (2× MR10Q010): verify both CS pins.
-        // RDID via PIO2 QSPI deferred to OpiPsramDriver::Initialize().
-        bool cs0ok = (GpuConfig::PIO2_MEM_CS0_PIN != 0xFF);
-        bool cs1ok = (GpuConfig::QSPI_MRAM_CS1_PIN != 0xFF);
-        bool detected = cs0ok && cs1ok;
-        if (detected) {
-            printf("[VRAM] PIO2 Dual QSPI MRAM probe: 2 × MR10Q010 "
-                   "(CS0=%u, CS1=%u, total=%lu KB)\n",
-                   GpuConfig::PIO2_MEM_CS0_PIN,
-                   GpuConfig::QSPI_MRAM_CS1_PIN,
-                   (unsigned long)(GpuConfig::QSPI_MRAM_CHIP_CAPACITY * 2 / 1024));
-        } else if (cs0ok) {
-            printf("[VRAM] PIO2 Dual QSPI MRAM probe: only CS0 detected, "
-                   "operating as single MRAM (128 KB)\n");
-            detected = true;
-        }
-        return detected;
-    }
-
-    case GpuConfig::Pio2MemMode::SINGLE_QSPI_MRAM: {
-        // Single QSPI MRAM (MR10Q010): verify CS0 pin.
-        bool detected = (GpuConfig::PIO2_MEM_CS0_PIN != 0xFF);
-        if (detected) {
-            printf("[VRAM] PIO2 Single QSPI MRAM probe: MR10Q010 "
-                   "(CS0=%u, capacity=%lu KB)\n",
-                   GpuConfig::PIO2_MEM_CS0_PIN,
-                   (unsigned long)(GpuConfig::QSPI_MRAM_CHIP_CAPACITY / 1024));
-        }
-        return detected;
-    }
-
-    default:
-        return false;
-    }
+    printf("[VRAM] QSPI Channel A: configured (%u chip(s), CS0=%u, CS1=%u) "
+           "— RDID/capacity deferred to QspiVramDriver init\n",
+           GpuConfig::QSPI_A_CHIP_COUNT,
+           GpuConfig::QSPI_A_CS0_PIN,
+           GpuConfig::QSPI_A_CS1_PIN);
+    return true;
 }
 
 /**
- * @brief Auto-detect chip on QMI CS1 (MRAM or PSRAM).
+ * @brief Check whether QSPI Channel B (Tier 2) is configured.
  *
- * Uses real QMI direct-mode SPI transactions to read chip IDs:
- *   1. Try MRAM RDID (cmd 0x4B, mode byte 0xFF, read 5 bytes).
- *      If response matches 0x076B111111 → MR10Q010 MRAM (128 KB).
- *   2. Try PSRAM RDID (cmd 0x9F, read 3 bytes).
- *      If MFR byte == 0x0D → APS6408L (8 MB AP Memory).
- *      If MFR byte == 0x5D → ESP-PSRAM64H (8 MB Espressif).
- *   3. If neither matched, report UNKNOWN_DEVICE.
+ * Channel B replaces the old QMI CS1 XIP path — XIP memory-mapping no
+ * longer exists; Channel B is a second PIO2 QSPI bus on the same unified
+ * QspiVramDriver.  Only present in DUAL_CHANNEL mode.
  *
- * The detected chip profile is stored in g_qspiChipProfile for use by the
- * QSPI driver and memory tier manager.
+ * Returns true if Channel B hardware is expected to be present.
  */
+static bool ProbeQspiChannelB() {
+    if (!GpuConfig::QspiChannelBEnabled()) return false;
+    if (GpuConfig::QSPI_B_CHIP_COUNT == 0) return false;
+    if (GpuConfig::QSPI_B_CS0_PIN == 0xFF) return false;
 
-// ─── QMI Direct-Mode SPI Helpers ─────────────────────────────────────────
-// These are lightweight SPI functions for RDID probes only.
-// The full QMI configuration is done by QspiPsramDriver::Initialize().
-
-/// Timeout for QMI direct-mode busy-waits (~2 ms at 150 MHz).
-static constexpr uint32_t QMI_PROBE_TIMEOUT = 300000;
-
-/// Track whether QMI probe timed out (used to early-exit the probe sequence).
-static volatile bool qmiProbeTimedOut = false;
-static uint32_t qmiProbeIrqState = 0;
-static bool qmiProbeIrqsDisabled = false;
-
-static void __not_in_flash_func(QmiProbeEnterDirect)() {
-    qmiProbeTimedOut = false;
-    qmiProbeIrqState = save_and_disable_interrupts();
-    qmiProbeIrqsDisabled = true;
-
-    // Temporarily disable XIP caching to enter direct mode
-    xip_ctrl_hw->ctrl &= ~(XIP_CTRL_EN_SECURE_BITS | XIP_CTRL_EN_NONSECURE_BITS);
-    // Enable QMI direct-mode CS1
-    qmi_hw->direct_csr = QMI_DIRECT_CSR_EN_BITS
-                        | QMI_DIRECT_CSR_CLKDIV_BITS  // max divider for safe probe
-                        | (1u << QMI_DIRECT_CSR_ASSERT_CS1N_LSB);
-    // Wait for direct mode to be ready (with timeout)
-    // NOTE: No printf allowed here — XIP is disabled, code runs from SRAM only.
-    uint32_t timeout = QMI_PROBE_TIMEOUT;
-    while (!(qmi_hw->direct_csr & QMI_DIRECT_CSR_TXEMPTY_BITS) && --timeout) {
-        tight_loop_contents();
-    }
-    if (timeout == 0) {
-        qmiProbeTimedOut = true;
-    }
+    printf("[VRAM] QSPI Channel B: configured (%u chip(s), CS0=%u, CS1=%u) "
+           "— RDID/capacity deferred to QspiVramDriver init\n",
+           GpuConfig::QSPI_B_CHIP_COUNT,
+           GpuConfig::QSPI_B_CS0_PIN,
+           GpuConfig::QSPI_B_CS1_PIN);
+    return true;
 }
 
-static void __not_in_flash_func(QmiProbeExitDirect)() {
-    // Deassert CS, disable direct mode
-    qmi_hw->direct_csr = 0;
-    // Re-enable XIP caching
-    xip_ctrl_hw->ctrl |= (XIP_CTRL_EN_SECURE_BITS | XIP_CTRL_EN_NONSECURE_BITS);
-    // Fence to ensure XIP is active before returning
-    __compiler_memory_barrier();
-
-    if (qmiProbeIrqsDisabled) {
-        restore_interrupts(qmiProbeIrqState);
-        qmiProbeIrqsDisabled = false;
-    }
-}
-
-/// Transfer one byte via QMI direct mode (full-duplex SPI).
-/// If `isTx` is true, sends `txByte`; otherwise sends 0xFF and returns the response.
-/// Returns 0xFF on timeout (no device present).
-/// NOTE: Runs from SRAM — must not call flash-resident code.
-static uint8_t __not_in_flash_func(QmiProbeTransfer)(uint8_t txByte, bool isTx) {
-    if (qmiProbeTimedOut) return 0xFF;
-
-    // Wait for TX ready (with timeout)
-    uint32_t timeout = QMI_PROBE_TIMEOUT;
-    while ((qmi_hw->direct_csr & QMI_DIRECT_CSR_BUSY_BITS) && --timeout) {
-        tight_loop_contents();
-    }
-    if (timeout == 0) { qmiProbeTimedOut = true; return 0xFF; }
-
-    if (isTx) {
-        // Transmit: OE enabled, 1-bit width, 8 bits, push RX
-        qmi_hw->direct_tx = QMI_DIRECT_TX_OE_BITS
-                           | (0u << QMI_DIRECT_TX_IWIDTH_LSB)   // single-bit
-                           | txByte;
-    } else {
-        // Receive: OE disabled (tristate MOSI), read MISO
-        qmi_hw->direct_tx = (0u << QMI_DIRECT_TX_IWIDTH_LSB) | 0xFF;
-    }
-
-    // Wait for RX data (with timeout)
-    timeout = QMI_PROBE_TIMEOUT;
-    while (!(qmi_hw->direct_csr & QMI_DIRECT_CSR_RXFULL_BITS) && --timeout) {
-        tight_loop_contents();
-    }
-    if (timeout == 0) { qmiProbeTimedOut = true; return 0xFF; }
-
-    return static_cast<uint8_t>(qmi_hw->direct_rx);
-}
-
-static bool __not_in_flash_func(ProbeQspiCs1)() {
-    // Respect compile-time board configuration.  Some boards do not wire CS1
-    // and probing it can stall early boot on certain hardware revisions.
-    if (!GpuConfig::QSPI_CS1_ENABLED) {
-        printf("[VRAM] QSPI CS1 auto-detect skipped (QSPI_CS1_ENABLED=false)\n");
-        return false;
-    }
-
-    // Runtime auto-detection uses QMI direct-mode RDID reads on CS1.
-    // It is gated by QSPI_CS1_ENABLED so board configs can explicitly disable
-    // this probe when CS1 is not routed or causes early-boot instability.
-
-    QmiProbeEnterDirect();
-
-    // ── Step 1: Try MRAM RDID (0x4B + mode byte 0xFF → 5 response bytes) ──
-    QmiProbeTransfer(0x4B, true);   // RDID command
-    QmiProbeTransfer(0xFF, true);   // Mode byte
-
-    uint8_t rdidBytes[5];
-    for (int i = 0; i < 5; ++i) {
-        rdidBytes[i] = QmiProbeTransfer(0xFF, false);
-    }
-
-    // Reconstruct 40-bit device ID (big-endian)
-    uint64_t mramRdid = 0;
-    for (int i = 0; i < 5; ++i) {
-        mramRdid = (mramRdid << 8) | rdidBytes[i];
-    }
-
-    QmiProbeExitDirect();
-
-    if (mramRdid == GpuConfig::QSPI_RDID_MR10Q010) {
-        g_qspiChipProfile = GpuConfig::PROFILE_MR10Q010;
-        printf("[VRAM] QSPI CS1 auto-detect: MR10Q010 MRAM "
-               "(128 KB, 104 MHz, no random-access penalty)\n");
-        return true;
-    }
-
-    // ── Step 2: Try PSRAM RDID (0x9F → 3 response bytes: MFR, KGD, EID) ──
-    QmiProbeEnterDirect();
-
-    QmiProbeTransfer(0x9F, true);   // RDID command
-
-    uint8_t mfrId   = QmiProbeTransfer(0xFF, false);
-    uint8_t kgdByte = QmiProbeTransfer(0xFF, false);
-    uint8_t eidByte = QmiProbeTransfer(0xFF, false);
-
-    uint64_t psramRdid = ((uint64_t)mfrId << 16) | ((uint64_t)kgdByte << 8) | eidByte;
-
-    QmiProbeExitDirect();
-
-    if (mfrId == 0x0D) {
-        // AP Memory — APS6408L-SQR (8 MB QSPI PSRAM)
-        g_qspiChipProfile = GpuConfig::PROFILE_APS6408L;
-        g_qspiChipProfile.deviceId = psramRdid;
-        printf("[VRAM] QSPI CS1 auto-detect: APS6408L PSRAM "
-               "(8 MB, 133 MHz, has random-access penalty)\n");
-        return true;
-    }
-
-    if (mfrId == 0x5D) {
-        // Espressif — ESP-PSRAM64H (8 MB)
-        g_qspiChipProfile = GpuConfig::PROFILE_ESP_PSRAM;
-        g_qspiChipProfile.deviceId = psramRdid;
-        printf("[VRAM] QSPI CS1 auto-detect: ESP-PSRAM64H "
-               "(8 MB, 84 MHz, has random-access penalty)\n");
-        return true;
-    }
-
-    // ── Step 3: No known device responded ─────────────────────────────
-    if (mramRdid != 0 && mramRdid != 0xFFFFFFFFFFULL) {
-        // Something responded but with an unrecognized ID
-        printf("[VRAM] QSPI CS1 auto-detect: unknown device "
-               "(MRAM RDID=0x%010llX, PSRAM MFR=0x%02X)\n",
-               (unsigned long long)mramRdid, mfrId);
-        // Default to MRAM profile for safety (lower risk of bus contention)
-        g_qspiChipProfile = GpuConfig::PROFILE_MR10Q010;
-        g_qspiChipProfile.type = static_cast<decltype(g_qspiChipProfile.type)>(
-            PGL_QSPI_CHIP_UNKNOWN);
-        return true;
-    }
-
-    printf("[VRAM] QSPI CS1 auto-detect: no device responded\n");
-    return false;
-}
+// ─── QMI CS1 XIP Probe (REMOVED) ────────────────────────────────────────────
+// The old QMI direct-mode CS1 RDID probe (QmiProbeEnterDirect /
+// QmiProbeTransfer / ProbeQspiCs1) has no analog in the QspiVram model:
+// there is no XIP memory-mapped VRAM anymore.  Equivalent per-chip-select
+// RDID auto-detection is built into QspiVramDriver::InitChannel().
 
 /// Probe all external VRAM at boot.  Updates capability flags.
 static void ProbeExternalVram() {
     detectedVramFlags = 0;
 
-    if (ProbePio2Memory()) {
+    if (ProbeQspiChannelA()) {
+        // Reported in the legacy "OPI" wire fields (= Tier 1 PIO2 memory).
         detectedVramFlags |= PGL_VRAM_OPI_DETECTED;
         capabilityResponse.flags |= PGL_CAP_OPI_VRAM;
 
-        // Use mode-aware capacity from gpu_config.h
-        uint32_t pio2Capacity = GpuConfig::Pio2MemCapacity();
-        extendedStatus.opiVramTotalKB = static_cast<uint16_t>(pio2Capacity / 1024);
-        extendedStatus.opiVramFreeKB = extendedStatus.opiVramTotalKB;
-
-        // Report PIO2 mode details
-        const char* modeStr =
-            (GpuConfig::PIO2_MEM_MODE == GpuConfig::Pio2MemMode::OPI_PSRAM)         ? "OPI PSRAM" :
-            (GpuConfig::PIO2_MEM_MODE == GpuConfig::Pio2MemMode::DUAL_QSPI_MRAM)   ? "Dual QSPI MRAM" :
-            (GpuConfig::PIO2_MEM_MODE == GpuConfig::Pio2MemMode::SINGLE_QSPI_MRAM) ? "Single QSPI MRAM" :
-            "unknown";
-        printf("[VRAM] PIO2 mode: %s (%lu KB, random-penalty: %s, non-volatile: %s)\n",
-               modeStr,
-               (unsigned long)(pio2Capacity / 1024),
-               GpuConfig::Pio2IsMram() ? "NO" : "yes",
-               GpuConfig::Pio2IsMram() ? "yes" : "no");
+        // Capacity is per-chip auto-detected (MRAM 128 KB vs PSRAM 8 MB) —
+        // unknown until QspiVramDriver::InitChannel() probes RDID.  Report 0
+        // here; per-frame authoritative values flow via PGL_REG_MEM_TIER_INFO.
+        extendedStatus.opiVramTotalKB = 0;
+        extendedStatus.opiVramFreeKB  = 0;
     }
 
-    if (ProbeQspiCs1()) {
+    if (ProbeQspiChannelB()) {
+        // Reported in the legacy "QSPI" wire fields (= Tier 2).
         detectedVramFlags |= PGL_VRAM_QSPI_DETECTED;
         capabilityResponse.flags |= PGL_CAP_QSPI_VRAM;
 
-        // Use runtime-detected capacity from the chip profile
-        extendedStatus.qspiVramTotalKB = static_cast<uint16_t>(
-            g_qspiChipProfile.capacityBytes / 1024);
-        extendedStatus.qspiVramFreeKB = extendedStatus.qspiVramTotalKB;
+        extendedStatus.qspiVramTotalKB = 0;
+        extendedStatus.qspiVramFreeKB  = 0;
 
-        // Report detected chip type to host (replaces 'reserved' byte)
-        extendedStatus.qspiChipType = static_cast<uint8_t>(g_qspiChipProfile.type);
-
-        printf("[VRAM] QSPI CS1 chip: %s (random-access penalty: %s, non-volatile: %s)\n",
-               g_qspiChipProfile.hasRandomAccessPenalty ? "PSRAM" : "MRAM",
-               g_qspiChipProfile.hasRandomAccessPenalty ? "yes" : "NO",
-               g_qspiChipProfile.isNonVolatile ? "yes" : "no");
+        // Chip type per chip-select is auto-detected by the driver at init.
+        extendedStatus.qspiChipType = PGL_QSPI_CHIP_NONE;
     }
 
     extendedStatus.vramTierFlags = detectedVramFlags;
-    printf("[VRAM] Tier flags: 0x%02X (OPI=%s, QSPI=%s)\n",
+    printf("[VRAM] Tier flags: 0x%02X (QSPI-A=%s, QSPI-B=%s)\n",
            detectedVramFlags,
            (detectedVramFlags & PGL_VRAM_OPI_DETECTED)  ? "yes" : "no",
            (detectedVramFlags & PGL_VRAM_QSPI_DETECTED) ? "yes" : "no");
@@ -509,7 +299,7 @@ static void ProcessRegisterWrite() {
             // Host writes 2-byte LE threshold value
             if (g_sceneState && writeLen >= 2) {
                 uint16_t val;
-                memcpy(&val, writeBuffer, sizeof(uint16_t));
+                memcpy(&val, (const void*)writeBuffer, sizeof(uint16_t));
                 g_sceneState->dmaFillThreshold = val;
             }
             break;
@@ -785,9 +575,9 @@ bool I2CSlave::Initialize() {
     BuildCapabilityResponse();
 
     // Probe external VRAM regardless of I2C availability.
-    // The QMI/PIO2 probes use hardware SPI, not I2C, so they work even when
-    // I2C pins are disabled.  This enables correct VRAM detection in
-    // VRAMless mode (Pico 2 with no I2C host but with PSRAM/MRAM attached).
+    // The probe only reads compile-time QspiVram channel configuration (no
+    // bus traffic — RDID happens later in QspiVramDriver::InitChannel()), so
+    // it works even when I2C pins are disabled.
     ProbeExternalVram();
 
     // ── Skip I2C bus init when pins are disabled (0xFF) ──

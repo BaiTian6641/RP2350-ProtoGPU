@@ -59,7 +59,7 @@ public:
 
     uint16_t GetWidth() const override { return HUD_WIDTH; }
     uint16_t GetHeight() const override { return HUD_HEIGHT; }
-    uint8_t GetPixelFormat() const override { return PGL_DISPLAY_FMT_MONO1; }
+    uint8_t GetPixelFormat() const override { return PGL_PIXFMT_MONO1; }
 
     DisplayTimingInfo GetTimingInfo() const override;
     void GetCaps(PglDisplayCaps& caps) const override;

@@ -337,9 +337,9 @@ void I2cHudDriver::GetCaps(PglDisplayCaps& caps) const {
     caps.displayType   = PGL_DISPLAY_I2C_HUD;
     caps.width         = HUD_WIDTH;
     caps.height        = HUD_HEIGHT;
-    caps.pixelFormat   = PGL_DISPLAY_FMT_MONO1;
+    caps.pixelFormat   = PGL_PIXFMT_MONO1;
     caps.maxBrightness = 255;
-    caps.flags         = PGL_DISPLAY_FLAG_PARTIAL_UPDATE;
+    caps.flags         = PGL_DISP_FLAG_HUD_AUTO;  // supports the auto status overlay
     caps.refreshHz     = static_cast<uint16_t>(measuredHz_);
     caps.framebufKB    = static_cast<uint16_t>((HUD_BUFSIZE + 1023) / 1024);  // 1 KB
     caps.pioUsage      = 0;  // No PIO — pure I2C

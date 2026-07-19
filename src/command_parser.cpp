@@ -12,8 +12,7 @@
 #include "command_parser.h"
 #include "scene_state.h"
 #include "gpu_config.h"
-#include "memory/mem_opi_psram.h"
-#include "memory/mem_qspi_psram.h"
+#include "memory/mem_qspi_vram.h"
 #include "memory/mem_tier.h"
 #include "memory/mem_pool.h"
 #include "memory/flash_persist.h"
@@ -32,8 +31,12 @@
 
 // ─── Memory Subsystem State (set via InitMemory) ────────────────────────────
 
-static OpiPsramDriver*  s_opi   = nullptr;
-static QspiPsramDriver* s_qspi  = nullptr;
+// Unified QSPI VRAM driver handles.  Both aliases name QspiVramDriver — in
+// the current memory model ONE dual-channel driver serves both external
+// tiers: s_opi addresses QspiChannel::A (Tier 1), s_qspi addresses
+// QspiChannel::B (Tier 2).  GpuCore passes the same instance for both.
+static OpiPsramDriver*  s_opi   = nullptr;   // QspiVramDriver — Channel A
+static QspiPsramDriver* s_qspi  = nullptr;   // QspiVramDriver — Channel B
 static MemTierManager*  s_tier  = nullptr;
 
 static const uint16_t*  s_frontBuffer = nullptr;
@@ -926,8 +929,10 @@ static void HandleSetShaderUniform(const uint8_t*& ptr, uint16_t payloadLen,
 }
 
 // ─── Memory Access Handlers (0x30 – 0x3F) ──────────────────────────────────
-// Route memory commands to the appropriate tier driver (OPI PSRAM, QSPI, or
-// SRAM).  These were formerly M8 stubs — now fully implemented.
+// Route memory commands to the appropriate tier of the unified QspiVramDriver
+// (QSPI Channel A, QSPI Channel B, or SRAM).  The wire protocol's legacy tier
+// names map to channels: PGL_TIER_OPI_PSRAM → QspiChannel::A,
+// PGL_TIER_QSPI_PSRAM → QspiChannel::B.
 
 /// Helper: read bytes from a given tier into a buffer.
 static bool TierReadInto(uint8_t tier, uint32_t address, void* dst,
@@ -940,15 +945,14 @@ static bool TierReadInto(uint8_t tier, uint32_t address, void* dst,
             return false;  // Handled at call site
 
         case PGL_TIER_OPI_PSRAM:
-            if (s_opi && s_opi->IsInitialized()) {
-                return s_opi->ReadSync(address, dst, size);
+            if (s_opi && s_opi->IsChannelInitialized(QspiChannel::A)) {
+                return s_opi->ReadSync(QspiChannel::A, address, dst, size);
             }
             return false;
 
         case PGL_TIER_QSPI_PSRAM:
-            if (s_qspi && s_qspi->IsInitialized()) {
-                s_qspi->Read(address, dst, size);
-                return true;
+            if (s_qspi && s_qspi->IsChannelInitialized(QspiChannel::B)) {
+                return s_qspi->ReadSync(QspiChannel::B, address, dst, size);
             }
             return false;
 
@@ -965,15 +969,14 @@ static bool TierWriteTo(uint8_t tier, uint32_t address, const void* src,
             return false;  // Caller must handle SRAM writes directly
 
         case PGL_TIER_OPI_PSRAM:
-            if (s_opi && s_opi->IsInitialized()) {
-                return s_opi->WriteSync(address, src, size);
+            if (s_opi && s_opi->IsChannelInitialized(QspiChannel::A)) {
+                return s_opi->WriteSync(QspiChannel::A, address, src, size);
             }
             return false;
 
         case PGL_TIER_QSPI_PSRAM:
-            if (s_qspi && s_qspi->IsInitialized()) {
-                s_qspi->Write(address, src, size);
-                return true;
+            if (s_qspi && s_qspi->IsChannelInitialized(QspiChannel::B)) {
+                return s_qspi->WriteSync(QspiChannel::B, address, src, size);
             }
             return false;
 
@@ -1003,20 +1006,22 @@ static void HandleMemWrite(const uint8_t*& ptr, uint16_t payloadLen,
             break;
         }
         case PGL_TIER_OPI_PSRAM:
-            if (s_opi && s_opi->IsInitialized()) {
-                if (!s_opi->WriteSync(hdr.address, dataPtr, hdr.size)) {
-                    printf("[Parser] MemWrite: OPI WriteSync failed\n");
+            if (s_opi && s_opi->IsChannelInitialized(QspiChannel::A)) {
+                if (!s_opi->WriteSync(QspiChannel::A, hdr.address, dataPtr, hdr.size)) {
+                    printf("[Parser] MemWrite: QSPI-A WriteSync failed\n");
                 }
             } else {
-                printf("[Parser] MemWrite: OPI tier not available\n");
+                printf("[Parser] MemWrite: QSPI-A tier not available\n");
             }
             break;
 
         case PGL_TIER_QSPI_PSRAM:
-            if (s_qspi && s_qspi->IsInitialized()) {
-                s_qspi->Write(hdr.address, dataPtr, hdr.size);
+            if (s_qspi && s_qspi->IsChannelInitialized(QspiChannel::B)) {
+                if (!s_qspi->WriteSync(QspiChannel::B, hdr.address, dataPtr, hdr.size)) {
+                    printf("[Parser] MemWrite: QSPI-B WriteSync failed\n");
+                }
             } else {
-                printf("[Parser] MemWrite: QSPI tier not available\n");
+                printf("[Parser] MemWrite: QSPI-B tier not available\n");
             }
             break;
 
@@ -1050,15 +1055,16 @@ static void HandleMemReadRequest(const uint8_t*& ptr, SceneState* scene) {
             break;
 
         case PGL_TIER_OPI_PSRAM:
-            if (s_opi && s_opi->IsInitialized()) {
-                ok = s_opi->ReadSync(cmd.address, scene->memStagingBuffer, stageLen);
+            if (s_opi && s_opi->IsChannelInitialized(QspiChannel::A)) {
+                ok = s_opi->ReadSync(QspiChannel::A, cmd.address,
+                                     scene->memStagingBuffer, stageLen);
             }
             break;
 
         case PGL_TIER_QSPI_PSRAM:
-            if (s_qspi && s_qspi->IsInitialized()) {
-                s_qspi->Read(cmd.address, scene->memStagingBuffer, stageLen);
-                ok = true;
+            if (s_qspi && s_qspi->IsChannelInitialized(QspiChannel::B)) {
+                ok = s_qspi->ReadSync(QspiChannel::B, cmd.address,
+                                      scene->memStagingBuffer, stageLen);
             }
             break;
 
@@ -1111,9 +1117,9 @@ static void HandleMemSetResourceTier(const uint8_t*& ptr, SceneState* scene) {
         if (cmd.preferredTier != PGL_TIER_AUTO) {
             MemTier targetTier;
             switch (cmd.preferredTier) {
-                case PGL_TIER_SRAM:       targetTier = MemTier::SRAM;      break;
-                case PGL_TIER_OPI_PSRAM:  targetTier = MemTier::OPI_PSRAM; break;
-                case PGL_TIER_QSPI_PSRAM: targetTier = MemTier::QSPI_XIP;  break;
+                case PGL_TIER_SRAM:       targetTier = MemTier::SRAM;   break;
+                case PGL_TIER_OPI_PSRAM:  targetTier = MemTier::QSPI_A; break;
+                case PGL_TIER_QSPI_PSRAM: targetTier = MemTier::QSPI_B; break;
                 default:                  targetTier = MemTier::SRAM;      break;
             }
 
@@ -1174,15 +1180,15 @@ static void HandleMemAlloc(const uint8_t*& ptr, SceneState* scene) {
             return;
 
         case PGL_TIER_OPI_PSRAM:
-            if (s_opi && s_opi->IsInitialized()) {
-                allocAddr = s_opi->Alloc(cmd.size, 4);
+            if (s_opi && s_opi->IsChannelInitialized(QspiChannel::A)) {
+                allocAddr = s_opi->Alloc(QspiChannel::A, cmd.size, 4);
                 ok = (allocAddr != 0xFFFFFFFF);
             }
             break;
 
         case PGL_TIER_QSPI_PSRAM:
-            if (s_qspi && s_qspi->IsInitialized()) {
-                allocAddr = s_qspi->Alloc(cmd.size, 4);
+            if (s_qspi && s_qspi->IsChannelInitialized(QspiChannel::B)) {
+                allocAddr = s_qspi->Alloc(QspiChannel::B, cmd.size, 4);
                 ok = (allocAddr != 0xFFFFFFFF);
             }
             break;
@@ -1194,9 +1200,11 @@ static void HandleMemAlloc(const uint8_t*& ptr, SceneState* scene) {
     if (!ok) {
         // Check if tier is disabled vs out-of-memory
         bool tierEnabled = false;
-        if (cmd.tier == PGL_TIER_OPI_PSRAM && s_opi && s_opi->IsInitialized())
+        if (cmd.tier == PGL_TIER_OPI_PSRAM && s_opi &&
+            s_opi->IsChannelInitialized(QspiChannel::A))
             tierEnabled = true;
-        if (cmd.tier == PGL_TIER_QSPI_PSRAM && s_qspi && s_qspi->IsInitialized())
+        if (cmd.tier == PGL_TIER_QSPI_PSRAM && s_qspi &&
+            s_qspi->IsChannelInitialized(QspiChannel::B))
             tierEnabled = true;
 
         scene->lastAllocResult.handle  = PGL_INVALID_MEM_HANDLE;

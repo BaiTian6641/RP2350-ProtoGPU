@@ -20,7 +20,7 @@ option(RP2350GPU_HEADLESS_SELFTEST
     "Build headless self-test mode (SSD1331 OLED triangle demo)" OFF)
 
 # ─── ProtoGL shared headers (wire-format types, parser, CRC) ────────────────
-set(PROTOGL_SHARED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../src")
+set(PROTOGL_SHARED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ProtoGL/src")
 
 # ─── Source files ────────────────────────────────────────────────────────────
 add_executable(protogl_gpu
@@ -33,6 +33,7 @@ add_executable(protogl_gpu
     src/transport/i2c_slave.cpp
     src/math/pgl_math.cpp
     src/render/rasterizer.cpp
+    src/render/rasterizer_2d.cpp
     src/render/quadtree.cpp
     src/render/triangle2d.cpp
     src/render/screenspace_effects.cpp

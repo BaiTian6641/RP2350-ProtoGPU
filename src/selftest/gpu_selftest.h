@@ -20,8 +20,9 @@
 #include <cstdint>
 
 // Forward declarations
-class OpiPsramDriver;
-class QspiPsramDriver;
+class QspiVramDriver;
+using OpiPsramDriver  = QspiVramDriver;  // legacy alias (mem_qspi_vram.h)
+using QspiPsramDriver = QspiVramDriver;  // legacy alias (mem_qspi_vram.h)
 
 namespace GpuSelfTest {
 

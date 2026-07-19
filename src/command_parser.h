@@ -15,8 +15,9 @@
 
 // Forward declarations
 struct SceneState;
-class OpiPsramDriver;
-class QspiPsramDriver;
+class QspiVramDriver;
+using OpiPsramDriver  = QspiVramDriver;  // legacy alias (mem_qspi_vram.h)
+using QspiPsramDriver = QspiVramDriver;  // legacy alias (mem_qspi_vram.h)
 class MemTierManager;
 class MemPoolManager;
 class DisplayManager;
@@ -39,8 +40,10 @@ enum class ParseResult : uint8_t {
  * Must be called after memory drivers are initialized, before any frames
  * containing memory commands (0x30–0x3F) are parsed.
  *
- * @param opi    PIO2 external memory driver (may be nullptr if not present).
- * @param qspi   QMI CS1 driver (may be nullptr if not present).
+ * @param opi    Unified QSPI VRAM driver — used for Channel A (Tier 1)
+ *               access (may be nullptr if no external VRAM present).
+ * @param qspi   Same unified driver — used for Channel B (Tier 2) access.
+ *               GpuCore passes one QspiVramDriver instance for both.
  * @param tier   Tiered memory manager.
  * @param frontBuf  Pointer to the front (display) framebuffer.
  * @param backBuf   Pointer to the back (render) framebuffer.
