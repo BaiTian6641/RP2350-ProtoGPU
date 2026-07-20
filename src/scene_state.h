@@ -4,15 +4,17 @@
  *
  * Holds all persistent resources (meshes, materials, textures, layouts) and
  * per-frame state (draw list, cameras, 2D layers, 2D draw commands).
- * Large data lives in typed bump pools so that slot metadata stays small
- * (~40 B per mesh slot) and we stay well within the RP2350's 520 KB SRAM budget.
+ * Large data lives in the **scene heap** (ProtoGC `HeapAllocator`, true
+ * random free — resolves the old bump-pool TODO(M5) at the bottom of this
+ * file's history) so that slot metadata stays small (~40 B per mesh slot)
+ * and arbitrary create/destroy order no longer fragments.
  *
  * Memory layout (approximate):
- *   Pools (persistent):   ~130 KB
- *   Pool (per-frame):      ~24 KB
+ *   Scene heap cap:       ~112 KB (was 106 KB of static pools + overhead)
+ *   Pool (per-frame):      ~24 KB (static bump — hot path, stays static)
  *   Slot arrays:            ~40 KB
  *   2D layer FBs:           ~16 KB per layer (128×64 RGB565)
- *   Total scene state:    ~210 KB (with 1 active 2D layer)
+ *   Total scene state:    ~192 KB (with 1 active 2D layer)
  *
  * Framebuffers, Z-buffer, QuadTree, code, and stack use the rest of SRAM.
  *
@@ -28,11 +30,14 @@
 
 #include <PglTypes.h>
 #include <PglShaderBytecode.h>
+#include <HeapAllocator.h>
 #include "gpu_config.h"
 
 // ─── Typed Bump Pool ────────────────────────────────────────────────────────
-// A simple arena allocator.  Persistent pools survive across frames; the
-// per-frame pool is reset at BeginFrame().
+// A simple arena allocator. Only the PER-FRAME pool remains a bump pool (by
+// design: it resets wholesale every BeginFrame, so random free is pointless).
+// Persistent resource data moved to the ProtoGC scene heap (2026-07-19) —
+// the old TODO(M5) "true random free" is resolved there.
 
 template <typename T, uint32_t Capacity>
 struct Pool {
@@ -47,8 +52,8 @@ struct Pool {
         return ptr;
     }
 
-    /// Free everything from `ptr` onward (stack-style).
-    /// For true random free, a free-list allocator is needed — TODO(M5).
+    /// Free everything from `ptr` onward (stack-style — fine for the
+    /// per-frame pool, which only ever shrinks/reset wholesale).
     void FreeFrom(T* ptr) {
         if (!ptr) return;
         uint32_t offset = static_cast<uint32_t>(ptr - data);
@@ -75,10 +80,10 @@ struct MeshSlot {
     uint16_t  triangleCount = 0;
     uint16_t  uvVertexCount = 0;
 
-    PglVec3*   vertices  = nullptr;  // → SceneState::vertexPool
-    PglIndex3* indices   = nullptr;  // → SceneState::indexPool
-    PglVec2*   uvVertices = nullptr; // → SceneState::uvVertexPool
-    PglIndex3* uvIndices  = nullptr; // → SceneState::uvIndexPool
+    PglVec3*   vertices  = nullptr;  // → SceneState::sceneHeap
+    PglIndex3* indices   = nullptr;  // → SceneState::sceneHeap
+    PglVec2*   uvVertices = nullptr; // → SceneState::sceneHeap
+    PglIndex3* uvIndices  = nullptr; // → SceneState::sceneHeap
 
     // Cached object-space AABB — computed on mesh creation/update.
     // Used for fast mesh-level frustum culling before per-triangle work.
@@ -117,7 +122,7 @@ struct TextureSlot {
     uint16_t         height        = 0;
     PglTextureFormat format        = PGL_TEX_RGB565;
     uint32_t         pixelDataSize = 0;
-    uint8_t*         pixels        = nullptr;  // → SceneState::texturePool
+    uint8_t*         pixels        = nullptr;  // → SceneState::sceneHeap
 };
 
 struct PixelLayoutSlot {
@@ -126,7 +131,7 @@ struct PixelLayoutSlot {
     uint8_t  flags      = 0;
 
     PglRectLayoutData rectData = {};          // used if RECTANGULAR flag set
-    PglVec2*          coords   = nullptr;     // → SceneState::layoutCoordPool
+    PglVec2*          coords   = nullptr;     // → SceneState::sceneHeap
 };
 
 struct ShaderSlot {
@@ -286,13 +291,14 @@ struct SceneState {
     uint32_t frameNumber = 0;
     uint32_t frameTimeUs = 0;
 
-    // ── Persistent memory pools ─────────────────────────────────────────────
-    Pool<PglVec3,   GpuConfig::VERTEX_POOL_SIZE>       vertexPool;
-    Pool<PglIndex3, GpuConfig::INDEX_POOL_SIZE>        indexPool;
-    Pool<PglVec2,   GpuConfig::UV_VERTEX_POOL_SIZE>    uvVertexPool;
-    Pool<PglIndex3, GpuConfig::UV_INDEX_POOL_SIZE>     uvIndexPool;
-    Pool<uint8_t,   GpuConfig::TEXTURE_POOL_SIZE>      texturePool;
-    Pool<PglVec2,   GpuConfig::LAYOUT_COORD_POOL_SIZE> layoutCoordPool;
+    // ── Persistent memory: scene heap (ProtoGC) ─────────────────────────────
+    // One capped HeapAllocator backs all persistent resource data (mesh
+    // vertex/index/UV, texture pixels, layout coords). True random free with
+    // immediate coalescing replaces the old stack-only bump pools; the cap
+    // preserves the deterministic budget the static pools guaranteed.
+    // NOT thread-shared: only Core 0 allocates (parser/Reset); Core 1 reads
+    // pointers during tile passes (non-moving heap — stable).
+    protogc::HeapAllocator sceneHeap;
 
     // ── Per-frame pool (reset every BeginFrame) ─────────────────────────────
     Pool<PglVec3,   GpuConfig::FRAME_VERTEX_POOL_SIZE> frameVertexPool;
@@ -310,8 +316,24 @@ struct SceneState {
 
     // ── Lifecycle ───────────────────────────────────────────────────────────
 
-    /// Full reset — zeroes everything, resets all pools.
+    /// Full reset — frees all scene-heap allocations (true random free),
+    /// zeroes everything, resets the per-frame pool.
     void Reset() {
+        // Free persistent resource data FIRST (slot pointers are needed for
+        // the heap frees; the memsets below would orphan them).
+        for (uint16_t i = 0; i < PGL_MAX_MESHES; ++i) {
+            if (meshes[i].vertices)   (void)sceneHeap.deallocate(meshes[i].vertices);
+            if (meshes[i].indices)    (void)sceneHeap.deallocate(meshes[i].indices);
+            if (meshes[i].uvVertices) (void)sceneHeap.deallocate(meshes[i].uvVertices);
+            if (meshes[i].uvIndices)  (void)sceneHeap.deallocate(meshes[i].uvIndices);
+        }
+        for (uint16_t i = 0; i < PGL_MAX_TEXTURES; ++i) {
+            if (textures[i].pixels) (void)sceneHeap.deallocate(textures[i].pixels);
+        }
+        for (uint16_t i = 0; i < PGL_MAX_LAYOUTS; ++i) {
+            if (pixelLayouts[i].coords) (void)sceneHeap.deallocate(pixelLayouts[i].coords);
+        }
+
         std::memset(meshes,       0, sizeof(meshes));
         std::memset(materials,    0, sizeof(materials));
         std::memset(textures,     0, sizeof(textures));
@@ -343,12 +365,6 @@ struct SceneState {
         dirtyStats       = {};
         dmaFillThreshold = 64;
 
-        vertexPool.Reset();
-        indexPool.Reset();
-        uvVertexPool.Reset();
-        uvIndexPool.Reset();
-        texturePool.Reset();
-        layoutCoordPool.Reset();
         frameVertexPool.Reset();
 
         // Reset memory access state
@@ -373,14 +389,39 @@ struct SceneState {
         }
     }
 
-    // ── Pool allocation helpers (called by command_parser) ──────────────────
+    // ── Scene heap lifecycle ────────────────────────────────────────────────
 
-    PglVec3*   AllocVertices(uint16_t count)        { return vertexPool.Allocate(count); }
-    PglIndex3* AllocIndices(uint16_t count)         { return indexPool.Allocate(count); }
-    PglVec2*   AllocUVVertices(uint16_t count)      { return uvVertexPool.Allocate(count); }
-    PglIndex3* AllocUVIndices(uint16_t count)       { return uvIndexPool.Allocate(count); }
-    uint8_t*   AllocTexturePixels(uint32_t bytes)   { return texturePool.Allocate(bytes); }
-    PglVec2*   AllocLayoutCoords(uint16_t count)    { return layoutCoordPool.Allocate(count); }
+    /// One-time scene heap init — call from GpuCore::Initialize() BEFORE the
+    /// first Reset()/allocation. pgc_init() is idempotent by contract.
+    void InitSceneHeap() {
+        pgc_init();
+        sceneHeap.begin(GpuConfig::SCENE_HEAP_SEGMENT_BYTES,
+                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT,
+                        protogc::HeapAllocator::defaultInternalForbiddenCaps(),
+                        GpuConfig::SCENE_HEAP_MAX_BYTES);
+    }
+
+    // ── Pool allocation helpers (called by command_parser) ──────────────────
+    // All persistent resource data comes from the capped scene heap. Growth:
+    // allocate → createSegment → linkSegment → retry (Core-0-only callers,
+    // so no locking is needed around the two-phase pattern).
+
+    void* SceneHeapAlloc(size_t bytes) {
+        if (void* p = sceneHeap.allocate(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)) {
+            return p;
+        }
+        auto* seg = sceneHeap.createSegment(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!seg) return nullptr;  // platform heap OOM or scene cap reached
+        sceneHeap.linkSegment(seg);
+        return sceneHeap.allocate(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+
+    PglVec3*   AllocVertices(uint16_t count)        { return static_cast<PglVec3*>(SceneHeapAlloc(count * sizeof(PglVec3))); }
+    PglIndex3* AllocIndices(uint16_t count)         { return static_cast<PglIndex3*>(SceneHeapAlloc(count * sizeof(PglIndex3))); }
+    PglVec2*   AllocUVVertices(uint16_t count)      { return static_cast<PglVec2*>(SceneHeapAlloc(count * sizeof(PglVec2))); }
+    PglIndex3* AllocUVIndices(uint16_t count)       { return static_cast<PglIndex3*>(SceneHeapAlloc(count * sizeof(PglIndex3))); }
+    uint8_t*   AllocTexturePixels(uint32_t bytes)   { return static_cast<uint8_t*>(SceneHeapAlloc(bytes)); }
+    PglVec2*   AllocLayoutCoords(uint16_t count)    { return static_cast<PglVec2*>(SceneHeapAlloc(count * sizeof(PglVec2))); }
     PglVec3*   AllocFrameVertices(uint16_t count)   { return frameVertexPool.Allocate(count); }
 
     // ── 2D Layer Helpers ────────────────────────────────────────────────────
@@ -412,26 +453,25 @@ struct SceneState {
         if (l.pixels) { free(l.pixels); l.pixels = nullptr; }
     }
 
-    // ── Pool deallocation helpers (simple stack-style) ──────────────────────
+    // ── Pool deallocation helpers (true random free via the scene heap) ─────
 
-    void FreeVertices(PglVec3* p)        { vertexPool.FreeFrom(p); }
-    void FreeIndices(PglIndex3* p)       { indexPool.FreeFrom(p); }
-    void FreeUVVertices(PglVec2* p)      { uvVertexPool.FreeFrom(p); }
-    void FreeUVIndices(PglIndex3* p)     { uvIndexPool.FreeFrom(p); }
-    void FreeTexturePixels(uint8_t* p)   { texturePool.FreeFrom(p); }
-    void FreeLayoutCoords(PglVec2* p)    { layoutCoordPool.FreeFrom(p); }
+    void FreeVertices(PglVec3* p)        { if (p) (void)sceneHeap.deallocate(p); }
+    void FreeIndices(PglIndex3* p)       { if (p) (void)sceneHeap.deallocate(p); }
+    void FreeUVVertices(PglVec2* p)      { if (p) (void)sceneHeap.deallocate(p); }
+    void FreeUVIndices(PglIndex3* p)     { if (p) (void)sceneHeap.deallocate(p); }
+    void FreeTexturePixels(uint8_t* p)   { if (p) (void)sceneHeap.deallocate(p); }
+    void FreeLayoutCoords(PglVec2* p)    { if (p) (void)sceneHeap.deallocate(p); }
 
     // ── Diagnostics ─────────────────────────────────────────────────────────
 
     void PrintPoolUsage() const {
-        printf("[Scene] Pools: vtx %u/%u  idx %u/%u  uvVtx %u/%u  uvIdx %u/%u  "
-               "tex %u/%u  layout %u/%u  frameVtx %u/%u\n",
-               vertexPool.used,      GpuConfig::VERTEX_POOL_SIZE,
-               indexPool.used,        GpuConfig::INDEX_POOL_SIZE,
-               uvVertexPool.used,     GpuConfig::UV_VERTEX_POOL_SIZE,
-               uvIndexPool.used,      GpuConfig::UV_INDEX_POOL_SIZE,
-               texturePool.used,      GpuConfig::TEXTURE_POOL_SIZE,
-               layoutCoordPool.used,  GpuConfig::LAYOUT_COORD_POOL_SIZE,
-               frameVertexPool.used,  GpuConfig::FRAME_VERTEX_POOL_SIZE);
+        const auto hs = sceneHeap.stats();
+        printf("[Scene] Heap: used %u/%u KB (segments %u KB, largest free %u B); "
+               "frameVtx %u/%u\n",
+               static_cast<unsigned>(hs.usedBytes / 1024),
+               static_cast<unsigned>(GpuConfig::SCENE_HEAP_MAX_BYTES / 1024),
+               static_cast<unsigned>(hs.segmentBytes / 1024),
+               static_cast<unsigned>(hs.largestFreeBlock),
+               frameVertexPool.used, GpuConfig::FRAME_VERTEX_POOL_SIZE);
     }
 };

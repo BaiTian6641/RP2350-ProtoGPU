@@ -380,6 +380,7 @@ bool GpuCore::Initialize() {
 
     // ── Common: Scene state ─────────────────────────────────────────────
 
+    sceneState.InitSceneHeap();   // ProtoGC platform + capped scene heap (once)
     sceneState.Reset();
 #ifndef RP2350GPU_HEADLESS_SELFTEST
     I2CSlave::SetSceneState(&sceneState);

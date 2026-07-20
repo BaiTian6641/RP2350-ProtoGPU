@@ -593,7 +593,7 @@ static void HandleDestroyMesh(const uint8_t*& ptr, SceneState* scene) {
     if (!ValidateMeshHandle(scene, cmd.meshId)) return;
 
     MeshSlot& mesh = scene->meshes[PglHandleIndex(cmd.meshId)];
-    // Free pool allocations (stack-style, best-effort)
+    // Free scene-heap allocations (true random free — order no longer matters)
     scene->FreeUVIndices(mesh.uvIndices);
     scene->FreeUVVertices(mesh.uvVertices);
     scene->FreeIndices(mesh.indices);

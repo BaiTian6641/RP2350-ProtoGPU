@@ -92,17 +92,24 @@ static constexpr uint8_t  MAX_DRAW_CALLS = 64;
 
 // ─── Memory Pools (shared across all resource slots) ────────────────────────
 // The RP2350 has only 520 KB SRAM; embedded per-slot arrays are infeasible.
-// Instead, large data (vertices, indices, pixels, layout coords) are allocated
-// from typed bump pools.  This keeps slot metadata small (~40 B) while
-// supporting the full protocol resource-ID range.
+// Instead, large data (vertices, indices, pixels, layout coords) is allocated
+// from the scene heap (ProtoGC HeapAllocator — see scene_state.h).  The sizes
+// below remain as PER-RESOURCE limits (mesh/texture validation) and for the
+// capability response; the old static bump pools are gone (protocol v8 era).
 
-static constexpr uint32_t VERTEX_POOL_SIZE       = 2048;   // PglVec3  — 24 KB
-static constexpr uint32_t INDEX_POOL_SIZE        = 2048;   // PglIndex3 — 12 KB
-static constexpr uint32_t UV_VERTEX_POOL_SIZE    = 2048;   // PglVec2  — 16 KB
-static constexpr uint32_t UV_INDEX_POOL_SIZE     = 1024;   // PglIndex3 — 6 KB
-static constexpr uint32_t TEXTURE_POOL_SIZE      = 32768;  // bytes   — 32 KB
-static constexpr uint32_t LAYOUT_COORD_POOL_SIZE = 2048;   // PglVec2  — 16 KB
-static constexpr uint32_t FRAME_VERTEX_POOL_SIZE = 2048;   // PglVec3  — 24 KB (per-frame)
+static constexpr uint32_t VERTEX_POOL_SIZE       = 2048;   // PglVec3  — max vertices per mesh
+static constexpr uint32_t INDEX_POOL_SIZE        = 2048;   // PglIndex3 — max triangles per mesh
+static constexpr uint32_t UV_VERTEX_POOL_SIZE    = 2048;   // PglVec2  — max UV vertices per mesh
+static constexpr uint32_t UV_INDEX_POOL_SIZE     = 1024;   // PglIndex3 — max UV triangles per mesh
+static constexpr uint32_t TEXTURE_POOL_SIZE      = 32768;  // bytes   — max texture pixel bytes
+static constexpr uint32_t LAYOUT_COORD_POOL_SIZE = 2048;   // PglVec2  — max layout coords
+static constexpr uint32_t FRAME_VERTEX_POOL_SIZE = 2048;   // PglVec3  — 24 KB (per-frame, static bump)
+
+// ─── Scene heap (ProtoGC HeapAllocator backing persistent resource data) ────
+// One capped heap replaces the six static bump pools (106 KB payload).  The
+// cap preserves the deterministic budget; 8 KB segments bound waste.
+static constexpr uint32_t SCENE_HEAP_SEGMENT_BYTES = 8 * 1024;    // growth granularity
+static constexpr uint32_t SCENE_HEAP_MAX_BYTES     = 112 * 1024;  // hard cap (106 KB + ~6% overhead)
 
 // ─── QuadTree ───────────────────────────────────────────────────────────────
 

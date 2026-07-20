@@ -22,6 +22,9 @@ option(RP2350GPU_HEADLESS_SELFTEST
 # ─── ProtoGL shared headers (wire-format types, parser, CRC) ────────────────
 set(PROTOGL_SHARED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ProtoGL/src")
 
+# ─── ProtoGC shared memory library (scene heap allocator + pico backend) ────
+set(PROTOGC_SHARED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ProtoGC/src")
+
 # ─── Source files ────────────────────────────────────────────────────────────
 add_executable(protogl_gpu
     src/main.cpp
@@ -48,11 +51,15 @@ add_executable(protogl_gpu
     src/selftest/gpu_selftest.cpp
     src/selftest/ssd1331_driver.cpp
     src/selftest/headless_selftest.cpp
+
+    # ProtoGC platform backend (scene heap allocator is header-only)
+    ${PROTOGC_SHARED_DIR}/pgc_pico.cpp
 )
 
 target_include_directories(protogl_gpu PRIVATE
     src
     ${PROTOGL_SHARED_DIR}
+    ${PROTOGC_SHARED_DIR}
 )
 
 # ─── Pico SDK libraries ─────────────────────────────────────────────────────
