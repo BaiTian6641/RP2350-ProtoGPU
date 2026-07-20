@@ -39,8 +39,14 @@ echo "  compiler: $CXX"
 # format specifiers, set-but-unused vars, unused parameters) are suppressed
 # LOCALLY here — the firmware sources themselves are intentionally not patched
 # for them.
+#
+# Optimization level is PINNED to -O1: the golden reference frames
+# (sim/golden/, A5-2) are only meaningful if the floating-point codegen is
+# stable.  Goldens are pinned to native g++ x86-64, -O1, little-endian; use
+# run_golden.sh's bounded-diff overrides if another toolchain's float results
+# drift within tolerance.
 set -e
-"$CXX" -std=gnu++17 -Wall -Wextra -O2 -g \
+"$CXX" -std=gnu++17 -Wall -Wextra -O1 -g \
     -Wno-class-memaccess -Wno-format -Wno-unused-but-set-variable \
     -Wno-unused-parameter \
     -DPGC_BACKEND_DESKTOP -DPROTOGC_OVERRIDE_NEW=0 \
