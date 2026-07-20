@@ -19,6 +19,7 @@
 #include "i2c_slave.h"
 #include "../gpu_config.h"
 #include "../scene_state.h"
+#include "../command_parser.h"
 #include "../display/display_manager.h"
 #include "../memory/mem_pool.h"
 
@@ -80,14 +81,16 @@ static volatile uint8_t  currentRegister = 0;     // register address from first
 static volatile bool     registerAddressed = false; // true after first byte of write
 static volatile uint8_t  writeBuffer[32];           // accumulates write data
 static volatile uint8_t  writeLen = 0;
-static volatile uint8_t  readBuffer[32];            // response data for reads
+// Response staging for reads.  Must hold the largest register response:
+// PglExtendedStatusResponse (40 bytes, protocol v8).
+static volatile uint8_t  readBuffer[48];
 static volatile uint8_t  readLen = 0;
 static volatile uint8_t  readIdx = 0;               // current read position
 
 // ─── Capability Initialization ──────────────────────────────────────────────
 
 static void BuildCapabilityResponse() {
-    capabilityResponse.protoVersion = 5;  // ProtoGL v0.5
+    capabilityResponse.protoVersion = PGL_PROTOCOL_VERSION;  // v8
     capabilityResponse.gpuArch     = PGL_ARCH_ARM_CM33;
     capabilityResponse.coreCount   = 2;
     capabilityResponse.coreFreqMHz = static_cast<uint8_t>(clock_get_hz(clk_sys) / 1000000);
@@ -104,6 +107,13 @@ static void BuildCapabilityResponse() {
 
     // VRAM detection flags are set after PSRAM probe (see ProbeExternalVram())
     capabilityResponse.flags = flags;
+
+    // v8 extension: logical capability bits 8–23 (PGL_CAP_* u32 space >> 8).
+    // The PSB shader VM exists; HANDLE_GEN and ERROR_BITMASK land with v8.
+    // V9/V10 planned bits stay 0.
+    capabilityResponse.flags16 = static_cast<uint16_t>(
+        (PGL_CAP_SHADER_VM | PGL_CAP_HANDLE_GEN | PGL_CAP_ERROR_BITMASK) >> 8);
+    capabilityResponse.reserved0 = 0;
 }
 
 // ─── VRAM Detection ─────────────────────────────────────────────────────────
@@ -357,6 +367,10 @@ static void PrepareRegisterRead() {
             break;
 
         case PGL_REG_EXTENDED_STATUS:
+            // v8: refresh the parser error accounting at read time so the
+            // host always sees current values (bytes 36–39).
+            extendedStatus.parserErrorCount = CommandParser::GetParserErrorCount();
+            extendedStatus.parserErrorMask  = CommandParser::GetParserErrorMask();
             memcpy((void*)readBuffer, (const void*)&extendedStatus,
                    sizeof(extendedStatus));
             readLen = sizeof(extendedStatus);
@@ -689,6 +703,10 @@ void I2CSlave::UpdateVramStatus(uint16_t opiTotalKB, uint16_t opiFreeKB,
     extendedStatus.qspiVramTotalKB = qspiTotalKB;
     extendedStatus.qspiVramFreeKB  = qspiFreeKB;
     extendedStatus.vramTierFlags   = tierFlags;
+}
+
+void I2CSlave::SetLastCompletedFrame(uint32_t frameNumber) {
+    extendedStatus.lastCompletedFrame = frameNumber;
 }
 
 // ─── Temperature Sensor ─────────────────────────────────────────────────────

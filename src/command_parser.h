@@ -13,6 +13,8 @@
 
 #include <cstdint>
 
+#include <PglTypes.h>  // PglParserErrorFlags (protocol v8 error accounting)
+
 // Forward declarations
 struct SceneState;
 class QspiVramDriver;
@@ -89,5 +91,25 @@ void InitDisplayAndPools(DisplayManager* displayMgr, MemPoolManager* poolMgr);
  */
 ParseResult Parse(const uint8_t* frameData, uint32_t frameLength,
                   SceneState* scene);
+
+/**
+ * @brief Latch a parser/command error (protocol v8).
+ *
+ * ORs `bit` into the latched error mask and increments the cumulative error
+ * counter (saturating at 0xFFFF).  Call this on every fail-closed rejection:
+ * the offending command/frame is skipped, never partially executed.
+ * Surfaced to the host via PglExtendedStatusResponse (PGL_REG_EXTENDED_STATUS).
+ */
+void NoteParserError(PglParserErrorFlags bit);
+
+/**
+ * @brief Cumulative parser/command error count since boot (v8).
+ */
+uint16_t GetParserErrorCount();
+
+/**
+ * @brief Latched PglParserErrorFlags bitmask since boot (v8).
+ */
+uint16_t GetParserErrorMask();
 
 }  // namespace CommandParser

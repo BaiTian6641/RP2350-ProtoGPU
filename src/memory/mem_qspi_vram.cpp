@@ -781,32 +781,47 @@ uint32_t QspiVramDriver::Alloc(QspiChannel chId, uint32_t size, uint32_t alignme
     return 0xFFFFFFFF;  // OOM
 }
 
-void QspiVramDriver::Free(QspiChannel chId, uint32_t addr) {
+void QspiVramDriver::Free(QspiChannel chId, uint32_t addr, uint32_t size) {
     uint8_t chIdx = static_cast<uint8_t>(chId);
-    if (chIdx >= QSPI_VRAM_MAX_CHANNELS) return;
+    if (chIdx >= QSPI_VRAM_MAX_CHANNELS || size == 0) return;
 
     ChannelState& ch = channels_[chIdx];
+    if (!ch.initialized) return;
 
-    // Find the allocation size — we need to track this externally
-    // For now, caller is responsible for passing correct addr
-    // The block will be added as a free block and coalesced
+    // Double-free / corrupt-addr guard: the range must not overlap any block
+    // already in the free list. A rejected free leaks one block but keeps the
+    // allocator consistent (a merged overlap would hand the same memory out
+    // twice later).
+    for (uint16_t i = 0; i < ch.freeBlockCount; ++i) {
+        const uint32_t bStart = ch.freeList[i].addr;
+        const uint32_t bEnd   = bStart + ch.freeList[i].size;
+        if (addr < bEnd && addr + size > bStart) {
+            printf("[QspiVram] WARNING: Free(addr=0x%lX size=%lu) overlaps "
+                   "free block [0x%lX,0x%lX) — rejected (double free?)\n",
+                   (unsigned long)addr, (unsigned long)size,
+                   (unsigned long)bStart, (unsigned long)bEnd);
+            return;
+        }
+    }
 
     if (ch.freeBlockCount >= ChannelState::MAX_FREE_BLOCKS) {
         CoalesceFreeList(ch);
+        if (ch.freeBlockCount >= ChannelState::MAX_FREE_BLOCKS) {
+            // Cannot track another block — leak it rather than corrupt.
+            printf("[QspiVram] WARNING: Free(addr=0x%lX size=%lu) — free "
+                   "list full, block leaked\n",
+                   (unsigned long)addr, (unsigned long)size);
+            return;
+        }
     }
 
-    // Note: size-tracking requires either a separate allocation table
-    // or the caller passing the size.  For the free-list allocator,
-    // we store size alongside address in a separate shadow array.
-    // This is handled by MemTierManager which tracks MemRecord.dataSize.
+    ch.freeList[ch.freeBlockCount].addr = addr;
+    ch.freeList[ch.freeBlockCount].size = size;
+    ch.freeBlockCount++;
 
-    // Add free block (size must be provided by caller via MemTierManager)
-    // This is a placeholder — in practice, MemTierManager calls FreeAll()
-    // or manages sizes through MemRecord.
-
-    printf("[QspiVram] WARNING: Free(addr=0x%lX) — use FreeAll() or "
-           "MemTierManager for proper size tracking\n",
-           (unsigned long)addr);
+    // Re-coalesce so first-fit allocs see maximal blocks. Cheap at
+    // MAX_FREE_BLOCKS scale and the free path is not latency-critical.
+    CoalesceFreeList(ch);
 }
 
 void QspiVramDriver::FreeAll(QspiChannel chId) {

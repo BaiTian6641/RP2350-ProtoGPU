@@ -834,6 +834,9 @@ void GpuCore::Core0Main() {
         displayManager.SetPrimaryFramebuffer(frontBuffer);
         CommandParser::UpdateFramebufferPtrs(frontBuffer, backBuffer);
 
+        // v8: frame fully rendered + presented — record for extended status
+        I2CSlave::SetLastCompletedFrame(sceneState.frameNumber);
+
         // ── Memory tier: end-of-frame flush ──
         memTierManager.EndFrame();
 

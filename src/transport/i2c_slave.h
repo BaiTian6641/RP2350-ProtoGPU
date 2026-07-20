@@ -76,6 +76,14 @@ void UpdateVramStatus(uint16_t opiTotalKB, uint16_t opiFreeKB,
                       uint8_t tierFlags);
 
 /**
+ * @brief Record the highest fully rendered + presented frame number (v8).
+ *
+ * Called by Core 0 at the framebuffer swap (frame present point).  Surfaced
+ * in PglExtendedStatusResponse::lastCompletedFrame.
+ */
+void SetLastCompletedFrame(uint32_t frameNumber);
+
+/**
  * @brief Read the on-chip temperature sensor.
  * @return Temperature in degrees Celsius (approximate, ±5 °C).
  */

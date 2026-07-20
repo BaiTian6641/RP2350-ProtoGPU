@@ -175,12 +175,12 @@ void MemTierManager::Unregister(uint16_t resourceId) {
         }
     }
 
-    // Free external memory allocations
+    // Free external memory allocations (size from the record for the free-list)
     if (rec->qspiAAddr != 0 && rec->qspiAAddr != 0xFFFFFFFF && vram_) {
-        vram_->Free(QspiChannel::A, rec->qspiAAddr);
+        vram_->Free(QspiChannel::A, rec->qspiAAddr, rec->dataSize);
     }
     if (rec->qspiBAddr != 0 && rec->qspiBAddr != 0xFFFFFFFF && vram_) {
-        vram_->Free(QspiChannel::B, rec->qspiBAddr);
+        vram_->Free(QspiChannel::B, rec->qspiBAddr, rec->dataSize);
     }
 
     // Zero out the record

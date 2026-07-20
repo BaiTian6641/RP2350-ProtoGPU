@@ -6,7 +6,10 @@
  * with meshes, materials, draw calls, camera state, 2D layer commands,
  * memory defrag, persistence, and direct framebuffer writes.
  *
- * ProtoGL v0.7.2 — M12: 2D compositing, defrag, persistence, framebuffer write.
+ * ProtoGL v0.8.0 — protocol v8: generation-checked resource handles
+ * (mesh/material/texture), latched parser error bitmask + counter, fail-closed
+ * payload bounds checks.  M12: 2D compositing, defrag, persistence,
+ * framebuffer write.
  */
 
 #include "command_parser.h"
@@ -97,6 +100,71 @@ void CommandParser::InitDisplayAndPools(DisplayManager* displayMgr,
     s_poolMgr    = poolMgr;
 }
 
+// ─── v8: Parser Error Accounting ────────────────────────────────────────────
+// Latched PglParserErrorFlags mask + cumulative counter, surfaced to the host
+// via PglExtendedStatusResponse (PGL_REG_EXTENDED_STATUS).  Fail-closed
+// policy: the offending command/frame is skipped, never partially executed.
+
+static uint16_t s_parserErrorMask  = 0;
+static uint16_t s_parserErrorCount = 0;
+
+void CommandParser::NoteParserError(PglParserErrorFlags bit) {
+    s_parserErrorMask = static_cast<uint16_t>(s_parserErrorMask | bit);
+    if (s_parserErrorCount < 0xFFFF) ++s_parserErrorCount;  // saturating
+}
+
+uint16_t CommandParser::GetParserErrorMask()  { return s_parserErrorMask; }
+uint16_t CommandParser::GetParserErrorCount() { return s_parserErrorCount; }
+
+// ─── v8: Generation-Checked Handle Validation ───────────────────────────────
+// Wire handles encode [generation:8 | index:8].  A use site is valid when the
+// index is in range (and not the reserved 0xFF), the slot is in use, and the
+// handle generation matches the byte recorded at CREATE time.  Legacy gen-0
+// handles match slots created with plain indices — v7 semantics preserved.
+// Every failure is latched via NoteParserError and the caller skips.
+
+static bool ValidateMeshHandle(const SceneState* scene, uint16_t handle) {
+    const uint8_t idx = PglHandleIndex(handle);
+    if (idx == PGL_INVALID_HANDLE_INDEX || idx >= GpuConfig::MAX_MESHES ||
+        !scene->meshes[idx].active) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_HANDLE);
+        return false;
+    }
+    if (scene->meshGeneration[idx] != PglHandleGeneration(handle)) {
+        CommandParser::NoteParserError(PGL_PERR_GEN_MISMATCH);
+        return false;
+    }
+    return true;
+}
+
+static bool ValidateMaterialHandle(const SceneState* scene, uint16_t handle) {
+    const uint8_t idx = PglHandleIndex(handle);
+    if (idx == PGL_INVALID_HANDLE_INDEX || idx >= GpuConfig::MAX_MATERIALS ||
+        !scene->materials[idx].active) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_HANDLE);
+        return false;
+    }
+    if (scene->materialGeneration[idx] != PglHandleGeneration(handle)) {
+        CommandParser::NoteParserError(PGL_PERR_GEN_MISMATCH);
+        return false;
+    }
+    return true;
+}
+
+static bool ValidateTextureHandle(const SceneState* scene, uint16_t handle) {
+    const uint8_t idx = PglHandleIndex(handle);
+    if (idx == PGL_INVALID_HANDLE_INDEX || idx >= GpuConfig::MAX_TEXTURES ||
+        !scene->textures[idx].active) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_HANDLE);
+        return false;
+    }
+    if (scene->textureGeneration[idx] != PglHandleGeneration(handle)) {
+        CommandParser::NoteParserError(PGL_PERR_GEN_MISMATCH);
+        return false;
+    }
+    return true;
+}
+
 // ─── Opcode Handlers (forward declarations) ─────────────────────────────────
 
 static void HandleBeginFrame(const uint8_t*& ptr, SceneState* scene);
@@ -166,6 +234,7 @@ CommandParser::ParseResult CommandParser::Parse(
     const uint8_t* frameData, uint32_t frameLength, SceneState* scene)
 {
     if (frameLength < sizeof(PglFrameHeader) + sizeof(PglFrameFooter)) {
+        NoteParserError(PGL_PERR_BAD_LENGTH);
         return ParseResult::TruncatedFrame;
     }
 
@@ -186,6 +255,7 @@ CommandParser::ParseResult CommandParser::Parse(
     std::memcpy(&storedCrc, frameData + dataLen, sizeof(storedCrc));
 
     if (computedCrc != storedCrc) {
+        NoteParserError(PGL_PERR_CRC);
         return ParseResult::CrcError;
     }
 
@@ -197,11 +267,26 @@ CommandParser::ParseResult CommandParser::Parse(
     ParseResult result = ParseResult::Ok;
 
     for (uint16_t i = 0; i < hdr.commandCount && ptr < frameEnd; ++i) {
+        // v8 fail-closed bounds: a truncated command header or a payloadLength
+        // running past the frame end aborts the frame (no partial dispatch).
+        if (frameEnd - ptr < static_cast<ptrdiff_t>(sizeof(PglCommandHeader))) {
+            NoteParserError(PGL_PERR_BAD_LENGTH);
+            result = ParseResult::TruncatedFrame;
+            break;
+        }
+
         // Read command header
         PglCommandHeader cmdHdr;
         PglReadStruct(ptr, cmdHdr);
 
         const uint8_t* cmdPayloadStart = ptr;
+
+        if (cmdHdr.payloadLength >
+            static_cast<uint32_t>(frameEnd - cmdPayloadStart)) {
+            NoteParserError(PGL_PERR_BAD_LENGTH);
+            result = ParseResult::TruncatedFrame;
+            break;
+        }
 
         switch (cmdHdr.opcode) {
             case PGL_CMD_BEGIN_FRAME:
@@ -372,9 +457,10 @@ CommandParser::ParseResult CommandParser::Parse(
                 break;
 
             default:
-                // Unknown opcode — skip payload, log warning
+                // Unknown opcode — skip payload, log warning, count (v8)
                 printf("[Parser] Unknown opcode 0x%02X, skipping %u bytes\n",
                        cmdHdr.opcode, cmdHdr.payloadLength);
+                NoteParserError(PGL_PERR_UNKNOWN_OPCODE);
                 PglSkip(ptr, cmdHdr.payloadLength);
                 result = ParseResult::UnknownOpcode;
                 break;
@@ -408,13 +494,17 @@ static void HandleCreateMesh(const uint8_t*& ptr, uint16_t payloadLen,
     PglCmdCreateMeshHeader hdr;
     PglReadStruct(ptr, hdr);
 
-    if (hdr.meshId >= GpuConfig::MAX_MESHES) {
+    // v8: decode the slot index from the [gen:8 | index:8] handle
+    const uint8_t meshIdx = PglHandleIndex(hdr.meshId);
+    if (meshIdx == PGL_INVALID_HANDLE_INDEX || meshIdx >= GpuConfig::MAX_MESHES) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_HANDLE);
         PglSkip(ptr, payloadLen - sizeof(hdr));
         return;
     }
 
     // If the slot was already active, free its old pool allocations
-    MeshSlot& mesh = scene->meshes[hdr.meshId];
+    // (CREATE on an occupied slot overwrites — the v8 re-gen flow)
+    MeshSlot& mesh = scene->meshes[meshIdx];
     if (mesh.active) {
         scene->FreeVertices(mesh.vertices);
         scene->FreeIndices(mesh.indices);
@@ -432,6 +522,7 @@ static void HandleCreateMesh(const uint8_t*& ptr, uint16_t payloadLen,
     PglIndex3* idxs  = scene->AllocIndices(trisToCopy);
     if (!verts || !idxs) {
         printf("[Parser] Vertex/index pool full for mesh %u\n", hdr.meshId);
+        CommandParser::NoteParserError(PGL_PERR_POOL_EXHAUSTED);
         PglSkip(ptr, payloadLen - sizeof(hdr));
         return;
     }
@@ -444,6 +535,9 @@ static void HandleCreateMesh(const uint8_t*& ptr, uint16_t payloadLen,
     mesh.uvVertexCount = 0;
     mesh.uvVertices    = nullptr;
     mesh.uvIndices     = nullptr;
+
+    // v8: record the handle generation (0 for legacy gen-0 handles)
+    scene->meshGeneration[meshIdx] = PglHandleGeneration(hdr.meshId);
 
     // Read vertex positions into pool memory
     PglReadArray(ptr, mesh.vertices, vertsToCopy);
@@ -470,6 +564,7 @@ static void HandleCreateMesh(const uint8_t*& ptr, uint16_t payloadLen,
         PglIndex3* uvIdxs  = scene->AllocUVIndices(trisToCopy);
         if (!uvVerts || !uvIdxs) {
             printf("[Parser] UV pool full for mesh %u\n", hdr.meshId);
+            CommandParser::NoteParserError(PGL_PERR_POOL_EXHAUSTED);
             // Skip remaining UV data
             PglSkip(ptr, uvVertexCount * sizeof(PglVec2)
                        + hdr.triangleCount * sizeof(PglIndex3));
@@ -493,15 +588,17 @@ static void HandleCreateMesh(const uint8_t*& ptr, uint16_t payloadLen,
 static void HandleDestroyMesh(const uint8_t*& ptr, SceneState* scene) {
     PglCmdDestroyMesh cmd;
     PglReadStruct(ptr, cmd);
-    if (cmd.meshId < GpuConfig::MAX_MESHES) {
-        MeshSlot& mesh = scene->meshes[cmd.meshId];
-        // Free pool allocations (stack-style, best-effort)
-        scene->FreeUVIndices(mesh.uvIndices);
-        scene->FreeUVVertices(mesh.uvVertices);
-        scene->FreeIndices(mesh.indices);
-        scene->FreeVertices(mesh.vertices);
-        mesh = MeshSlot{};  // zero the slot
-    }
+
+    // v8: validate index range + slot in use + generation match (fail-closed)
+    if (!ValidateMeshHandle(scene, cmd.meshId)) return;
+
+    MeshSlot& mesh = scene->meshes[PglHandleIndex(cmd.meshId)];
+    // Free pool allocations (stack-style, best-effort)
+    scene->FreeUVIndices(mesh.uvIndices);
+    scene->FreeUVVertices(mesh.uvVertices);
+    scene->FreeIndices(mesh.indices);
+    scene->FreeVertices(mesh.vertices);
+    mesh = MeshSlot{};  // zero the slot (generation byte retained; slot inactive)
 }
 
 static void HandleUpdateVertices(const uint8_t*& ptr, uint16_t payloadLen,
@@ -509,12 +606,12 @@ static void HandleUpdateVertices(const uint8_t*& ptr, uint16_t payloadLen,
     PglCmdUpdateVerticesHeader hdr;
     PglReadStruct(ptr, hdr);
 
-    if (hdr.meshId >= GpuConfig::MAX_MESHES || !scene->meshes[hdr.meshId].active) {
+    if (!ValidateMeshHandle(scene, hdr.meshId)) {
         PglSkip(ptr, hdr.vertexCount * sizeof(PglVec3));
         return;
     }
 
-    MeshSlot& mesh = scene->meshes[hdr.meshId];
+    MeshSlot& mesh = scene->meshes[PglHandleIndex(hdr.meshId)];
     uint16_t count = (hdr.vertexCount <= mesh.vertexCount)
                    ? hdr.vertexCount : mesh.vertexCount;
     PglReadArray(ptr, mesh.vertices, count);
@@ -530,12 +627,12 @@ static void HandleUpdateVerticesDelta(const uint8_t*& ptr, uint16_t payloadLen,
     PglCmdUpdateVerticesDeltaHeader hdr;
     PglReadStruct(ptr, hdr);
 
-    if (hdr.meshId >= GpuConfig::MAX_MESHES || !scene->meshes[hdr.meshId].active) {
+    if (!ValidateMeshHandle(scene, hdr.meshId)) {
         PglSkip(ptr, hdr.deltaCount * sizeof(PglVertexDelta));
         return;
     }
 
-    MeshSlot& mesh = scene->meshes[hdr.meshId];
+    MeshSlot& mesh = scene->meshes[PglHandleIndex(hdr.meshId)];
     for (uint16_t i = 0; i < hdr.deltaCount; ++i) {
         PglVertexDelta delta;
         PglReadStruct(ptr, delta);
@@ -555,15 +652,21 @@ static void HandleCreateMaterial(const uint8_t*& ptr, uint16_t payloadLen,
     PglCmdCreateMaterialHeader hdr;
     PglReadStruct(ptr, hdr);
 
-    if (hdr.materialId >= GpuConfig::MAX_MATERIALS) {
+    // v8: decode the slot index from the [gen:8 | index:8] handle
+    const uint8_t matIdx = PglHandleIndex(hdr.materialId);
+    if (matIdx == PGL_INVALID_HANDLE_INDEX || matIdx >= GpuConfig::MAX_MATERIALS) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_HANDLE);
         PglSkip(ptr, payloadLen - sizeof(hdr));
         return;
     }
 
-    MaterialSlot& mat = scene->materials[hdr.materialId];
+    MaterialSlot& mat = scene->materials[matIdx];
     mat.active = true;
     mat.type = static_cast<PglMaterialType>(hdr.materialType);
     mat.blendMode = static_cast<PglBlendMode>(hdr.blendMode);
+
+    // v8: record the handle generation (0 for legacy gen-0 handles)
+    scene->materialGeneration[matIdx] = PglHandleGeneration(hdr.materialId);
 
     // Copy type-specific parameters into the raw param buffer
     uint16_t paramSize = payloadLen - sizeof(hdr);
@@ -581,13 +684,12 @@ static void HandleUpdateMaterial(const uint8_t*& ptr, uint16_t payloadLen,
     PglCmdUpdateMaterialHeader hdr;
     PglReadStruct(ptr, hdr);
 
-    if (hdr.materialId >= GpuConfig::MAX_MATERIALS ||
-        !scene->materials[hdr.materialId].active) {
+    if (!ValidateMaterialHandle(scene, hdr.materialId)) {
         PglSkip(ptr, payloadLen - sizeof(hdr));
         return;
     }
 
-    MaterialSlot& mat = scene->materials[hdr.materialId];
+    MaterialSlot& mat = scene->materials[PglHandleIndex(hdr.materialId)];
     uint16_t paramSize = payloadLen - sizeof(hdr);
     if (paramSize > sizeof(mat.params)) {
         paramSize = sizeof(mat.params);
@@ -601,9 +703,11 @@ static void HandleUpdateMaterial(const uint8_t*& ptr, uint16_t payloadLen,
 static void HandleDestroyMaterial(const uint8_t*& ptr, SceneState* scene) {
     PglCmdDestroyMaterial cmd;
     PglReadStruct(ptr, cmd);
-    if (cmd.materialId < GpuConfig::MAX_MATERIALS) {
-        scene->materials[cmd.materialId].active = false;
-    }
+
+    // v8: validate index range + slot in use + generation match (fail-closed)
+    if (!ValidateMaterialHandle(scene, cmd.materialId)) return;
+
+    scene->materials[PglHandleIndex(cmd.materialId)].active = false;
 }
 
 static void HandleCreateTexture(const uint8_t*& ptr, uint16_t payloadLen,
@@ -611,14 +715,17 @@ static void HandleCreateTexture(const uint8_t*& ptr, uint16_t payloadLen,
     PglCmdCreateTextureHeader hdr;
     PglReadStruct(ptr, hdr);
 
-    if (hdr.textureId >= GpuConfig::MAX_TEXTURES) {
+    // v8: decode the slot index from the [gen:8 | index:8] handle
+    const uint8_t texIdx = PglHandleIndex(hdr.textureId);
+    if (texIdx == PGL_INVALID_HANDLE_INDEX || texIdx >= GpuConfig::MAX_TEXTURES) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_HANDLE);
         PglSkip(ptr, payloadLen - sizeof(hdr));
         return;
     }
 
-    TextureSlot& tex = scene->textures[hdr.textureId];
+    TextureSlot& tex = scene->textures[texIdx];
 
-    // Free previous allocation if re-creating
+    // Free previous allocation if re-creating (v8 re-gen overwrite flow)
     if (tex.active && tex.pixels) {
         scene->FreeTexturePixels(tex.pixels);
     }
@@ -629,6 +736,7 @@ static void HandleCreateTexture(const uint8_t*& ptr, uint16_t payloadLen,
     if (!pixBuf) {
         printf("[Parser] Texture pool full for texture %u (%u bytes)\n",
                hdr.textureId, pixelDataSize);
+        CommandParser::NoteParserError(PGL_PERR_POOL_EXHAUSTED);
         PglSkip(ptr, payloadLen - sizeof(hdr));
         return;
     }
@@ -640,6 +748,9 @@ static void HandleCreateTexture(const uint8_t*& ptr, uint16_t payloadLen,
     tex.pixelDataSize = pixelDataSize;
     tex.pixels        = pixBuf;
 
+    // v8: record the handle generation (0 for legacy gen-0 handles)
+    scene->textureGeneration[texIdx] = PglHandleGeneration(hdr.textureId);
+
     // Copy pixel data into pool memory
     std::memcpy(tex.pixels, ptr, pixelDataSize);
     PglSkip(ptr, payloadLen - sizeof(hdr));
@@ -648,11 +759,13 @@ static void HandleCreateTexture(const uint8_t*& ptr, uint16_t payloadLen,
 static void HandleDestroyTexture(const uint8_t*& ptr, SceneState* scene) {
     PglCmdDestroyTexture cmd;
     PglReadStruct(ptr, cmd);
-    if (cmd.textureId < GpuConfig::MAX_TEXTURES) {
-        TextureSlot& tex = scene->textures[cmd.textureId];
-        scene->FreeTexturePixels(tex.pixels);
-        tex = TextureSlot{};
-    }
+
+    // v8: validate index range + slot in use + generation match (fail-closed)
+    if (!ValidateTextureHandle(scene, cmd.textureId)) return;
+
+    TextureSlot& tex = scene->textures[PglHandleIndex(cmd.textureId)];
+    scene->FreeTexturePixels(tex.pixels);
+    tex = TextureSlot{};  // zero the slot (generation byte retained; slot inactive)
 }
 
 static void HandleSetPixelLayout(const uint8_t*& ptr, uint16_t payloadLen,
@@ -661,6 +774,7 @@ static void HandleSetPixelLayout(const uint8_t*& ptr, uint16_t payloadLen,
     PglReadStruct(ptr, hdr);
 
     if (hdr.layoutId >= PGL_MAX_LAYOUTS) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
         PglSkip(ptr, payloadLen - sizeof(hdr));
         return;
     }
@@ -687,6 +801,7 @@ static void HandleSetPixelLayout(const uint8_t*& ptr, uint16_t payloadLen,
         PglVec2* coordBuf = scene->AllocLayoutCoords(count);
         if (!coordBuf) {
             printf("[Parser] Layout coord pool full for layout %u\n", hdr.layoutId);
+            CommandParser::NoteParserError(PGL_PERR_POOL_EXHAUSTED);
             PglSkip(ptr, hdr.pixelCount * sizeof(PglVec2));
             return;
         }
@@ -703,11 +818,21 @@ static void HandleDrawObject(const uint8_t*& ptr, uint16_t payloadLen,
     PglCmdDrawObject cmd;
     PglReadStruct(ptr, cmd);
 
-    if (scene->drawCallCount >= GpuConfig::MAX_DRAW_CALLS) return;
+    if (scene->drawCallCount >= GpuConfig::MAX_DRAW_CALLS) {
+        CommandParser::NoteParserError(PGL_PERR_POOL_EXHAUSTED);
+        return;
+    }
+
+    // v8: validate generation-checked handles before enqueuing (fail-closed —
+    // the whole draw call is skipped, never partially applied)
+    if (!ValidateMeshHandle(scene, cmd.meshId)) return;
+    if (!ValidateMaterialHandle(scene, cmd.materialId)) return;
 
     DrawCall& dc = scene->drawList[scene->drawCallCount];
-    dc.meshId     = cmd.meshId;
-    dc.materialId = cmd.materialId;
+    // Store decoded slot indices — the rasterizer and tier prefetch consume
+    // raw indices; the generation byte was already validated above.
+    dc.meshId     = PglHandleIndex(cmd.meshId);
+    dc.materialId = PglHandleIndex(cmd.materialId);
     dc.enabled    = (cmd.flags & PGL_DRAW_ENABLED) != 0;
 
     // Copy full transform
@@ -730,6 +855,7 @@ static void HandleDrawObject(const uint8_t*& ptr, uint16_t payloadLen,
         PglVec3* overrideBuf = scene->AllocFrameVertices(count);
         if (!overrideBuf) {
             printf("[Parser] Frame vertex pool full for draw call\n");
+            CommandParser::NoteParserError(PGL_PERR_POOL_EXHAUSTED);
             PglSkip(ptr, dc.overrideVertexCount * sizeof(PglVec3));
             dc.hasVertexOverride = false;
         } else {
@@ -749,7 +875,10 @@ static void HandleSetCamera(const uint8_t*& ptr, SceneState* scene) {
     PglCmdSetCamera cmd;
     PglReadStruct(ptr, cmd);
 
-    if (cmd.cameraId >= PGL_MAX_CAMERAS) return;
+    if (cmd.cameraId >= PGL_MAX_CAMERAS) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
+        return;
+    }
 
     CameraSlot& cam = scene->cameras[cmd.cameraId];
     cam.active      = true;
@@ -766,10 +895,16 @@ static void HandleSetShader(const uint8_t*& ptr, SceneState* scene) {
     PglCmdSetShader cmd;
     PglReadStruct(ptr, cmd);
 
-    if (cmd.cameraId >= PGL_MAX_CAMERAS) return;
+    if (cmd.cameraId >= PGL_MAX_CAMERAS) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
+        return;
+    }
     CameraSlot& cam = scene->cameras[cmd.cameraId];
     if (!cam.active) return;
-    if (cmd.shaderSlot >= PGL_MAX_SHADERS_PER_CAMERA) return;
+    if (cmd.shaderSlot >= PGL_MAX_SHADERS_PER_CAMERA) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
+        return;
+    }
 
     ShaderSlot& slot = cam.shaders[cmd.shaderSlot];
     slot.active      = (cmd.shaderClass != PGL_SHADER_NONE);
@@ -786,6 +921,7 @@ static void HandleCreateShaderProgram(const uint8_t*& ptr, uint16_t payloadLen,
     PglReadStruct(ptr, cmd);
 
     if (cmd.programId >= PGL_MAX_SHADER_PROGRAMS) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_HANDLE);
         // Skip the bytecode blob
         ptr += cmd.bytecodeSize;
         return;
@@ -793,6 +929,7 @@ static void HandleCreateShaderProgram(const uint8_t*& ptr, uint16_t payloadLen,
 
     // Validate bytecode blob size
     if (cmd.bytecodeSize < sizeof(PglShaderProgramHeader)) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
         ptr += cmd.bytecodeSize;
         return;
     }
@@ -805,6 +942,7 @@ static void HandleCreateShaderProgram(const uint8_t*& ptr, uint16_t payloadLen,
 
     // Validate magic and version
     if (psbHdr.magic != PSB_MAGIC || psbHdr.version != PSB_VERSION) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
         ptr = blobStart + cmd.bytecodeSize;
         return;
     }
@@ -813,6 +951,7 @@ static void HandleCreateShaderProgram(const uint8_t*& ptr, uint16_t payloadLen,
     if (psbHdr.uniformCount > PSB_MAX_UNIFORMS ||
         psbHdr.constCount > PSB_MAX_CONSTANTS ||
         psbHdr.instrCount > PSB_MAX_INSTRUCTIONS) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
         ptr = blobStart + cmd.bytecodeSize;
         return;
     }
@@ -855,7 +994,10 @@ static void HandleDestroyShaderProgram(const uint8_t*& ptr, SceneState* scene) {
     PglCmdDestroyShaderProgram cmd;
     PglReadStruct(ptr, cmd);
 
-    if (cmd.programId >= PGL_MAX_SHADER_PROGRAMS) return;
+    if (cmd.programId >= PGL_MAX_SHADER_PROGRAMS) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_HANDLE);
+        return;
+    }
 
     ShaderProgram& prog = scene->shaderPrograms[cmd.programId];
     std::memset(&prog, 0, sizeof(prog));
@@ -867,10 +1009,16 @@ static void HandleBindShaderProgram(const uint8_t*& ptr, SceneState* scene) {
     PglCmdBindShaderProgram cmd;
     PglReadStruct(ptr, cmd);
 
-    if (cmd.cameraId >= PGL_MAX_CAMERAS) return;
+    if (cmd.cameraId >= PGL_MAX_CAMERAS) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
+        return;
+    }
     CameraSlot& cam = scene->cameras[cmd.cameraId];
     if (!cam.active) return;
-    if (cmd.shaderSlot >= PGL_MAX_SHADERS_PER_CAMERA) return;
+    if (cmd.shaderSlot >= PGL_MAX_SHADERS_PER_CAMERA) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
+        return;
+    }
 
     ShaderSlot& slot = cam.shaders[cmd.shaderSlot];
     if (cmd.programId == 0xFFFF) {
@@ -893,6 +1041,7 @@ static void HandleSetShaderUniform(const uint8_t*& ptr, uint16_t payloadLen,
     PglReadStruct(ptr, cmd);
 
     if (cmd.programId >= PGL_MAX_SHADER_PROGRAMS) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_HANDLE);
         // Skip value data
         if (cmd.componentCount > 0 && cmd.componentCount <= 4) {
             ptr += cmd.componentCount * sizeof(float);
@@ -902,6 +1051,7 @@ static void HandleSetShaderUniform(const uint8_t*& ptr, uint16_t payloadLen,
 
     ShaderProgram& prog = scene->shaderPrograms[cmd.programId];
     if (!prog.active) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_HANDLE);
         if (cmd.componentCount > 0 && cmd.componentCount <= 4) {
             ptr += cmd.componentCount * sizeof(float);
         }
@@ -909,6 +1059,7 @@ static void HandleSetShaderUniform(const uint8_t*& ptr, uint16_t payloadLen,
     }
 
     if (cmd.uniformSlot >= PSB_MAX_UNIFORMS || cmd.componentCount == 0 || cmd.componentCount > 4) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
         if (cmd.componentCount > 0 && cmd.componentCount <= 4) {
             ptr += cmd.componentCount * sizeof(float);
         }
@@ -1027,6 +1178,7 @@ static void HandleMemWrite(const uint8_t*& ptr, uint16_t payloadLen,
 
         default:
             printf("[Parser] MemWrite: invalid tier %u\n", hdr.tier);
+            CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
             break;
     }
 }
@@ -1145,6 +1297,7 @@ static void HandleMemAlloc(const uint8_t*& ptr, SceneState* scene) {
         scene->lastAllocResult.handle  = PGL_INVALID_MEM_HANDLE;
         scene->lastAllocResult.address = 0;
         scene->lastAllocResult.status  = PGL_ALLOC_INVALID_TIER;
+        CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
         return;
     }
 
@@ -1163,6 +1316,7 @@ static void HandleMemAlloc(const uint8_t*& ptr, SceneState* scene) {
         scene->lastAllocResult.handle  = PGL_INVALID_MEM_HANDLE;
         scene->lastAllocResult.address = 0;
         scene->lastAllocResult.status  = PGL_ALLOC_HANDLE_EXHAUSTED;
+        CommandParser::NoteParserError(PGL_PERR_POOL_EXHAUSTED);
         return;
     }
 
@@ -1234,13 +1388,33 @@ static void HandleMemFree(const uint8_t*& ptr, SceneState* scene) {
     if (cmd.handle >= PGL_MAX_MEM_ALLOCATIONS ||
         !s_allocTable[cmd.handle].active) {
         printf("[Parser] MemFree: invalid handle %u\n", cmd.handle);
+        CommandParser::NoteParserError(PGL_PERR_INVALID_HANDLE);
         return;
     }
 
+    // Return the block to the driver's free-list (size from the alloc table).
+    // The old bump-allocator justification no longer applies — QspiVramDriver
+    // has a real size-aware free-list.
+    switch (s_allocTable[cmd.handle].tier) {
+        case PGL_TIER_OPI_PSRAM:
+            if (s_opi && s_opi->IsChannelInitialized(QspiChannel::A)) {
+                s_opi->Free(QspiChannel::A,
+                            s_allocTable[cmd.handle].address,
+                            s_allocTable[cmd.handle].size);
+            }
+            break;
+        case PGL_TIER_QSPI_PSRAM:
+            if (s_qspi && s_qspi->IsChannelInitialized(QspiChannel::B)) {
+                s_qspi->Free(QspiChannel::B,
+                             s_allocTable[cmd.handle].address,
+                             s_allocTable[cmd.handle].size);
+            }
+            break;
+        default:
+            break;  // SRAM etc. — nothing to return to a driver
+    }
+
     // Mark the handle as free.
-    // Note: With bump allocators, individual deallocation doesn't return memory
-    // to the pool. The space is reclaimed only on FreeAll(). This is acceptable
-    // for the GPU's allocation pattern (bulk load → render → reset).
     s_allocTable[cmd.handle].active = false;
 
     (void)scene;
@@ -1353,6 +1527,7 @@ static void HandleLayerCreate(const uint8_t*& ptr, SceneState* scene) {
 
     if (cmd.layerId == PGL_LAYER_3D || cmd.layerId >= PGL_MAX_LAYERS) {
         printf("[Parser] LayerCreate: invalid layer %u\n", cmd.layerId);
+        CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
         return;
     }
 
@@ -1378,6 +1553,7 @@ static void HandleLayerCreate(const uint8_t*& ptr, SceneState* scene) {
     if (!scene->AllocLayerFramebuffer(cmd.layerId)) {
         printf("[Parser] LayerCreate: failed to allocate FB for layer %u (%ux%u)\n",
                cmd.layerId, cmd.width, cmd.height);
+        CommandParser::NoteParserError(PGL_PERR_POOL_EXHAUSTED);
         layer.active = false;
         return;
     }
@@ -1397,6 +1573,7 @@ static void HandleLayerDestroy(const uint8_t*& ptr, SceneState* scene) {
 
     if (cmd.layerId == PGL_LAYER_3D || cmd.layerId >= PGL_MAX_LAYERS) {
         printf("[Parser] LayerDestroy: invalid layer %u\n", cmd.layerId);
+        CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
         return;
     }
 
@@ -1415,6 +1592,7 @@ static void HandleLayerSetProps(const uint8_t*& ptr, SceneState* scene) {
 
     if (cmd.layerId >= PGL_MAX_LAYERS || !scene->layers[cmd.layerId].active) {
         printf("[Parser] LayerSetProps: invalid/inactive layer %u\n", cmd.layerId);
+        CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
         return;
     }
 
@@ -1434,6 +1612,7 @@ static bool Enqueue2D(SceneState* scene, uint8_t layerId, DrawCmd2DType type,
                       const void* payload, size_t payloadSize) {
     if (layerId >= PGL_MAX_LAYERS || !scene->layers[layerId].active) {
         printf("[Parser] 2D cmd type %u: invalid/inactive layer %u\n", type, layerId);
+        CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
         return false;
     }
     DrawCmd2D cmd;
@@ -1441,7 +1620,12 @@ static bool Enqueue2D(SceneState* scene, uint8_t layerId, DrawCmd2DType type,
     cmd.layerId = layerId;  // Store explicit layerId for Process2DDrawQueue
     std::memcpy(&cmd.rect, payload, payloadSize);  // union starts at .rect
     scene->layers[layerId].dirty = true;
-    return scene->Enqueue2DCmd(cmd);
+    if (!scene->Enqueue2DCmd(cmd)) {
+        printf("[Parser] 2D draw queue full (type %u, layer %u)\n", type, layerId);
+        CommandParser::NoteParserError(PGL_PERR_POOL_EXHAUSTED);
+        return false;
+    }
+    return true;
 }
 
 static void HandleDrawRect2D(const uint8_t*& ptr, SceneState* scene) {
@@ -1465,6 +1649,15 @@ static void HandleDrawCircle2D(const uint8_t*& ptr, SceneState* scene) {
 static void HandleDrawSprite(const uint8_t*& ptr, SceneState* scene) {
     PglCmdDrawSprite cmd;
     PglReadStruct(ptr, cmd);
+
+    // v8: the sprite's textureId is a generation-checked texture handle
+    // (unless it names an ImageSequence).  Validate fail-closed and store the
+    // decoded slot index for the 2D executor (raw-index consumer).
+    if (!(cmd.flags & PGL_SPRITE_SRC_SEQUENCE)) {
+        if (!ValidateTextureHandle(scene, cmd.textureId)) return;
+        cmd.textureId = PglHandleIndex(cmd.textureId);
+    }
+
     Enqueue2D(scene, cmd.layerId, DRAW_CMD_2D_SPRITE, &cmd, sizeof(cmd));
 }
 
@@ -1510,6 +1703,9 @@ static void HandleMemPoolCreate(const uint8_t*& ptr, SceneState* scene) {
 
     uint16_t handle = s_poolMgr->CreatePool(cmd.tier, cmd.blockSize,
                                               cmd.blockCount, cmd.tag);
+    if (handle == 0xFFFF) {
+        CommandParser::NoteParserError(PGL_PERR_POOL_EXHAUSTED);
+    }
 
     // Report result via I2C MEM_ALLOC_RESULT register
     scene->lastAllocResult.handle  = handle;
@@ -1532,6 +1728,9 @@ static void HandleMemPoolAlloc(const uint8_t*& ptr, SceneState* scene) {
     }
 
     uint16_t blockIdx = s_poolMgr->Alloc(cmd.poolHandle);
+    if (blockIdx == 0xFFFF) {
+        CommandParser::NoteParserError(PGL_PERR_POOL_EXHAUSTED);
+    }
 
     // Report block index in the address field
     scene->lastAllocResult.handle  = cmd.poolHandle;
@@ -1549,6 +1748,7 @@ static void HandleMemPoolFree(const uint8_t*& ptr, SceneState* scene) {
     if (!ok) {
         printf("[Parser] MemPoolFree: failed pool=%u block=%u\n",
                cmd.poolHandle, cmd.blockIndex);
+        CommandParser::NoteParserError(PGL_PERR_INVALID_HANDLE);
     }
     (void)scene;
 }
@@ -1662,6 +1862,7 @@ static void HandleWriteFramebuffer(const uint8_t*& ptr, uint16_t payloadLen,
     if (pixelDataBytes < expectedBytes) {
         printf("[Parser] WriteFramebuffer: truncated data (%u < %u)\n",
                pixelDataBytes, expectedBytes);
+        CommandParser::NoteParserError(PGL_PERR_BAD_LENGTH);
         PglSkip(ptr, pixelDataBytes);
         return;
     }
@@ -1686,6 +1887,7 @@ static void HandleWriteFramebuffer(const uint8_t*& ptr, uint16_t payloadLen,
         layer.dirty = true;
     } else {
         printf("[Parser] WriteFramebuffer: invalid layer %u\n", hdr.layerId);
+        CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
         PglSkip(ptr, pixelDataBytes);
         return;
     }
@@ -1747,6 +1949,7 @@ static void HandlePersistResource(const uint8_t*& ptr, SceneState* scene) {
     if (!dataPtr || dataSize == 0) {
         printf("[Parser] PersistResource: resource %u:%u not found in memory\n",
                cmd.resourceClass, cmd.resourceId);
+        CommandParser::NoteParserError(PGL_PERR_INVALID_HANDLE);
         scene->persistStatus.state          = PGL_PERSIST_ERROR;
         scene->persistStatus.lastResourceId = cmd.resourceId;
         return;
@@ -1790,6 +1993,7 @@ static void HandleRestoreResource(const uint8_t*& ptr, SceneState* scene) {
         scene->persistStatus.state = PGL_PERSIST_ERROR;
         printf("[Parser] RestoreResource: failed class=%u id=%u\n",
                cmd.resourceClass, cmd.resourceId);
+        CommandParser::NoteParserError(PGL_PERR_INVALID_HANDLE);
     }
 }
 

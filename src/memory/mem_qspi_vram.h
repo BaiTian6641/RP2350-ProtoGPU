@@ -234,8 +234,11 @@ public:
     /// Dual CS: allocation spans both chips transparently.
     uint32_t Alloc(QspiChannel ch, uint32_t size, uint32_t alignment = 4);
 
-    /// Free a previously allocated block.
-    void Free(QspiChannel ch, uint32_t addr);
+    /// Free a previously allocated block. The size must match the Alloc call
+    /// (the free-list stores addr+size; callers track sizes externally:
+    /// MemRecord.dataSize, the parser's alloc table, or the test constant).
+    /// Overlapping an existing free block is rejected (double-free guard).
+    void Free(QspiChannel ch, uint32_t addr, uint32_t size);
 
     /// Free all allocations on a channel.
     void FreeAll(QspiChannel ch);

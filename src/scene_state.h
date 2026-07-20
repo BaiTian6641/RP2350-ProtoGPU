@@ -256,6 +256,15 @@ struct SceneState {
     DrawCall        drawList   [GpuConfig::MAX_DRAW_CALLS];
     uint16_t        drawCallCount = 0;
 
+    // ── v8 generation-checked handles (PGL_CAP_HANDLE_GEN) ──────────────────
+    // Per-slot generation byte recorded at CREATE time from the wire handle's
+    // [generation:8 | index:8] encoding.  DESTROY/use sites must present a
+    // handle whose generation matches the stored byte; legacy gen-0 handles
+    // match slots created with plain indices (v7 semantics preserved).
+    uint8_t         meshGeneration    [GpuConfig::MAX_MESHES]     = {};
+    uint8_t         materialGeneration[GpuConfig::MAX_MATERIALS]  = {};
+    uint8_t         textureGeneration [GpuConfig::MAX_TEXTURES]   = {};
+
     // ── Programmable shader programs ────────────────────────────────────────
     ShaderProgram   shaderPrograms[PGL_MAX_SHADER_PROGRAMS];
 
@@ -310,6 +319,9 @@ struct SceneState {
         std::memset(cameras,      0, sizeof(cameras));
         std::memset(drawList,     0, sizeof(drawList));
         std::memset(shaderPrograms, 0, sizeof(shaderPrograms));
+        std::memset(meshGeneration,      0, sizeof(meshGeneration));
+        std::memset(materialGeneration,  0, sizeof(materialGeneration));
+        std::memset(textureGeneration,   0, sizeof(textureGeneration));
         drawCallCount = 0;
         frameNumber   = 0;
         frameTimeUs   = 0;

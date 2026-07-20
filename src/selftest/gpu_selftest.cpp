@@ -342,7 +342,7 @@ VramTestResult TestOpiVram(OpiPsramDriver* drv) {
         }
     }
 
-    drv->Free(QspiChannel::A, testAddr);
+    drv->Free(QspiChannel::A, testAddr, TEST_SIZE);
     result.pass = pass;
     printf("[SelfTest] QSPI-A VRAM test: %s (tested %u bytes, %u errors)\n",
            pass ? "PASSED" : "FAILED", (unsigned)result.testedBytes,
@@ -495,7 +495,7 @@ VramTestResult TestQspiVram(QspiPsramDriver* drv) {
         }
     }
 
-    drv->Free(QspiChannel::B, testOffset);
+    drv->Free(QspiChannel::B, testOffset, TEST_SIZE);
     result.pass = pass;
     printf("[SelfTest] QSPI-B VRAM test: %s (tested %u bytes, %u errors)\n",
            pass ? "PASSED" : "FAILED", (unsigned)result.testedBytes,
