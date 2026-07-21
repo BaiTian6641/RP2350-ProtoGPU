@@ -1,5 +1,0 @@
-/home/polar/MCUGPU/RP2350-ProtoGPU/build-headless/pioasm-install/pioasm/pioasm
-/home/polar/MCUGPU/RP2350-ProtoGPU/build-headless/pioasm-install/pioasm/pioasmTargets.cmake
-/home/polar/MCUGPU/RP2350-ProtoGPU/build-headless/pioasm-install/pioasm/pioasmTargets-release.cmake
-/home/polar/MCUGPU/RP2350-ProtoGPU/build-headless/pioasm-install/pioasm/pioasmConfig.cmake
-/home/polar/MCUGPU/RP2350-ProtoGPU/build-headless/pioasm-install/pioasm/pioasmConfigVersion.cmake
