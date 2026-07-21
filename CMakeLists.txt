@@ -119,9 +119,39 @@ target_compile_options(protogl_gpu PRIVATE
                            # reciprocal sqrt approx, no-errno — safe for renderer.
     -ffunction-sections    # Place each function in its own section for linker GC
     -fdata-sections        # Place each data item in its own section for linker GC
+    -flto                  # F-07: link-time optimization (paired with link -flto)
+)
+
+# ─── F-06: -O3 for the hot render translation units only (global stays -O2) ──
+# Per-source COMPILE_OPTIONS are appended AFTER the target-level options, so
+# the later -O3 wins over the global -O2 (verified: "-O2 ... -O3" in build log).
+set_source_files_properties(
+    src/render/rasterizer.cpp
+    src/render/screenspace_effects.cpp
+    src/render/pgl_shader_vm.cpp
+    src/math/pgl_math.cpp
+    PROPERTIES COMPILE_OPTIONS -O3
 )
 
 # Remove unused code/data sections
 target_link_options(protogl_gpu PRIVATE
+    -flto                  # F-07: link-time optimization (paired with compile -flto)
     -Wl,--gc-sections
+)
+
+# F-07 caveat: LTO and the Pico SDK's -Wl,--wrap=<fn> redirection (pico_stdio,
+# pico_printf, pico_float, pico_double, pico_malloc) do not mix. --wrap renames
+# references to __wrap_<fn> only at the final link — after LTO symbol
+# resolution — so LTO sees the wrapper bodies as unreferenced and discards
+# them ("undefined reference to __wrap_printf" etc.). Exclude the five
+# wrapper-defining SDK TUs from LTO so their symbols stay in regular symbol
+# tables, visible at final link. (ASM wrapper objects are never LTO'd and are
+# unaffected; all 114 active --wrap symbols are then defined, verified.)
+set_source_files_properties(
+    ${PICO_SDK_PATH}/src/rp2_common/pico_stdio/stdio.c
+    ${PICO_SDK_PATH}/src/rp2_common/pico_printf/printf.c
+    ${PICO_SDK_PATH}/src/rp2_common/pico_float/float_math.c
+    ${PICO_SDK_PATH}/src/rp2_common/pico_double/double_math.c
+    ${PICO_SDK_PATH}/src/rp2_common/pico_malloc/malloc.c
+    PROPERTIES COMPILE_OPTIONS -fno-lto
 )

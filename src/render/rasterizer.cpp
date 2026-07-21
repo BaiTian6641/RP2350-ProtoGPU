@@ -24,8 +24,17 @@
 #include <cstdio>
 #include <cmath>
 
+// ─── Debug Options ───────────────────────────────────────────────────────────
+// GPU_CONFIG_DEBUG_PREPARE_PRINT: when 1, PrepareFrame prints a per-frame
+// summary line over UART.  At 115200 baud one line costs ~1 ms+ on-device —
+// hot path, keep 0 unless actively debugging the transform stage.
+#ifndef GPU_CONFIG_DEBUG_PREPARE_PRINT
+#define GPU_CONFIG_DEBUG_PREPARE_PRINT 0
+#endif
+
 // ─── FNV-1a hash helper ────────────────────────────────────────────────────
-// Used for frame signature caching — identical draw list + cameras = skip raster.
+// Used for frame signature caching — identical draw list + mesh versions +
+// cameras = skip raster.
 
 static uint32_t fnv1a_hash(const void* data, size_t len, uint32_t seed = 0x811c9dc5u) {
     const uint8_t* p = static_cast<const uint8_t*>(data);
@@ -708,10 +717,19 @@ void Rasterizer::Initialize(SceneState* scene, uint16_t* zBuffer,
 
 // ─── Frame Signature ────────────────────────────────────────────────────────
 //
-// FNV-1a hash of the draw list (transforms, mesh/material IDs, enabled flags)
-// and all active camera state.  If the signature matches the previous frame,
-// PrepareFrame can skip the full transform→project→QuadTree pipeline and
-// the rasterizer reuses the previous frame's pixel data.
+// FNV-1a hash of the draw list (transforms, mesh/material IDs, enabled flags),
+// per-mesh CONTENT VERSIONS, and all active camera state.  If the signature
+// matches the previous frame, PrepareFrame can skip the full
+// transform→project→QuadTree pipeline and the rasterizer reuses the previous
+// frame's pixel data.
+//
+// F-04: mesh vertex bytes are no longer hashed (up to ~24 KB/frame).  The
+// command parser bumps SceneState::meshVersion[] on every mesh data write
+// (CREATE_MESH, UPDATE_VERTICES, UPDATE_VERTICES_DELTA, DESTROY_MESH), so
+// comparing versions detects the same content changes in O(draws) instead of
+// O(verts).  Morph-override vertices are per-frame data (frame pool, re-read
+// from the wire each frame) — a version cannot detect "same bytes re-sent",
+// so those bytes are still content-hashed.
 
 uint32_t Rasterizer::ComputeFrameSignature(const SceneState* s) const {
     uint32_t h = 0x811c9dc5u;
@@ -744,15 +762,17 @@ uint32_t Rasterizer::ComputeFrameSignature(const SceneState* s) const {
         }
     }
 
-    // Hash mesh vertex data for active meshes (catches base vertex changes)
+    // Hash mesh content versions for active meshes (F-04 — replaces hashing
+    // the vertex bytes themselves; the parser bumps a version on any write,
+    // which covers every change the byte hash would have caught).
     for (uint16_t d = 0; d < s->drawCallCount; ++d) {
         const DrawCall& dc = s->drawList[d];
         if (!dc.enabled || dc.meshId >= GpuConfig::MAX_MESHES) continue;
         if (dc.hasVertexOverride) continue;  // already hashed above
         const MeshSlot& mesh = s->meshes[dc.meshId];
         if (mesh.active && mesh.vertices && mesh.vertexCount > 0) {
-            h = fnv1a_hash(mesh.vertices,
-                           mesh.vertexCount * sizeof(PglVec3), h);
+            h = fnv1a_hash(&s->meshVersion[dc.meshId],
+                           sizeof(s->meshVersion[dc.meshId]), h);
         }
     }
 
@@ -843,6 +863,11 @@ void Rasterizer::PrepareFrame(SceneState* scene) {
         // Get transform early — needed for both AABB cull and vertex transform
         const PglTransform& xform = dc.transform;
 
+        // F-3: compose this draw call's rotation ONCE — it is invariant
+        // across all AABB corners and vertices below.  The per-vertex
+        // operation sequence is unchanged (bit-identical float results).
+        const PglQuat drawFullRot = PglMath::TransformFullRotation(xform);
+
         // ── Mesh-level AABB frustum cull ────────────────────────────
         // Transform the 8 corners of the mesh AABB, project to screen,
         // and skip the entire draw call if fully off-screen.
@@ -860,7 +885,7 @@ void Rasterizer::PrepareFrame(SceneState* scene) {
             float sMaxX = -1e30f, sMaxY = -1e30f;
             bool anyInFront = false;
             for (int c = 0; c < 8; ++c) {
-                PglVec3 tv = PglMath::TransformVertex(xform, corners[c]);
+                PglVec3 tv = PglMath::TransformVertex(xform, drawFullRot, corners[c]);
                 float cz;
                 PglVec2 sp;
                 if (is2D) {
@@ -891,7 +916,7 @@ void Rasterizer::PrepareFrame(SceneState* scene) {
         // Applies scale (around scaleOffset), rotation (around rotationOffset),
         // then translation.  This matches ProtoTracer's Transform pipeline.
         for (uint16_t v = 0; v < vertCount; ++v) {
-            transformedVerts[v] = PglMath::TransformVertex(xform, srcVerts[v]);
+            transformedVerts[v] = PglMath::TransformVertex(xform, drawFullRot, srcVerts[v]);
         }
 
         // ── Step 2: Project each triangle to 2D and insert into QuadTree ──
@@ -991,12 +1016,14 @@ void Rasterizer::PrepareFrame(SceneState* scene) {
         projectedTriCount += mesh.triangleCount;
     }
 
+#if GPU_CONFIG_DEBUG_PREPARE_PRINT
     if (projectedTriCount > 0) {
         printf("[Rasterizer] PrepareFrame: %u draw calls, %u triangles projected, "
                "%u in pool, %u QuadTree nodes\n",
                scene->drawCallCount, projectedTriCount,
                trianglePoolUsed, quadTree.GetNodeCount());
     }
+#endif
 }
 
 // ─── RasterizeRange (both cores, parallel) ──────────────────────────────────

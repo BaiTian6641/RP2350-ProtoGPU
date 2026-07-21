@@ -62,6 +62,17 @@ PglVec3 Mat3MulVec(const Mat3& m, const PglVec3& v);
 
 // ─── Transform ──────────────────────────────────────────────────────────────
 
+/// Composed per-draw-call rotation: rotation ∘ baseRotation.
+/// Loop-invariant across all vertices (and AABB corners) of a draw call —
+/// compute once per draw call and pass to the 3-argument TransformVertex
+/// (F-3: hoists the per-vertex QuatMul out of the transform loop).
+PglQuat TransformFullRotation(const PglTransform& t);
+
+/// Apply a full PglTransform to a vertex using a precomputed composed
+/// rotation.  Same operations in the same order as the 2-argument form —
+/// bit-identical float results.
+PglVec3 TransformVertex(const PglTransform& t, const PglQuat& fullRot, const PglVec3& v);
+
 /// Apply a full PglTransform to a vertex: rotation, scale, translation.
 /// Mirrors Transform::GetTransformMatrix() from ProtoTracer.
 PglVec3 TransformVertex(const PglTransform& t, const PglVec3& v);

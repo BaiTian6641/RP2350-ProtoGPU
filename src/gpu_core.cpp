@@ -117,6 +117,14 @@ static uint32_t droppedFrames = 0;
 static uint32_t lastPerfReportFrameCount = 0;
 static constexpr uint32_t PERF_REPORT_INTERVAL = 60;
 
+/// F-05: HUD OLED I2C page updates run 1-in-N frames so the management-plane
+/// I2C bandwidth returns to host queries. The first frames after boot still
+/// update every frame to keep bringup diagnostics responsive.
+/// (Dedicated counter: frameCount resets every second in UpdateFpsMeasurement.)
+static uint32_t hudUpdateFrameCounter = 0;
+static constexpr uint32_t HUD_UPDATE_INTERVAL_FRAMES = 10;
+static constexpr uint32_t HUD_BOOT_FULL_RATE_FRAMES  = 30;
+
 #endif // !RP2350GPU_HEADLESS_SELFTEST
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -918,8 +926,12 @@ void GpuCore::Core0Main() {
             ti.qspiEnabled = chBInit ? 1 : 0;
         }
 
-        // ── Update HUD OLED (one page per frame) ──
-        if (displayManager.GetDriver(1) != nullptr) {
+        // ── Update HUD OLED (one page per update; throttled 1-in-N frames) ──
+        const bool hudDue =
+            (hudUpdateFrameCounter < HUD_BOOT_FULL_RATE_FRAMES) ||
+            ((hudUpdateFrameCounter % HUD_UPDATE_INTERVAL_FRAMES) == 0);
+        hudUpdateFrameCounter++;
+        if (hudDue && displayManager.GetDriver(1) != nullptr) {
             uint16_t vramUsed = static_cast<uint16_t>(
                 memTierManager.GetSramCacheUsed() / 1024);
             uint16_t vramTotal = 520;  // SRAM total KB
@@ -936,7 +948,7 @@ void GpuCore::Core0Main() {
             hudDisplay.RenderStatus(
                 measuredFps, vramUsed, vramTotal,
                 cpuPct, htempCi, frameUs);
-            hudDisplay.PollRefresh();  // one 128-byte page per frame
+            hudDisplay.PollRefresh();  // one 128-byte page per update
         }
 
         // ── Periodic profiling report ──

@@ -270,6 +270,17 @@ struct SceneState {
     uint8_t         materialGeneration[GpuConfig::MAX_MATERIALS]  = {};
     uint8_t         textureGeneration [GpuConfig::MAX_TEXTURES]   = {};
 
+    // ── Mesh content versions (F-04 frame-signature counters) ───────────────
+    // Per-slot logical clock, bumped by the command parser on EVERY write to
+    // a mesh slot's vertex data (CREATE_MESH initial data / re-gen overwrite,
+    // UPDATE_VERTICES, UPDATE_VERTICES_DELTA, DESTROY_MESH).  The rasterizer's
+    // frame signature folds these in instead of FNV-1a-hashing up to ~24 KB of
+    // vertex bytes per frame — O(draws) instead of O(verts).
+    // MONOTONIC: deliberately NOT cleared by Reset() — a scene rebuilt after a
+    // reset must never reproduce a pre-reset signature (Reset wipes the slot
+    // data these versions describe, so the versions must keep counting).
+    uint32_t        meshVersion       [GpuConfig::MAX_MESHES]     = {};
+
     // ── Programmable shader programs ────────────────────────────────────────
     ShaderProgram   shaderPrograms[PGL_MAX_SHADER_PROGRAMS];
 

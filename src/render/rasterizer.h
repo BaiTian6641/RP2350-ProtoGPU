@@ -77,7 +77,8 @@ private:
     bool        frameSkipped      = false;
     float       elapsedTimeS      = 0.0f;  ///< animated material time
 
-    /// Frame signature: FNV-1a hash of draw list + camera state.
+    /// Frame signature: FNV-1a hash of draw list + camera state + mesh
+    /// content versions (F-04 — parser-bumped counters, not vertex bytes).
     /// If identical to the previous frame, rasterization is skipped.
     uint32_t    prevFrameSignature = 0;
 

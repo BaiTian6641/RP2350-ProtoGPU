@@ -170,7 +170,14 @@ PglVec3 Mat3MulVec(const Mat3& m, const PglVec3& v) {
 
 // ─── Transform ──────────────────────────────────────────────────────────────
 
-PglVec3 TransformVertex(const PglTransform& t, const PglVec3& v) {
+PglQuat TransformFullRotation(const PglTransform& t) {
+    // The same QuatMul the original per-vertex code executed — hoisting it
+    // changes WHEN it runs (once per draw call), not HOW, so per-vertex
+    // results stay bit-identical.
+    return QuatMul(t.rotation, t.baseRotation);
+}
+
+PglVec3 TransformVertex(const PglTransform& t, const PglQuat& fullRot, const PglVec3& v) {
     // 1. Apply scale offset
     PglVec3 offset = Sub(v, t.scaleOffset);
 
@@ -184,14 +191,19 @@ PglVec3 TransformVertex(const PglTransform& t, const PglVec3& v) {
     PglVec3 rotated = QuatRotate(t.scaleRotationOffset, scaled);
     PglVec3 reoffset = Add(rotated, t.scaleOffset);
 
-    // 3. Apply rotation offset, main rotation, then base rotation
+    // 3. Apply rotation offset, then the precomputed composed rotation
     PglVec3 rOff = Sub(reoffset, t.rotationOffset);
-    PglQuat fullRot = QuatMul(t.rotation, t.baseRotation);
     PglVec3 finalRot = QuatRotate(fullRot, rOff);
     PglVec3 result = Add(finalRot, t.rotationOffset);
 
     // 4. Translate
     return Add(result, t.position);
+}
+
+PglVec3 TransformVertex(const PglTransform& t, const PglVec3& v) {
+    // Composes the rotation here — identical operations to the hoisted form,
+    // so both overloads produce bit-identical results.
+    return TransformVertex(t, TransformFullRotation(t), v);
 }
 
 // ─── Projection ─────────────────────────────────────────────────────────────

@@ -523,6 +523,9 @@ static void HandleCreateMesh(const uint8_t*& ptr, uint16_t payloadLen,
     if (!verts || !idxs) {
         printf("[Parser] Vertex/index pool full for mesh %u\n", hdr.meshId);
         CommandParser::NoteParserError(PGL_PERR_POOL_EXHAUSTED);
+        // Old pool data was freed above — slot content changed, invalidate
+        // any cached frame signature (F-04).
+        scene->meshVersion[meshIdx]++;
         PglSkip(ptr, payloadLen - sizeof(hdr));
         return;
     }
@@ -583,6 +586,10 @@ static void HandleCreateMesh(const uint8_t*& ptr, uint16_t payloadLen,
             }
         }
     }
+
+    // Mesh vertex data written — bump the content version so the next frame
+    // signature differs (F-04; covers both fresh CREATE and re-gen overwrite).
+    scene->meshVersion[meshIdx]++;
 }
 
 static void HandleDestroyMesh(const uint8_t*& ptr, SceneState* scene) {
@@ -599,6 +606,9 @@ static void HandleDestroyMesh(const uint8_t*& ptr, SceneState* scene) {
     scene->FreeIndices(mesh.indices);
     scene->FreeVertices(mesh.vertices);
     mesh = MeshSlot{};  // zero the slot (generation byte retained; slot inactive)
+    // Slot content removed — bump the content version (F-04) so a cached
+    // frame signature that referenced this mesh is invalidated.
+    scene->meshVersion[PglHandleIndex(cmd.meshId)]++;
 }
 
 static void HandleUpdateVertices(const uint8_t*& ptr, uint16_t payloadLen,
@@ -618,6 +628,9 @@ static void HandleUpdateVertices(const uint8_t*& ptr, uint16_t payloadLen,
     if (hdr.vertexCount > count) {
         PglSkip(ptr, (hdr.vertexCount - count) * sizeof(PglVec3));
     }
+
+    // Vertex data written — bump the content version (F-04).
+    scene->meshVersion[PglHandleIndex(hdr.meshId)]++;
 
     // Recompute cached AABB after vertex replacement
     mesh.RecomputeAABB();
@@ -642,6 +655,9 @@ static void HandleUpdateVerticesDelta(const uint8_t*& ptr, uint16_t payloadLen,
             mesh.vertices[delta.index].z += delta.z;
         }
     }
+
+    // Vertex data written — bump the content version (F-04).
+    scene->meshVersion[PglHandleIndex(hdr.meshId)]++;
 
     // Recompute cached AABB after delta updates
     mesh.RecomputeAABB();
