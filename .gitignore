@@ -1,15 +1,23 @@
 # Build artifacts
 build/
+build-*/
 *.elf
 *.bin
 *.hex
 *.uf2
+*.dis
+*.map
 
 # CMake
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 Makefile
+
+# Desktop simulator outputs (references in sim/golden/ stay TRACKED —
+# they are the regression baseline, not build output)
+sim/out/
+build/sim/
 
 # VSCode
 .vscode/

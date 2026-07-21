@@ -186,53 +186,57 @@ static void B3InitTextures() {
 }
 
 // ─── B4: PGLSL post-FX sources (compiled at runtime, see EncodeB4) ──────────
-// NOTE: the stock ../ProtoGL/shaders/*.pglsl samples do NOT compile with the
-// current PglShaderCompiler: its register allocator is a pure bump allocator
-// with no frees, so anything beyond ~14 expression temporaries fails with
-// "register allocation overflow" (verified: all 8 samples, 2026-07-20).
-// B4 therefore uses register-budget-compatible PGLSL written for today's
-// compiler (component-wise assignments, one binary op per statement).  Each
-// shader still has one user uniform and samples u_framebuffer (TEX2D), so the
-// PSB VM's scratch-copy path and distinct math ops (ADD/SUB, POW, STEP) are
-// exercised.  If the compiler's allocator improves, these can be swapped for
-// the stock samples.
+// These are VERBATIM copies of the stock ProtoGL samples
+//   ../ProtoGL/shaders/invert.pglsl
+//   ../ProtoGL/shaders/gamma.pglsl
+//   ../ProtoGL/shaders/vignette.pglsl
+// embedded as string literals (the sim's cwd varies between build_sim.sh and
+// run_golden.sh, so runtime file loading would be fragile; the stock files
+// themselves are compile-gated by ProtoGL/tests/syntax_check/
+// run_shader_compile.sh). They compile now that PglShaderCompiler's register
+// allocator frees expression temporaries (LIFO temp stack, 2026-07-20) —
+// before that fix all 8 stock samples failed with "register allocation
+// overflow". Chain: invert (SUB) → gamma (POW) → vignette (LEN2/MIX); all
+// three sample u_framebuffer (TEX2D), exercising the PSB VM's scratch-copy
+// path on every pixel.
 
-static const char kPglslWarmShift[] = R"pglsl(
-uniform float u_warm;
-
+// stock ProtoGL/shaders/invert.pglsl (no user uniform; intensity mixes)
+static const char kPglslInvert[] = R"pglsl(
 void main() {
     vec2 uv = gl_FragCoord.xy / u_resolution;
-    vec4 c = texture2D(u_framebuffer, uv);
-    gl_FragColor.r = c.r + u_warm;
-    gl_FragColor.g = c.g;
-    gl_FragColor.b = c.b - u_warm;
-    gl_FragColor.a = 1.0;
+    vec4 color = texture2D(u_framebuffer, uv);
+    gl_FragColor = vec4(vec3(1.0) - color.rgb, 1.0);
 }
 )pglsl";
 
+// stock ProtoGL/shaders/gamma.pglsl (uniform float u_gamma)
 static const char kPglslGamma[] = R"pglsl(
 uniform float u_gamma;
 
 void main() {
     vec2 uv = gl_FragCoord.xy / u_resolution;
-    vec4 c = texture2D(u_framebuffer, uv);
-    gl_FragColor.r = pow(c.r, u_gamma);
-    gl_FragColor.g = pow(c.g, u_gamma);
-    gl_FragColor.b = pow(c.b, u_gamma);
-    gl_FragColor.a = 1.0;
+    vec4 color = texture2D(u_framebuffer, uv);
+    vec3 corrected = vec3(
+        pow(color.r, u_gamma),
+        pow(color.g, u_gamma),
+        pow(color.b, u_gamma)
+    );
+    gl_FragColor = vec4(corrected, 1.0);
 }
 )pglsl";
 
-static const char kPglslPosterize[] = R"pglsl(
-uniform float u_thresh;
+// stock ProtoGL/shaders/vignette.pglsl (uniform float u_strength)
+static const char kPglslVignette[] = R"pglsl(
+uniform float u_strength;
 
 void main() {
     vec2 uv = gl_FragCoord.xy / u_resolution;
-    vec4 c = texture2D(u_framebuffer, uv);
-    gl_FragColor.r = step(u_thresh, c.r);
-    gl_FragColor.g = step(u_thresh, c.g);
-    gl_FragColor.b = step(u_thresh, c.b);
-    gl_FragColor.a = 1.0;
+    vec2 center = vec2(0.5, 0.5);
+    float dist = length(uv - center) * 1.414;
+    float vignette = mix(1.0, 1.0 - dist * dist, u_strength);
+
+    vec4 color = texture2D(u_framebuffer, uv);
+    gl_FragColor = vec4(color.rgb * vignette, 1.0);
 }
 )pglsl";
 
@@ -796,11 +800,12 @@ static size_t EncodeB3Textures(uint8_t* buf, size_t capacity, uint8_t frameIndex
 // (PglShaderCompiler.h), uploaded via CREATE_SHADER_PROGRAM, bound to the
 // three shader slots of camera 0 with distinct uniforms (SET_SHADER_UNIFORM).
 // Chain order (ApplyShaders iterates slots in order):
-//   warm-shift (ADD/SUB) → gamma (POW) → posterize (STEP).
-// All three sample u_framebuffer (TEX2D), exercising the PSB VM's
-// scratch-copy path on every pixel.  Background: the standard lit cube.
-// (See the note above kPglslWarmShift on why these are not the stock
-// ../ProtoGL/shaders/*.pglsl samples.)
+//   invert (SUB) → gamma (POW) → vignette (LEN2/MIX).
+// The sources are the STOCK ProtoGL shaders (verbatim copies, see the note
+// above kPglslInvert) — before the compiler's register-allocator fix they
+// failed with "register allocation overflow". All three sample u_framebuffer
+// (TEX2D), exercising the PSB VM's scratch-copy path on every pixel.
+// Background: the standard lit cube.
 
 struct B4Shader {
     const char* name;
@@ -810,9 +815,9 @@ struct B4Shader {
 };
 
 static const B4Shader kB4Shaders[3] = {
-    { "warm_shift", kPglslWarmShift, 0.12f, 1.0f },
-    { "gamma",      kPglslGamma,     1.90f, 1.0f },
-    { "posterize",  kPglslPosterize, 0.40f, 1.0f },
+    { "invert",   kPglslInvert,   0.0f, 1.0f },   // no user uniform (unused)
+    { "gamma",    kPglslGamma,    2.2f, 1.0f },   // u_gamma
+    { "vignette", kPglslVignette, 0.7f, 1.0f },   // u_strength
 };
 
 static size_t EncodeB4PsbPostFx(uint8_t* buf, size_t capacity, uint8_t frameIndex) {
@@ -1012,7 +1017,7 @@ static const SceneDef kScenes[] = {
           return CheckCoverage(fb, w, h, 7000, 0);
       } },
 
-    { "B4_psb_postfx", "B4 PSB post-FX chain: vignette→contrast→hue_shift",
+    { "B4_psb_postfx", "B4 PSB post-FX chain: invert→gamma→vignette (stock)",
       EncodeB4PsbPostFx, 1, kCubeFaceCount, kCubeFaceCount,
       [](const uint16_t* fb, uint16_t w, uint16_t h) {
           return CheckCoverage(fb, w, h, 400, 0);
