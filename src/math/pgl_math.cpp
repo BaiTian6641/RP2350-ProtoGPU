@@ -218,11 +218,22 @@ PglVec2 PerspectiveProject(const PglVec3& worldPos,
     PglVec3 rel = Sub(worldPos, camPos);
     PglVec3 view = QuatRotate(QuatConjugate(camRot), rel);
 
-    float z = view.z;
-    if (z < 0.001f) z = 0.001f;  // clamp to avoid div-by-zero
+    // G5: outZ receives the TRUE view-space z.  The old code clamped z to
+    // 0.001 BEFORE writing outZ — that corrupted the depth fed to the
+    // Z-buffer and made the rasterizer's `z <= 0` near-cull dead code, so
+    // near-plane-crossing triangles survived as giant flat slivers.
+    // Rasterizer::PrepareFrame now clips against z = kNearPlaneZ before
+    // projection, so rasterized vertices always arrive with z > kNearPlaneZ.
+    const float z = view.z;
     if (outZ) *outZ = z;
 
-    float invZ = fovFactor / z;
+    // Division guard ONLY: clamp the divisor for degenerate inputs that
+    // bypass clipping (mesh-AABB probe corners at/behind the camera) so the
+    // projection cannot produce inf/NaN screen coordinates.  This preserves
+    // the old screen-space result for those inputs; the callers reject them
+    // via the true outZ (AABB in-front test) or the near-plane clip.
+    const float zDiv = (z < kNearPlaneZ) ? kNearPlaneZ : z;
+    float invZ = fovFactor / zDiv;
     return {
         view.x * invZ + screenW * 0.5f,
         view.y * invZ + screenH * 0.5f

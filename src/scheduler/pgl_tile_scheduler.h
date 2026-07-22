@@ -166,3 +166,36 @@ private:
     static void ProcessTiles(TilePassContext* ctx);
 };
 
+// ─── Pair Dispatch (dual-core worker pair) ──────────────────────────────────
+
+/// Runs two worker functions as a core pair and returns only after BOTH have
+/// completed.  Same FIFO_CMD_PAIR mechanism as PglTileScheduler::DispatchPair,
+/// but callable without a scheduler instance (e.g. from namespace-style
+/// subsystems such as ScreenspaceShaders that run horizontal band splits).
+///
+/// Firmware (Pico SDK build): `core1Func` is pushed to Core 1 through the
+/// multicore FIFO while `core0Func` runs inline on Core 0; `idleFunc` is
+/// polled while waiting for Core 1's DONE.
+/// Single-core targets (desktop sim — pgl_tile_scheduler.cpp is not compiled
+/// there): both workers run sequentially on the calling thread, in order.
+///
+/// Contract (either backend): the two workers must share NO mutable state —
+/// each writes its own disjoint output region (e.g. separate framebuffer row
+/// bands) and every input buffer stays read-only for the whole call.  Under
+/// that contract serial execution is byte-identical to dual-core execution.
+namespace PairDispatch {
+#if defined(PICO_ON_DEVICE) || defined(PICO_RP2040) || defined(PICO_RP2350)
+    void Run(void (*core0Func)(void*), void* core0Ctx,
+             void (*core1Func)(void*), void* core1Ctx,
+             void (*idleFunc)());
+#else
+    inline void Run(void (*core0Func)(void*), void* core0Ctx,
+                    void (*core1Func)(void*), void* core1Ctx,
+                    void (*idleFunc)()) {
+        (void)idleFunc;
+        if (core0Func) core0Func(core0Ctx);
+        if (core1Func) core1Func(core1Ctx);
+    }
+#endif
+}
+

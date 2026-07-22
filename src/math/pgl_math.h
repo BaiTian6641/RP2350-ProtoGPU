@@ -79,7 +79,17 @@ PglVec3 TransformVertex(const PglTransform& t, const PglVec3& v);
 
 // ─── Projection ─────────────────────────────────────────────────────────────
 
-/// Perspective project: returns screen-space XY.  Z is stored in *outZ.
+/// View-space near plane (V9/G5).  Rasterizer::PrepareFrame clips every
+/// perspective triangle against the plane z = kNearPlaneZ before projection
+/// (Sutherland–Hodgman, 1–2 output triangles), so rasterized vertices always
+/// have view z > kNearPlaneZ.  PerspectiveProject keeps the value only as a
+/// division guard for degenerate inputs that bypass clipping (AABB probe
+/// corners).  The value preserves the historical de-facto near plane — the
+/// old 0.001 projection clamp.
+inline constexpr float kNearPlaneZ = 0.001f;
+
+/// Perspective project: returns screen-space XY.  The TRUE view-space z is
+/// stored in *outZ (G5: no longer clamped — it feeds the Z-buffer).
 PglVec2 PerspectiveProject(const PglVec3& worldPos,
                            const PglVec3& camPos,
                            const PglQuat& camRot,

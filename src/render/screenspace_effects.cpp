@@ -17,12 +17,22 @@
  *   - Displacement:  O(pixels), ~0.1-0.3 ms (sin via PglShaderBackend)
  *   - ColorAdjust:   O(pixels), ~0.05-0.15 ms
  *   - Worst case (4 shaders): < 1.0 ms, well within 16.6 ms budget
+ *
+ * S-02: programmable (PGL_SHADER_PROGRAM) passes run as two horizontal row
+ * bands dispatched across both cores via PairDispatch::Run (see
+ * pgl_tile_scheduler.h) — the PSB VM stage is the dominant post-FX cost
+ * (~17 ms single-core at 360 MHz → ~9 ms dual-core).  Built-in classes stay
+ * single-threaded: they cost < 1 ms worst-case and their fb-neighbour reads
+ * (e.g. edge feather) do not band-split as cheaply.  Banding is pixel-exact:
+ * bands write disjoint rows and sample the immutable scratch snapshot, so
+ * serial execution (desktop sim) is byte-identical to dual-core execution.
  */
 
 #include "screenspace_effects.h"
 #include "../scene_state.h"
 #include "../gpu_config.h"
 #include "pgl_shader_vm.h"
+#include "../scheduler/pgl_tile_scheduler.h"
 
 #include <PglTypes.h>
 #include <PglShaderBytecode.h>
@@ -578,6 +588,68 @@ static void ApplyColorAdjust(uint16_t* fb, uint16_t* scratch,
 // ── DISPATCHER + PUBLIC API ─────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════
 
+// ── Programmable (PSB) band worker ──────────────────────────────────────────
+//
+// S-02: the PSB VM pass is split into two horizontal row bands so both cores
+// work on it (post-FX is the ~17 ms frame stage; bands halve it on-device).
+// PairDispatch::Run executes the two bands concurrently on the firmware
+// (Core 0 + Core 1) and sequentially in the desktop sim — pixel-identical
+// either way because:
+//   - Band row ranges [yStart, yEnd) are disjoint and together cover the
+//     frame, so the two workers never write the same fb location.
+//   - With PSB_FLAG_NEEDS_SCRATCH_COPY the VM samples (TEX2D) the immutable
+//     scratch snapshot taken BEFORE dispatch; without the flag the compiler
+//     guarantees the program contains no texture2D call, so the only read is
+//     readBuf[idx] of the pixel being processed — owned by the same band.
+//   - progCopy is read-only during the pass; each band runs its own
+//     stack-local PglShaderVM (register file is per-instance state).
+// Serial execution (band A rows, then band B rows) is the same per-pixel
+// sequence as the former single y-loop, so output is byte-identical.
+
+struct ShaderBandContext {
+    uint16_t*             fb;        // output — only rows [yStart, yEnd) written
+    const uint16_t*       readBuf;   // input (scratch snapshot, or fb per-pixel)
+    const ShaderProgram*  prog;      // read-only uniform-augmented program copy
+    uint16_t              w, h;
+    uint16_t              yStart;    // first row of this band (inclusive)
+    uint16_t              yEnd;      // last row of this band (exclusive)
+    float                 intensity; // slot mix factor
+};
+
+static void RunShaderBand(void* ctxPtr) {
+    const ShaderBandContext& bc = *static_cast<const ShaderBandContext*>(ctxPtr);
+    const uint16_t w = bc.w;
+    PglShaderVM vm;  // per-band instance — no shared VM state between cores
+
+    for (uint16_t y = bc.yStart; y < bc.yEnd; ++y) {
+        for (uint16_t x = 0; x < w; ++x) {
+            uint32_t idx = y * w + x;
+            uint16_t pixel = bc.readBuf[idx];
+            float inR = static_cast<float>(R5(pixel)) / 31.0f;
+            float inG = static_cast<float>(G6(pixel)) / 63.0f;
+            float inB = static_cast<float>(B5(pixel)) / 31.0f;
+
+            float outR, outG, outB;
+            vm.Execute(*bc.prog, static_cast<float>(x), static_cast<float>(y),
+                       inR, inG, inB,
+                       bc.readBuf, w, bc.h,
+                       outR, outG, outB);
+
+            // Intensity blending: mix(original, shader output, intensity)
+            if (bc.intensity < 1.0f) {
+                outR = inR + (outR - inR) * bc.intensity;
+                outG = inG + (outG - inG) * bc.intensity;
+                outB = inB + (outB - inB) * bc.intensity;
+            }
+
+            bc.fb[idx] = PackRGB565(
+                Clamp5(static_cast<int>(outR * 31.0f + 0.5f)),
+                Clamp6(static_cast<int>(outG * 63.0f + 0.5f)),
+                Clamp5(static_cast<int>(outB * 31.0f + 0.5f)));
+        }
+    }
+}
+
 static void ApplySingleShader(uint16_t* fb, uint16_t* scratch,
                                uint16_t w, uint16_t h,
                                const ShaderSlot& slot,
@@ -599,14 +671,16 @@ static void ApplySingleShader(uint16_t* fb, uint16_t* scratch,
             const ShaderProgram& prog = scene->shaderPrograms[slot.programId];
             if (!prog.active) break;
 
-            // Copy framebuffer to scratch if the shader reads from it (TEX2D)
+            // Copy framebuffer to scratch if the shader reads from it (TEX2D).
+            // Done ONCE here, before the band dispatch: both bands sample this
+            // immutable snapshot, never the framebuffer being written.
             if (prog.flags & PSB_FLAG_NEEDS_SCRATCH_COPY) {
                 std::memcpy(scratch, fb, static_cast<uint32_t>(w) * h * 2);
             }
 
             // Prepare a mutable copy of the program's uniform table so we can
             // inject auto-bound values (u_resolution, u_time) without modifying
-            // the persistent program state.
+            // the persistent program state.  Read-only for both band workers.
             ShaderProgram progCopy;
             std::memcpy(&progCopy, &prog, sizeof(ShaderProgram));
             progCopy.uniforms[PSB_AUTO_UNIFORM_RESOLUTION_X] = static_cast<float>(w);
@@ -617,36 +691,17 @@ static void ApplySingleShader(uint16_t* fb, uint16_t* scratch,
             const uint16_t* readBuf = (prog.flags & PSB_FLAG_NEEDS_SCRATCH_COPY)
                                         ? scratch : fb;
 
-            PglShaderVM vm;
-            const float intensity = slot.intensity;
-
-            for (uint16_t y = 0; y < h; ++y) {
-                for (uint16_t x = 0; x < w; ++x) {
-                    uint32_t idx = y * w + x;
-                    uint16_t pixel = readBuf[idx];
-                    float inR = static_cast<float>(R5(pixel)) / 31.0f;
-                    float inG = static_cast<float>(G6(pixel)) / 63.0f;
-                    float inB = static_cast<float>(B5(pixel)) / 31.0f;
-
-                    float outR, outG, outB;
-                    vm.Execute(progCopy, static_cast<float>(x), static_cast<float>(y),
-                               inR, inG, inB,
-                               readBuf, w, h,
-                               outR, outG, outB);
-
-                    // Intensity blending: mix(original, shader output, intensity)
-                    if (intensity < 1.0f) {
-                        outR = inR + (outR - inR) * intensity;
-                        outG = inG + (outG - inG) * intensity;
-                        outB = inB + (outB - inB) * intensity;
-                    }
-
-                    fb[idx] = PackRGB565(
-                        Clamp5(static_cast<int>(outR * 31.0f + 0.5f)),
-                        Clamp6(static_cast<int>(outG * 63.0f + 0.5f)),
-                        Clamp5(static_cast<int>(outB * 31.0f + 0.5f)));
-                }
-            }
+            // S-02: two horizontal bands with a deterministic mid-frame
+            // boundary.  The contexts live on this (Core 0's) stack frame,
+            // which outlives the dispatch — PairDispatch::Run blocks until
+            // both bands have completed.
+            const uint16_t yMid = h / 2;
+            ShaderBandContext bandA = { fb, readBuf, &progCopy, w, h,
+                                        0, yMid, slot.intensity };
+            ShaderBandContext bandB = { fb, readBuf, &progCopy, w, h,
+                                        yMid, h, slot.intensity };
+            PairDispatch::Run(RunShaderBand, &bandA, RunShaderBand, &bandB,
+                              nullptr);
             break;
         }
         default:

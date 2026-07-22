@@ -807,11 +807,36 @@ void GpuCore::Core0Main() {
         }
 
         // ── Tile rasterization (dual-core, work-stealing) ──
+        // Multi-camera (V9 G3/G7): PrepareFrame bound the first ACTIVE
+        // back-buffer camera (v8 default); remaining active cameras are
+        // prepared+rendered in slot order via PrepareNextCameraPass, each
+        // into its resolved target (layer FB or back buffer, scissored).
+        // Single-camera hosts see identical behavior to before.
         PerfCounters::Begin(PerfStage::RasterTop);
-        tileScheduler.DispatchTilePass(
-            &rasterizer, backBuffer, zBuffer,
-            GpuConfig::PANEL_WIDTH, GpuConfig::PANEL_HEIGHT,
-            Hub75Driver::PollRefresh);
+        {
+            const int8_t firstCam = rasterizer.GetPreparedCameraIndex();
+            if (firstCam >= 0) {
+                CameraTargetInfo ti = sceneState.ResolveCameraTarget(
+                    static_cast<uint8_t>(firstCam), backBuffer,
+                    GpuConfig::PANEL_WIDTH, GpuConfig::PANEL_HEIGHT);
+                if (ti.valid && ti.fb) {
+                    tileScheduler.DispatchTilePass(
+                        &rasterizer, ti.fb, zBuffer, ti.width, ti.height,
+                        Hub75Driver::PollRefresh);
+                }
+            }
+            uint8_t camIdx;
+            while (rasterizer.PrepareNextCameraPass(&sceneState, &camIdx)) {
+                CameraTargetInfo ti = sceneState.ResolveCameraTarget(
+                    camIdx, backBuffer,
+                    GpuConfig::PANEL_WIDTH, GpuConfig::PANEL_HEIGHT);
+                if (ti.valid && ti.fb) {
+                    tileScheduler.DispatchTilePass(
+                        &rasterizer, ti.fb, zBuffer, ti.width, ti.height,
+                        Hub75Driver::PollRefresh);
+                }
+            }
+        }
         PerfCounters::End(PerfStage::RasterTop);
 
         // ── Accumulate elapsed time ──

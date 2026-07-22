@@ -149,6 +149,23 @@ void PglTileScheduler::DispatchTilePass(Rasterizer* rasterizer,
 void PglTileScheduler::DispatchPair(void (*core0Func)(void*), void* core0Ctx,
                                      void (*core1Func)(void*), void* core1Ctx,
                                      void (*idleFunc)()) {
+    PairDispatch::Run(core0Func, core0Ctx, core1Func, core1Ctx, idleFunc);
+}
+
+// ─── PairDispatch::Run ──────────────────────────────────────────────────────
+//
+// Instance-free pair dispatch (see pgl_tile_scheduler.h for the contract).
+// Core 1 must be parked in PglTileScheduler::Core1Main()'s FIFO loop — the
+// same FIFO_CMD_PAIR protocol as DispatchPair.  The caller's stack frame (and
+// therefore both context pointers) outlives this call because it blocks until
+// Core 1 pushes FIFO_DONE.
+
+#if defined(PICO_ON_DEVICE) || defined(PICO_RP2040) || defined(PICO_RP2350)
+namespace PairDispatch {
+
+void Run(void (*core0Func)(void*), void* core0Ctx,
+         void (*core1Func)(void*), void* core1Ctx,
+         void (*idleFunc)()) {
     // Send pair command + func + ctx to Core 1
     multicore_fifo_push_blocking(FIFO_CMD_PAIR);
     multicore_fifo_push_blocking(reinterpret_cast<uint32_t>(core1Func));
@@ -164,6 +181,9 @@ void PglTileScheduler::DispatchPair(void (*core0Func)(void*), void* core0Ctx,
     uint32_t response = multicore_fifo_pop_blocking();
     (void)response;  // expected: FIFO_DONE
 }
+
+}  // namespace PairDispatch
+#endif  // PICO_ON_DEVICE || PICO_RP2040 || PICO_RP2350
 
 // ─── ProcessTiles ───────────────────────────────────────────────────────────
 //

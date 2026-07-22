@@ -18,8 +18,10 @@
  *
  * A5-2 additions (see docs/OPTIMIZATION_PLAN.md §2):
  *   - Scene registry: one encoded frame set + one rendered PPM per benchmark
- *     scene.  Scenes B1–B6 are the frozen pixel-regression gate for all
- *     future firmware optimizations (F-01…, S-01…, V9 features).
+ *     scene.  Scenes B1–B9 are the frozen pixel-regression gate for all
+ *     future firmware optimizations (F-01…, S-01…, V9 features).  B7/B8 pin
+ *     the V9 G4 (3D alpha blend) / G6 (bilinear filtering) render semantics;
+ *     B9 pins G3/G7 (multi-camera viewports + render-to-layer).
  *   - Per-stage wall-clock timing (std::chrono): parse / PrepareFrame /
  *     tile raster / screenspace / 2D+composite / total — the sim-side analog
  *     of the firmware's DWT PerfCounters.
@@ -601,15 +603,17 @@ static size_t EncodeCubeScene(uint8_t* buf, size_t capacity, uint8_t frameIndex)
 // TODAY'S BEHAVIOR (pinned by this golden): near-plane crossing is NOT
 // clipped and NOT culled.  PglMath::PerspectiveProject clamps z to 0.001
 // before writing outZ, so the rasterizer's per-triangle "near-plane cull"
-// (za <= 0 at rasterizer.cpp:950) is DEAD CODE — it can never fire.  Instead
-// every behind-camera vertex projects to view.x·64000+64 (±~64k px); the
-// screen-AABB frustum cull drops fully-off-screen triangles, but crossing
-// triangles survive with their AABB clamped to the panel and rasterize as
-// GIANT FLAT SLIVERS whose interpolated z (~0.001) beats the real teapot in
-// the Z test — they paint over it as the large flat regions visible in this
-// golden.  The future V9 near-plane CLIP (G5) will rasterize the in-front
-// slivers of those same triangles instead, producing an obvious golden diff
-// across exactly these wash regions.
+// is DEAD CODE, and crossing vertices project to ±~64k px.  HOWEVER — the
+// V9/G5 implementation (2026-07-21) proved with an independent double-
+// precision oracle that in THIS scene the mis-projected slivers own ZERO
+// pixel centers at 128×64 (19 of the 22 crossing tris are back-face/off-
+// screen culled; the 3 survivors are razor slivers no pixel center falls
+// inside).  So the flat wash regions in this golden are genuine flat-shaded
+// teapot faces at extreme proximity — NOT slivers (an earlier version of
+// this comment claimed otherwise; it was wrong).  G5 now clips crossing
+// triangles for real (Sutherland–Hodgman in view space + true view-space z
+// in outZ) and this scene stays BIT-IDENTICAL — the strongest possible
+// regression proof that the non-crossing path is untouched.
 
 static size_t EncodeB1Teapot(uint8_t* buf, size_t capacity, uint8_t frameIndex) {
     if (frameIndex > 0) return 0;   // single-frame scene
@@ -756,12 +760,15 @@ static size_t EncodeB3Textures(uint8_t* buf, size_t capacity, uint8_t frameIndex
                        true, kQuadUVs, 4, kQuadUVIndices);
 
         // 16 image materials, ids 0..15 (textureId i, scale 1, offset 0).
+        // Sent as the frozen 18-byte v8 PglParamImage — the pre-V9 tolerance
+        // path (V9's grown 20-byte form with filterFlags is exercised by B8).
         for (uint16_t i = 0; i < kB3TexCount; ++i) {
             PglParamImage img{};
             img.textureId = i;
             img.offsetX = 0.0f; img.offsetY = 0.0f;
             img.scaleX  = 1.0f; img.scaleY  = 1.0f;
-            enc.CreateMaterial(i, PGL_MAT_IMAGE, PGL_BLEND_BASE, &img, sizeof(img));
+            enc.CreateMaterial(i, PGL_MAT_IMAGE, PGL_BLEND_BASE,
+                               &img, PGL_PARAM_IMAGE_V8_SIZE);
         }
 
         EncodePerspectiveCamera(enc, 0, -5.0f);
@@ -852,6 +859,249 @@ static size_t EncodeB4PsbPostFx(uint8_t* buf, size_t capacity, uint8_t frameInde
         enc.SetShaderUniform(i, PSB_USER_UNIFORM_START,
                              kB4Shaders[i].uniformValue);
     }
+
+    enc.EndFrame();
+
+    if (enc.HasOverflow()) {
+        std::fprintf(stderr, "[sim] ERROR: encoder overflow\n");
+        return kEncodeError;
+    }
+    return enc.GetLength();
+}
+
+// ─── Scene B7: 3D alpha blending (V9/G4) ────────────────────────────────────
+//
+// One cube mesh drawn three times over the plain (black) background:
+//   A — OPAQUE orange cube at mid depth (PGL_BLEND_BASE),
+//   B — translucent CYAN cube (alpha 0.45) CLOSER to the camera, overlapping
+//       A on screen: where it covers A the pixel is src·0.45 + A·0.55 (blend
+//       correctness), where it extends past A it darkens over the background,
+//   C — translucent MAGENTA cube (alpha 0.45) whose ENTIRE depth range sits
+//       behind A's (near z 1.7 > A's far z 1.5): fully occluded where it
+//       overlaps A's silhouette (Z interplay — the deferred translucent pass
+//       Z-tests against the finished opaque depth buffer), visible as a clean
+//       magenta-over-background strip where it peeks out past A's right edge.
+// Both translucent materials are created with CreateMaterialAlpha() — the
+// PGL_BLEND_ALPHA + appended-float-alpha wire convention (SIMPLE params are
+// 3 B, so the param block is 7 B).  The golden pins the exact blend values:
+// check() verifies B-over-A, B-over-background, C-over-background and the
+// opaque occlusion pixel to the byte.
+//
+// (Note: this pipeline's winding convention keeps each cube's FAR faces —
+// flat-coloured SIMPLE cubes still read as solid squares, and all depth
+// relationships above are stated in world-z so they hold regardless.)
+
+static size_t EncodeB7Alpha3D(uint8_t* buf, size_t capacity, uint8_t frameIndex) {
+    if (frameIndex > 0) return 0;   // single-frame scene
+    PglEncoder enc(buf, capacity);
+
+    enc.BeginFrame(1, 16666);
+
+    // Mesh 0: cube (no UV — SIMPLE materials).
+    enc.CreateMesh(0, kCubeVerts, kCubeVertCount, kCubeIndices, kCubeFaceCount);
+
+    // Material 0: opaque orange (blend BASE — untouched by the alpha path).
+    PglParamSimple orange{};
+    orange.r = 255; orange.g = 128; orange.b = 0;
+    enc.CreateMaterial(0, PGL_MAT_SIMPLE, PGL_BLEND_BASE,
+                       &orange, sizeof(orange));
+
+    // Material 1: translucent cyan, alpha 0.45 (appended float on the wire).
+    PglParamSimple cyan{};
+    cyan.r = 0; cyan.g = 200; cyan.b = 255;
+    enc.CreateMaterialAlpha(1, PGL_MAT_SIMPLE, &cyan, sizeof(cyan), 0.45f);
+
+    // Material 2: translucent magenta, alpha 0.45.
+    PglParamSimple magenta{};
+    magenta.r = 255; magenta.g = 0; magenta.b = 200;
+    enc.CreateMaterialAlpha(2, PGL_MAT_SIMPLE, &magenta, sizeof(magenta), 0.45f);
+
+    EncodePerspectiveCamera(enc, 0, -5.0f);
+
+    // Draw order is deliberately NOT back-to-front for the opaque cube —
+    // the GPU's Z-buffer + deferred translucent pass resolves it (the
+    // painter's-algorithm contract only concerns stacked translucents).
+    enc.DrawObject(0, 0,                                // A: opaque, mid depth
+                   { 0.3f, -0.1f, 0.3f }, kIdentityQuat,
+                   { 2.4f, 2.4f, 2.4f },
+                   kIdentityQuat, kIdentityQuat,
+                   { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f },
+                   true);
+    enc.DrawObject(0, 2,                                // C: translucent, BEHIND A
+                   { 2.9f, -0.35f, 2.5f }, kIdentityQuat,  // (near z 1.7 > A far 1.5)
+                   { 1.6f, 1.6f, 1.6f },
+                   kIdentityQuat, kIdentityQuat,
+                   { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f },
+                   true);
+    enc.DrawObject(0, 1,                                // B: translucent, CLOSER
+                   { -0.75f, 0.25f, -1.4f }, kIdentityQuat,
+                   { 1.5f, 1.5f, 1.5f },
+                   kIdentityQuat, kIdentityQuat,
+                   { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f },
+                   true);
+
+    enc.EndFrame();
+
+    if (enc.HasOverflow()) {
+        std::fprintf(stderr, "[sim] ERROR: encoder overflow\n");
+        return kEncodeError;
+    }
+    return enc.GetLength();
+}
+
+// ─── Scene B8: bilinear texture filtering (V9/G6) ───────────────────────────
+//
+// The SAME 8×8 texture drawn twice side by side, heavily magnified (~7 px
+// per texel): left half sampled NEAREST (material 0 — sent as the frozen
+// 18-byte v8 PglParamImage), right half sampled BILINEAR (material 1 —
+// grown 20-byte form, filterFlags bit0).  The texture is a 2×2-texel-cell
+// red/blue checkerboard, so the golden itself shows crisp texel blocks on
+// the left and smooth lerp ramps between cells on the right.  check()
+// verifies the left half contains ONLY pure texel colours while the right
+// half contains mixed (lerped) pixels.
+
+// Full-range UVs for the B8 quads (B3's kQuadUVs span only [0..0.5]²).
+static const PglVec2 kB8QuadUVs[] = {
+    { 0.0f, 0.0f }, { 1.0f, 0.0f }, { 1.0f, 1.0f }, { 0.0f, 1.0f },
+};
+
+static size_t EncodeB8Bilinear(uint8_t* buf, size_t capacity, uint8_t frameIndex) {
+    if (frameIndex > 0) return 0;   // single-frame scene
+    PglEncoder enc(buf, capacity);
+
+    enc.BeginFrame(1, 16666);
+
+    // Texture 0: 8×8 RGB565, 2×2-texel checker cells alternating red/blue.
+    static uint16_t b8Tex[8 * 8];
+    for (int y = 0; y < 8; ++y) {
+        for (int x = 0; x < 8; ++x) {
+            const int cx = x / 2, cy = y / 2;
+            b8Tex[y * 8 + x] = ((cx ^ cy) & 1) ? 0x001F /*blue*/ : 0xF800 /*red*/;
+        }
+    }
+    enc.CreateTexture(0, 8, 8, PGL_TEX_RGB565, b8Tex);
+
+    // Quad mesh 0 with full-range UVs.
+    enc.CreateMesh(0, kQuadVerts, 4, kQuadIndices, 2,
+                   true, kB8QuadUVs, 4, kQuadUVIndices);
+
+    // Material 0: NEAREST via the frozen 18-byte v8 PglParamImage form —
+    // exercises the parser's pre-V9 tolerance path (filterFlags absent → 0).
+    PglParamImage img{};
+    img.textureId = 0;
+    img.offsetX = 0.0f; img.offsetY = 0.0f;
+    img.scaleX  = 1.0f; img.scaleY  = 1.0f;
+    enc.CreateMaterial(0, PGL_MAT_IMAGE, PGL_BLEND_BASE,
+                       &img, PGL_PARAM_IMAGE_V8_SIZE);
+
+    // Material 1: BILINEAR via the grown 20-byte form (filterFlags bit0).
+    enc.CreateImageMaterial(1, PGL_BLEND_BASE, img, PGL_IMAGE_FILTER_BILINEAR);
+
+    EncodePerspectiveCamera(enc, 0, -5.0f);
+
+    // Two quads side by side, ~54 px each: camera z=-5 → 12.8 px/world-unit.
+    enc.DrawObject(0, 0,                                // left: nearest
+                   { -2.5f, 0.0f, 0.0f }, kIdentityQuat,
+                   { 4.2f, 4.2f, 1.0f },
+                   kIdentityQuat, kIdentityQuat,
+                   { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f },
+                   true);
+    enc.DrawObject(0, 1,                                // right: bilinear
+                   { 2.5f, 0.0f, 0.0f }, kIdentityQuat,
+                   { 4.2f, 4.2f, 1.0f },
+                   kIdentityQuat, kIdentityQuat,
+                   { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f },
+                   true);
+
+    enc.EndFrame();
+
+    if (enc.HasOverflow()) {
+        std::fprintf(stderr, "[sim] ERROR: encoder overflow\n");
+        return kEncodeError;
+    }
+    return enc.GetLength();
+}
+
+// ─── Scene B9: multi-camera + render-to-layer (V9 G3/G7) ────────────────────
+//
+// THREE active cameras over ONE shared draw list (cube + teapot):
+//   cam0: z=-5,          → layer 0, viewport (0,0,64,64)   — LEFT half: cube
+//   cam1: z=-3 (closer), → layer 0, viewport (64,0,64,64)  — RIGHT half: teapot
+//   cam2: (0,1.2,-5),    → LAYER 3 (64×32), viewport (4,4,56,24) — "3D-in-UI"
+// The projection is full-frame for every camera; the viewport is a pure
+// scissor, so each pass writes only its half/window (cam1's pass re-renders
+// the cube but it lands at screen x<0 / outside the scissor; cam0's pass
+// re-renders the teapot at x≈93 — clipped to the right half).
+//
+// Layer 3 composites OPAQUE at offset (32,16) over the split screen — the
+// 3D window in the middle.  NOTE the frame ordering (mirrors gpu_core.cpp):
+// the 2D queue runs AFTER the 3D passes, so a same-frame LAYER_CLEAR on a
+// 3D target would ERASE the 3D content (the 3D pass clears its own viewport
+// to black).  B9 therefore draws 2D *over* the 3D instead: a navy title bar
+// and a white frame outline — the "UI" around the 3D viewport.
+//
+// check() pins: left/right content, in-window 3D content, the navy bar and
+// white frame on top of the 3D layer, the black 3D background inside the
+// viewport, and no bleed outside the window / viewport edges.
+
+static size_t EncodeB9Multicam(uint8_t* buf, size_t capacity, uint8_t frameIndex) {
+    if (frameIndex > 0) return 0;   // single-frame scene
+    PglEncoder enc(buf, capacity);
+
+    enc.BeginFrame(1, 16666);
+
+    // Mesh 0: cube;  mesh 1: Utah teapot (real data, as B1).
+    enc.CreateMesh(0, kCubeVerts, kCubeVertCount, kCubeIndices, kCubeFaceCount);
+    enc.CreateMesh(1, kTeapotVerts, kTeapotVertCount,
+                   kTeapotIndices, kTeapotFaceCount);
+
+    // Material 0: warm directional light (shared by both draws).
+    EncodeWarmLightMaterial(enc, 0);
+
+    // Layer 3: 64×32 opaque window at offset (32,16) — the 3D-in-UI target.
+    // MUST be created before cam2 targets it (the parser validates targets
+    // against existing layers, fail-closed).
+    enc.LayerCreate(3, 64, 32, 0, PGL_LAYER_BLEND_ALPHA, 255);
+    enc.LayerSetProps(3, 255, PGL_LAYER_BLEND_ALPHA, 32, 16);
+
+    // cam0: left half of the back buffer.
+    EncodePerspectiveCamera(enc, 0, -5.0f);
+    enc.SetCameraTarget(0, 0, 0, 0, 64, 64, PGL_CAMERA_TARGET_SCISSOR);
+
+    // cam1: right half of the back buffer, closer view.
+    EncodePerspectiveCamera(enc, 1, -3.0f);
+    enc.SetCameraTarget(1, 0, 64, 0, 64, 64, PGL_CAMERA_TARGET_SCISSOR);
+
+    // cam2: into layer 3, scissored to (4,4,56,24) inside the 64×32 FB.
+    // Camera raised to y=1.2 so the cube projects into the layer's panel
+    // region (layer space == panel space, origin-aligned).
+    enc.SetCamera(2, 0,
+                  { 0.0f, 1.2f, -5.0f }, kIdentityQuat,
+                  { 1.0f, 1.0f, 1.0f }, kIdentityQuat, kIdentityQuat, false);
+    enc.SetCameraTarget(2, 3, 4, 4, 56, 24, PGL_CAMERA_TARGET_SCISSOR);
+
+    // 2D "UI" over the 3D layer (executed after the 3D pass — see header):
+    // navy title bar + white frame outline.
+    enc.DrawRect2D(3, 0, 0, 64, 6, 0x0841, true);    // filled navy title bar
+    enc.DrawRect2D(3, 0, 6, 64, 26, 0xFFFF, false);  // white frame outline
+
+    // Draw 1: cube, world x=-3.75 → left half at z=5 (cam0) / into the layer
+    // window (cam2); lands at screen x<0 in cam1's closer view (culled).
+    enc.DrawObject(0, 0,
+                   { -3.75f, 0.0f, 0.0f }, GentleTilt(),
+                   { 1.2f, 1.2f, 1.2f },
+                   kIdentityQuat, kIdentityQuat,
+                   { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f },
+                   true);
+
+    // Draw 2: teapot, world x=+2.4 → right half at z=3 (cam1); clipped out of
+    // cam0's left-half scissor and outside cam2's layer region (x≈95 > 64).
+    enc.DrawObject(1, 0,
+                   { 2.4f, 0.0f, 0.0f }, GentleTilt(),
+                   { 0.35f, 0.35f, 0.35f },
+                   kIdentityQuat, kIdentityQuat,
+                   { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f },
+                   true);
 
     enc.EndFrame();
 
@@ -977,6 +1227,99 @@ static bool CheckB2Scene(const uint16_t* fb, uint16_t w, uint16_t h) {
     return ok;
 }
 
+/// B7 (G4): pin the exact ROP blend results at four probe pixels:
+///   (55,35) — translucent cyan (α=0.45) over opaque orange  → 0x8D0D
+///   (37,38) — translucent cyan over the black background    → 0x02CD
+///   (95,28) — translucent magenta over the black background → 0x680B
+///   (86,28) — opaque orange where A occludes the behind cube → 0xFC00
+/// Expected values derived from the ROP formula dst = src·a + dst·(1−a)
+/// (per-channel float, truncated, a = 0.45f) on the unpacked RGB565 channels.
+static bool CheckB7Scene(const uint16_t* fb, uint16_t w, uint16_t h) {
+    if (!CheckCoverage(fb, w, h, 1500, 0)) return false;
+    bool ok = true;
+    auto probe = [&](uint16_t x, uint16_t y, uint16_t expect, const char* what) {
+        const uint16_t got = fb[y * w + x];
+        const bool good = (got == expect);
+        std::printf("  [%s] %s (%u,%u) == 0x%04X (got 0x%04X)\n",
+                    good ? " OK " : "FAIL", what, x, y, expect, got);
+        if (!good) ok = false;
+    };
+    probe(55, 35, 0x8D0D, "cyan a=0.45 over opaque orange");
+    probe(37, 38, 0x02CD, "cyan a=0.45 over background   ");
+    probe(95, 28, 0x680B, "magenta a=0.45 over background ");
+    probe(86, 28, 0xFC00, "opaque occludes behind-cube   ");
+    return ok;
+}
+
+/// B8 (G6): left quad (x 5..59) is nearest-sampled — every pixel must be a
+/// PURE texel colour (0xF800 red or 0x001F blue).  Right quad (x 69..123) is
+/// bilinear — must contain mixed (lerped) pixels, and the two halves must
+/// differ.  Quad rects are generous (full interior incl. ramps).
+static bool CheckB8Scene(const uint16_t* fb, uint16_t w, uint16_t h) {
+    if (!CheckCoverage(fb, w, h, 4000, 0)) return false;
+
+    bool ok = true;
+    uint32_t leftImpure = 0, rightMixed = 0, halvesDiffer = 0;
+    for (uint16_t y = 5; y < 59; ++y) {
+        for (uint16_t x = 5; x < 59; ++x) {
+            const uint16_t c = fb[y * w + x];
+            if (c != 0xF800 && c != 0x001F) ++leftImpure;
+        }
+        for (uint16_t x = 69; x < 123; ++x) {
+            const uint16_t c = fb[y * w + x];
+            const uint8_t r = (c >> 11) & 0x1F, b = c & 0x1F;
+            if (r > 0 && b > 0) ++rightMixed;
+        }
+        // Same relative position inside each quad (54 px pitch, offset 64).
+        for (uint16_t x = 5; x < 59; ++x) {
+            if (fb[y * w + x] != fb[y * w + x + 64]) ++halvesDiffer;
+        }
+    }
+
+    auto check = [&](bool cond, const char* what, uint32_t got) {
+        std::printf("  [%s] %s (got %u)\n", cond ? " OK " : "FAIL", what, got);
+        if (!cond) ok = false;
+    };
+    check(leftImpure == 0,  "nearest half: pure texel colours only", leftImpure);
+    check(rightMixed > 100, "bilinear half: mixed lerp pixels present", rightMixed);
+    check(halvesDiffer > 100, "halves differ (filter actually applied)", halvesDiffer);
+    return ok;
+}
+
+/// B9 (G3/G7): pin the multi-camera structure — left-half cube (cam0,
+/// scissor (0,0,64,64)), right-half teapot (cam1, scissor (64,0,64,64)), and
+/// the layer-3 3D window composited at (32,16) with 2D UI drawn over it.
+/// All screen coordinates: window = x[32,96) × y[16,48).
+static bool CheckB9Scene(const uint16_t* fb, uint16_t w, uint16_t h) {
+    if (!CheckCoverage(fb, w, h, 1500, 0)) return false;
+    bool ok = true;
+    auto probe = [&](uint16_t x, uint16_t y, uint16_t expect, const char* what) {
+        const uint16_t got = fb[y * w + x];
+        const bool good = (got == expect);
+        std::printf("  [%s] %s (%u,%u) == 0x%04X (got 0x%04X)\n",
+                    good ? " OK " : "FAIL", what, x, y, expect, got);
+        if (!good) ok = false;
+    };
+    auto probeNonBlack = [&](uint16_t x, uint16_t y, const char* what) {
+        const uint16_t got = fb[y * w + x];
+        const bool good = (got != 0x0000);
+        std::printf("  [%s] %s (%u,%u) != black (got 0x%04X)\n",
+                    good ? " OK " : "FAIL", what, x, y, got);
+        if (!good) ok = false;
+    };
+    probeNonBlack(16, 32,  "cam0 left-half cube content        ");
+    probeNonBlack(115, 32, "cam1 right-half teapot content     ");
+    probeNonBlack(48, 32,  "cam2 3D cube inside the layer window");
+    probe(33, 17, 0x0841,  "navy 2D title bar over the 3D layer");
+    probe(32, 22, 0xFFFF,  "white 2D frame over the 3D layer   ");
+    probe(62, 32, 0x0000,  "3D viewport background inside window ");
+    probe(31, 32, 0x0000,  "one px left of window (offset exact)");
+    probe(16, 10, 0x0000,  "left half above window (no bleed)   ");
+    probe(63, 60, 0x0000,  "cam0 half, below window (no bleed)  ");
+    probe(64, 60, 0x0000,  "cam1 half, below teapot (no bleed)  ");
+    return ok;
+}
+
 // ─── Scene registry ─────────────────────────────────────────────────────────
 // Each scene = one or more encoded frames + one rendered PPM.  B1–B6 are the
 // frozen benchmark suite of docs/OPTIMIZATION_PLAN.md §2; "cube" is the A5-1
@@ -1030,6 +1373,17 @@ static const SceneDef kScenes[] = {
 
     { "B6_empty",     "B6 empty frame (BeginFrame/EndFrame only, baseline)",
       EncodeB6Empty, 0, 0, 0, CheckEmptyScene },
+
+    { "B7_alpha3d",   "B7 V9/G4 3D alpha: opaque + 2 translucent cubes (Z interplay)",
+      EncodeB7Alpha3D, 3, 3 * kCubeFaceCount, 3 * kCubeFaceCount, CheckB7Scene },
+
+    { "B8_bilinear",  "B8 V9/G6 bilinear: same texture, nearest left vs bilinear right",
+      EncodeB8Bilinear, 2, 4, 4, CheckB8Scene },
+
+    // triMin/triMax cover PrepareFrame's first pass only (cam0: cube 12 +
+    // teapot 1166); the cam1/cam2 passes add 2×1178 after the registry check.
+    { "B9_multicam",  "B9 V9/G3+G7: 3 cameras — split-screen + 3D-in-UI layer",
+      EncodeB9Multicam, 2, 1178, 1178, CheckB9Scene },
 };
 
 static constexpr size_t kSceneCount = sizeof(kScenes) / sizeof(kScenes[0]);
@@ -1140,19 +1494,49 @@ static int RunScene(const SceneDef& scene, const char* ppmPath) {
         return 1;
     }
 
-    // ── 5. Phase 2: serial tile rasterization ───────────────────────────
+    // ── 5. Phase 2: serial tile rasterization (per camera pass) ─────────
     // 1:1 serial replica of PglTileScheduler::ProcessTiles(): same Morton
     // order, same per-tile RasterizeTile() call.  The firmware scheduler
     // itself is not compilable here (RP2350 multicore FIFO); on hardware the
     // two cores write disjoint tiles, so the serial pass is equivalent.
+    //
+    // V9 (G3/G7): the frame is a SEQUENCE of per-camera passes.  PrepareFrame
+    // bound the first valid back-buffer camera (the v8 legacy binding —
+    // single-camera scenes render bit-identically to before); the loop below
+    // renders that pass, then iterates PrepareNextCameraPass() for every
+    // remaining active camera, each into its resolved target (layer FB or
+    // back buffer).  Cameras sharing one target render in slot order.
     const Clock::time_point tRaster = Clock::now();
-    for (uint32_t idx = 0; idx < TileConfig::TILE_COUNT; ++idx) {
-        uint8_t  linearId = TileConfig::MORTON_ORDER[idx];
-        uint16_t tileCol  = linearId % TileConfig::COLS;
-        uint16_t tileRow  = linearId / TileConfig::COLS;
-        rasterizer.RasterizeTile(backBuffer, zBuffer,
-                                 tileCol, tileRow,
-                                 TileConfig::TILE_W, TileConfig::TILE_H);
+    int renderedPasses = 0;
+    auto runTilePass = [&](uint16_t* fb) {
+        for (uint32_t idx = 0; idx < TileConfig::TILE_COUNT; ++idx) {
+            uint8_t  linearId = TileConfig::MORTON_ORDER[idx];
+            uint16_t tileCol  = linearId % TileConfig::COLS;
+            uint16_t tileRow  = linearId / TileConfig::COLS;
+            rasterizer.RasterizeTile(fb, zBuffer,
+                                     tileCol, tileRow,
+                                     TileConfig::TILE_W, TileConfig::TILE_H);
+        }
+        ++renderedPasses;
+    };
+    {
+        const int8_t firstCam = rasterizer.GetPreparedCameraIndex();
+        if (firstCam >= 0) {
+            CameraTargetInfo ti = sceneState.ResolveCameraTarget(
+                static_cast<uint8_t>(firstCam), backBuffer, W, H);
+            if (ti.valid && ti.fb) runTilePass(ti.fb);
+        }
+        uint8_t camIdx = 0;
+        while (rasterizer.PrepareNextCameraPass(&sceneState, &camIdx)) {
+            CameraTargetInfo ti =
+                sceneState.ResolveCameraTarget(camIdx, backBuffer, W, H);
+            if (ti.valid && ti.fb) runTilePass(ti.fb);
+        }
+        if (renderedPasses == 0) {
+            // Legacy no-camera frame: one empty pass clears the frame to
+            // black (v8 behaviour for scenes without an active camera).
+            runTilePass(backBuffer);
+        }
     }
     timing.rasterMs = MsSince(tRaster);
 

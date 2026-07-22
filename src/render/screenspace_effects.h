@@ -44,6 +44,10 @@ namespace ScreenspaceShaders {
  * read-from-src / write-to-dst semantics.  The caller typically passes the
  * Z-buffer (reinterpreted as uint16_t*) since Z data is stale post-raster.
  *
+ * Programmable (PSB) shader passes are split into two horizontal row bands
+ * run on both cores (S-02, PairDispatch::Run); the split is pixel-exact and
+ * falls back to sequential execution on single-core targets (desktop sim).
+ *
  * @param framebuffer   Back-buffer being composed (RGB565, width × height).
  * @param scratchBuffer Temporary buffer, at least width × height × 2 bytes.
  * @param width         Panel width in pixels.

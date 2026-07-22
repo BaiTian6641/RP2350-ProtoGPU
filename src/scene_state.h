@@ -113,7 +113,12 @@ struct MaterialSlot {
     PglMaterialType type     = PGL_MAT_SIMPLE;
     PglBlendMode   blendMode = PGL_BLEND_BASE;
     uint8_t        params[60] = {};   // type-specific, copied verbatim from wire
-                                      // (max: 7-stop gradient = 59 B)
+                                      // (max: 7-stop gradient = 59 B); bytes past
+                                      // the received paramSize are zeroed by the
+                                      // parser (grown-struct feature bytes read 0)
+    float          alpha     = 1.0f;  // V9 (G4): blend alpha for PGL_BLEND_ALPHA,
+                                      // extracted by the parser from the appended
+                                      // trailing float (default 1.0f = opaque)
 };
 
 struct TextureSlot {
@@ -170,6 +175,18 @@ struct CameraSlot {
     PglQuat lookOffset    = {};
     PglQuat baseRotation  = {};
     bool    is2D          = false;
+
+    // V9 (G3/G7): render target + viewport scissor (CMD_SET_CAMERA_TARGET).
+    // All-zero defaults = layer 0 (back buffer) + full frame = v8 semantics.
+    // The fields persist per slot (orthogonal to SET_CAMERA, which never
+    // touches them); the frame signature folds them like the other camera
+    // state, so writes invalidate the skip-cache with no version counter.
+    uint8_t  targetLayer = 0;   // 0 = back buffer; 1–7 = layers[targetLayer]
+    uint8_t  vpFlags     = 0;   // PglCameraTargetFlags (bit0: scissor enable)
+    uint16_t vpX         = 0;   // viewport rect in target pixels (used only
+    uint16_t vpY         = 0;   // when vpFlags bit0 set; parser clamps to the
+    uint16_t vpW         = 0;   // target dims, render re-clamps)
+    uint16_t vpH         = 0;
 
     // Screen-space post-processing shaders (applied in slot order after rasterization)
     ShaderSlot shaders[PGL_MAX_SHADERS_PER_CAMERA];
@@ -247,6 +264,21 @@ struct DrawCmd2D {
 // With packing: compiler may pad to 17. 128 commands × 17 bytes ≈ 2.2 KB per-frame budget
 static_assert(sizeof(DrawCmd2D) <= 20, "DrawCmd2D should be compact (≤20 bytes)");
 
+// ─── Camera Render-Target Resolution (V9 G3/G7) ────────────────────────────
+// Single source of truth shared by the parser doc, the rasterizer's
+// per-camera pass setup, and the frame drivers (gpu_core.cpp / sim_main.cpp).
+
+struct CameraTargetInfo {
+    uint16_t* fb = nullptr;   ///< Target framebuffer (backBuf for layer 0, layer
+                              ///< FB otherwise); nullptr when invalid OR when the
+                              ///< caller passed backBuf=nullptr (rasterizer use —
+                              ///< it only needs dims/scissor/valid, never the FB)
+    uint16_t  width  = 0;     ///< Target dims in pixels (panel dims for layer 0)
+    uint16_t  height = 0;
+    uint16_t  scX0 = 0, scY0 = 0, scX1 = 0, scY1 = 0;  ///< Effective scissor, exclusive
+    bool      valid  = false; ///< Target layer exists (renderable) — fail-closed
+};
+
 // ─── Scene State ────────────────────────────────────────────────────────────
 // The main GPU-side data structure.  Owned by gpu_core.cpp (static lifetime).
 
@@ -280,6 +312,28 @@ struct SceneState {
     // reset must never reproduce a pre-reset signature (Reset wipes the slot
     // data these versions describe, so the versions must keep counting).
     uint32_t        meshVersion       [GpuConfig::MAX_MESHES]     = {};
+
+    // ── Material / texture content versions (F-04 extension, V9 wave) ──────
+    // Same logical-clock pattern as meshVersion: bumped by the parser on
+    // EVERY content-changing write (CREATE/UPDATE/DESTROY for materials,
+    // CREATE/DESTROY for textures — success paths only; validation-failure
+    // early-returns change no state and do not bump).  Closes the stale-skip
+    // gap where a param update or texture re-upload on an otherwise-static
+    // scene was invisible to the frame signature.  Equally MONOTONIC across
+    // Reset() (same rationale as meshVersion above).
+    uint32_t        materialVersion   [GpuConfig::MAX_MATERIALS]  = {};
+    uint32_t        textureVersion    [GpuConfig::MAX_TEXTURES]   = {};
+
+    // ── Shader-state version (F-04 extension, V9 wave) ─────────────────────
+    // Single GLOBAL logical clock for ALL shader-state writes
+    // (CREATE/DESTROY/BIND_SHADER_PROGRAM, SET_SHADER, SET_SHADER_UNIFORM —
+    // success paths only).  Screen-space post-FX state is small and
+    // cross-cutting (camera shader slots + program uniforms), so one counter
+    // covers it; the frame signature folds it unconditionally.  Without it a
+    // uniform-only animation on a static scene is frame-skipped frozen (the
+    // skip also skips ApplyShaders).  MONOTONIC across Reset() like the
+    // per-slot versions.
+    uint32_t        shaderStateVersion = 0;
 
     // ── Programmable shader programs ────────────────────────────────────────
     ShaderProgram   shaderPrograms[PGL_MAX_SHADER_PROGRAMS];
@@ -462,6 +516,58 @@ struct SceneState {
         if (layerId == 0 || layerId >= PGL_MAX_LAYERS) return;
         LayerSlot& l = layers[layerId];
         if (l.pixels) { free(l.pixels); l.pixels = nullptr; }
+    }
+
+    // ── Camera render-target resolution (V9 G3/G7) ─────────────────────────
+
+    /// Resolve a camera slot's render target (CMD_SET_CAMERA_TARGET state).
+    /// Layer 0 = the 3D back buffer (always valid, panel-sized); layers 1–7
+    /// must be active with an allocated framebuffer.  The effective scissor
+    /// is the camera's viewport clamped to the target dims (whole target
+    /// when the scissor flag is clear).  `valid == false` means the target
+    /// is gone (e.g. layer destroyed after targeting) — callers skip the
+    /// camera's pass, fail-closed.  Pass backBuf = nullptr when only
+    /// dims/scissor/valid are needed (the rasterizer never touches the FB).
+    CameraTargetInfo ResolveCameraTarget(uint8_t camIdx, uint16_t* backBuf,
+                                         uint16_t panelW, uint16_t panelH) const {
+        CameraTargetInfo ti;
+        if (camIdx >= PGL_MAX_CAMERAS) return ti;  // valid=false
+        const CameraSlot& cam = cameras[camIdx];
+
+        if (cam.targetLayer == PGL_LAYER_3D) {
+            ti.fb     = backBuf;
+            ti.width  = panelW;
+            ti.height = panelH;
+            ti.valid  = true;
+        } else if (cam.targetLayer < PGL_MAX_LAYERS) {
+            const LayerSlot& l = layers[cam.targetLayer];
+            if (!l.active || !l.pixels || l.width == 0 || l.height == 0) {
+                return ti;  // valid=false — fail-closed
+            }
+            ti.fb     = l.pixels;
+            ti.width  = l.width;
+            ti.height = l.height;
+            ti.valid  = true;
+        }
+        if (!ti.valid) return ti;
+
+        if (cam.vpFlags & PGL_CAMERA_TARGET_SCISSOR) {
+            // Clamp the viewport rect to the target dims (u32 math: the wire
+            // fields are u16 and vpX+vpW can overflow u16).
+            const uint32_t x0 = (cam.vpX < ti.width)  ? cam.vpX : ti.width;
+            const uint32_t y0 = (cam.vpY < ti.height) ? cam.vpY : ti.height;
+            uint32_t x1 = static_cast<uint32_t>(cam.vpX) + cam.vpW;
+            uint32_t y1 = static_cast<uint32_t>(cam.vpY) + cam.vpH;
+            if (x1 > ti.width)  x1 = ti.width;
+            if (y1 > ti.height) y1 = ti.height;
+            ti.scX0 = static_cast<uint16_t>(x0);
+            ti.scY0 = static_cast<uint16_t>(y0);
+            ti.scX1 = static_cast<uint16_t>((x1 > x0) ? x1 : x0);
+            ti.scY1 = static_cast<uint16_t>((y1 > y0) ? y1 : y0);
+        } else {
+            ti.scX0 = 0; ti.scY0 = 0; ti.scX1 = ti.width; ti.scY1 = ti.height;
+        }
+        return ti;
     }
 
     // ── Pool deallocation helpers (true random free via the scene heap) ─────

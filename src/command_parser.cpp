@@ -198,6 +198,9 @@ static void HandleDestroyShaderProgram(const uint8_t*& ptr, SceneState* scene);
 static void HandleBindShaderProgram(const uint8_t*& ptr, SceneState* scene);
 static void HandleSetShaderUniform(const uint8_t*& ptr, uint16_t payloadLen, SceneState* scene);
 
+// V9 (G3/G7): per-camera render target + viewport (0x88)
+static void HandleSetCameraTarget(const uint8_t*& ptr, SceneState* scene);
+
 // ── M12: 2D Layer & Draw Command handlers (0xA0 – 0xAC) ────────────────────
 static void HandleLayerCreate(const uint8_t*& ptr, SceneState* scene);
 static void HandleLayerDestroy(const uint8_t*& ptr, SceneState* scene);
@@ -370,6 +373,11 @@ CommandParser::ParseResult CommandParser::Parse(
                 break;
             case PGL_CMD_SET_SHADER_UNIFORM:
                 HandleSetShaderUniform(ptr, cmdHdr.payloadLength, scene);
+                break;
+
+            // V9 (G3/G7): per-camera render target + viewport (0x88)
+            case PGL_CMD_SET_CAMERA_TARGET:
+                HandleSetCameraTarget(ptr, scene);
                 break;
 
             // ── M12: Memory defrag (0x3C) ───────────────────────────────
@@ -663,6 +671,71 @@ static void HandleUpdateVerticesDelta(const uint8_t*& ptr, uint16_t payloadLen,
     mesh.RecomputeAABB();
 }
 
+// ─── V9 (G4/G6): Material Parameter Tolerance ───────────────────────────────
+// The wire param block of a material may legitimately arrive in several
+// lengths (append-only growth): the frozen v8 base size, grown forms
+// (PglParamImage 18 → 20 with filterFlags), and — when blendMode is
+// PGL_BLEND_ALPHA — any of those ENDING with an appended float alpha.
+// The helpers below normalise a freshly received block so the rasterizer
+// never has to know which form was sent.
+
+/// Base (v8) param size per material type, excluding any appended alpha.
+/// Returns 0xFFFF for unknown/invalid types (no alpha extraction; the
+/// material renders the unknown-type fallback anyway).
+static uint16_t BaseMaterialParamSize(PglMaterialType type,
+                                      const uint8_t* params,
+                                      uint16_t paramSize) {
+    switch (type) {
+        case PGL_MAT_SIMPLE:         return sizeof(PglParamSimple);        // 3
+        case PGL_MAT_NORMAL:         return 0;
+        case PGL_MAT_DEPTH:          return sizeof(PglParamDepth);         // 14
+        case PGL_MAT_GRADIENT: {
+            // 1 (stopCount) + stopCount × PglGradientStop + 9 (axis + range)
+            if (paramSize < 1) return 0xFFFF;
+            const uint8_t stops = params[0];
+            if (stops < 1 || stops > 7) return 0xFFFF;  // invalid → renders black
+            return static_cast<uint16_t>(1 + stops * sizeof(PglGradientStop) + 9);
+        }
+        case PGL_MAT_LIGHT:          return sizeof(PglParamLight);         // 18
+        case PGL_MAT_SIMPLEX_NOISE:  return sizeof(PglParamSimplexNoise);  // 22
+        case PGL_MAT_RAINBOW_NOISE:  return sizeof(PglParamRainbowNoise);  // 8
+        case PGL_MAT_IMAGE:          return PGL_PARAM_IMAGE_V8_SIZE;       // 18
+        case PGL_MAT_COMBINE:        return sizeof(PglParamCombine);       // 9
+        case PGL_MAT_MASK:           return sizeof(PglParamMask);          // 8
+        case PGL_MAT_ANIMATOR:       return sizeof(PglParamAnimator);      // 9
+        case PGL_MAT_PRERENDERED:    return sizeof(PglParamPreRendered);   // 2
+        default:                     return 0xFFFF;
+    }
+}
+
+/// Normalise a freshly written material param block (CREATE and UPDATE):
+///  * Zero the tail past paramSize.  Feature bytes introduced by append-only
+///    struct growth (PglParamImage.filterFlags at byte 18) then read 0 =
+///    v8 semantics when a host sends the short form, and a re-created slot
+///    never leaks stale bytes from its previous contents.
+///  * G4 alpha: when blendMode == PGL_BLEND_ALPHA the params are expected to
+///    END with an appended little-endian float alpha (0..1).  Read it only
+///    when paramSize covers the type's base size + 4 (payloadLength-driven
+///    tolerance: v8 hosts send no alpha and behave as opaque), clamped to
+///    [0,1]; otherwise default 1.0f.
+static void FinalizeMaterialParams(MaterialSlot& mat, uint16_t paramSize) {
+    if (paramSize < sizeof(mat.params)) {
+        std::memset(mat.params + paramSize, 0, sizeof(mat.params) - paramSize);
+    }
+
+    float alpha = 1.0f;
+    if (mat.blendMode == PGL_BLEND_ALPHA) {
+        const uint16_t base = BaseMaterialParamSize(mat.type, mat.params, paramSize);
+        if (static_cast<uint32_t>(paramSize) >= static_cast<uint32_t>(base) + 4u) {
+            float a;
+            std::memcpy(&a, mat.params + paramSize - sizeof(float), sizeof(float));
+            // Fail-safe clamp (host contract is already 0..1)
+            alpha = (a < 0.0f) ? 0.0f : (a > 1.0f) ? 1.0f : a;
+        }
+    }
+    mat.alpha = alpha;
+}
+
 static void HandleCreateMaterial(const uint8_t*& ptr, uint16_t payloadLen,
                                  SceneState* scene) {
     PglCmdCreateMaterialHeader hdr;
@@ -692,7 +765,12 @@ static void HandleCreateMaterial(const uint8_t*& ptr, uint16_t payloadLen,
     if (paramSize > 0) {
         std::memcpy(mat.params, ptr, paramSize);
     }
+    FinalizeMaterialParams(mat, paramSize);   // V9: tail zero + alpha extract
     PglSkip(ptr, payloadLen - sizeof(hdr));
+
+    // Material content written (initial create AND re-gen overwrite) —
+    // bump the content version (F-04).
+    scene->materialVersion[matIdx]++;
 }
 
 static void HandleUpdateMaterial(const uint8_t*& ptr, uint16_t payloadLen,
@@ -713,7 +791,13 @@ static void HandleUpdateMaterial(const uint8_t*& ptr, uint16_t payloadLen,
     if (paramSize > 0) {
         std::memcpy(mat.params, ptr, paramSize);
     }
+    // V9: re-derive with the slot's existing blendMode (UPDATE carries no
+    // blendMode field; an update without appended alpha resets to opaque).
+    FinalizeMaterialParams(mat, paramSize);
     PglSkip(ptr, payloadLen - sizeof(hdr));
+
+    // Material content written — bump the content version (F-04).
+    scene->materialVersion[PglHandleIndex(hdr.materialId)]++;
 }
 
 static void HandleDestroyMaterial(const uint8_t*& ptr, SceneState* scene) {
@@ -724,6 +808,9 @@ static void HandleDestroyMaterial(const uint8_t*& ptr, SceneState* scene) {
     if (!ValidateMaterialHandle(scene, cmd.materialId)) return;
 
     scene->materials[PglHandleIndex(cmd.materialId)].active = false;
+    // Slot content removed — bump the content version (F-04) so a cached
+    // frame signature that referenced this material is invalidated.
+    scene->materialVersion[PglHandleIndex(cmd.materialId)]++;
 }
 
 static void HandleCreateTexture(const uint8_t*& ptr, uint16_t payloadLen,
@@ -770,6 +857,10 @@ static void HandleCreateTexture(const uint8_t*& ptr, uint16_t payloadLen,
     // Copy pixel data into pool memory
     std::memcpy(tex.pixels, ptr, pixelDataSize);
     PglSkip(ptr, payloadLen - sizeof(hdr));
+
+    // Texture content written (initial create AND re-gen overwrite) —
+    // bump the content version (F-04).
+    scene->textureVersion[texIdx]++;
 }
 
 static void HandleDestroyTexture(const uint8_t*& ptr, SceneState* scene) {
@@ -782,6 +873,9 @@ static void HandleDestroyTexture(const uint8_t*& ptr, SceneState* scene) {
     TextureSlot& tex = scene->textures[PglHandleIndex(cmd.textureId)];
     scene->FreeTexturePixels(tex.pixels);
     tex = TextureSlot{};  // zero the slot (generation byte retained; slot inactive)
+    // Slot content removed — bump the content version (F-04) so a cached
+    // frame signature that referenced this texture is invalidated.
+    scene->textureVersion[PglHandleIndex(cmd.textureId)]++;
 }
 
 static void HandleSetPixelLayout(const uint8_t*& ptr, uint16_t payloadLen,
@@ -907,6 +1001,61 @@ static void HandleSetCamera(const uint8_t*& ptr, SceneState* scene) {
     cam.is2D        = cmd.is2D != 0;
 }
 
+// V9 (G3/G7): per-camera render target + viewport scissor (0x88, additive
+// under protocol v8 — old GPUs skip this opcode via the UNKNOWN_OPCODE path).
+// Fail-closed per the v8 pattern: invalid camera/layer ids and non-existent
+// layer targets are counted as parser errors and the command is dropped.
+// The target layer must EXIST at parse time (hosts create layers before
+// targeting them); render-time resolution re-validates every frame, so a
+// layer destroyed after targeting simply disables that camera's output.
+// Like SET_CAMERA, this bumps no version counter — the frame signature folds
+// the camera slot fields, so target/viewport writes invalidate the
+// skip-cache through the same path (F-04).
+static void HandleSetCameraTarget(const uint8_t*& ptr, SceneState* scene) {
+    PglCmdSetCameraTarget cmd;
+    PglReadStruct(ptr, cmd);
+
+    if (cmd.cameraId >= PGL_MAX_CAMERAS) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
+        return;
+    }
+    if (cmd.targetLayer >= PGL_MAX_LAYERS) {
+        CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
+        return;
+    }
+
+    // Target dims for the viewport clamp: layer 0 = back buffer (panel-sized,
+    // always valid); layers 1–7 must be active with an allocated FB NOW.
+    uint16_t targetW = GpuConfig::PANEL_WIDTH;
+    uint16_t targetH = GpuConfig::PANEL_HEIGHT;
+    if (cmd.targetLayer != PGL_LAYER_3D) {
+        const LayerSlot& l = scene->layers[cmd.targetLayer];
+        if (!l.active || !l.pixels || l.width == 0 || l.height == 0) {
+            CommandParser::NoteParserError(PGL_PERR_INVALID_VALUE);
+            return;
+        }
+        targetW = l.width;
+        targetH = l.height;
+    }
+
+    CameraSlot& cam = scene->cameras[cmd.cameraId];
+    cam.targetLayer = cmd.targetLayer;
+    cam.vpFlags     = cmd.flags & PGL_CAMERA_TARGET_SCISSOR;  // mask to defined bits
+
+    // Clamp the viewport rect to the CURRENT target dims (u32 math against
+    // u16 overflow; render-time resolution re-clamps — a layer re-created
+    // with different dims can never push the scissor out of bounds).
+    const uint32_t x0 = (cmd.vpX < targetW) ? cmd.vpX : targetW;
+    const uint32_t y0 = (cmd.vpY < targetH) ? cmd.vpY : targetH;
+    uint32_t w = cmd.vpW, h = cmd.vpH;
+    if (x0 + w > targetW) w = targetW - x0;
+    if (y0 + h > targetH) h = targetH - y0;
+    cam.vpX = static_cast<uint16_t>(x0);
+    cam.vpY = static_cast<uint16_t>(y0);
+    cam.vpW = static_cast<uint16_t>(w);
+    cam.vpH = static_cast<uint16_t>(h);
+}
+
 static void HandleSetShader(const uint8_t*& ptr, SceneState* scene) {
     PglCmdSetShader cmd;
     PglReadStruct(ptr, cmd);
@@ -927,6 +1076,9 @@ static void HandleSetShader(const uint8_t*& ptr, SceneState* scene) {
     slot.shaderClass = cmd.shaderClass;
     slot.intensity   = cmd.intensity;
     std::memcpy(slot.params, cmd.params, sizeof(slot.params));
+
+    // Shader state written — bump the global state version (F-04).
+    scene->shaderStateVersion++;
 }
 
 // ─── Programmable Shader Handlers (0x84 – 0x87) ────────────────────────────
@@ -1004,6 +1156,9 @@ static void HandleCreateShaderProgram(const uint8_t*& ptr, uint16_t payloadLen,
 
     printf("[Parser] Created shader program %u: %u uniforms, %u consts, %u instrs\n",
            cmd.programId, psbHdr.uniformCount, psbHdr.constCount, psbHdr.instrCount);
+
+    // Shader state written — bump the global state version (F-04).
+    scene->shaderStateVersion++;
 }
 
 static void HandleDestroyShaderProgram(const uint8_t*& ptr, SceneState* scene) {
@@ -1019,6 +1174,9 @@ static void HandleDestroyShaderProgram(const uint8_t*& ptr, SceneState* scene) {
     std::memset(&prog, 0, sizeof(prog));
 
     printf("[Parser] Destroyed shader program %u\n", cmd.programId);
+
+    // Shader state written — bump the global state version (F-04).
+    scene->shaderStateVersion++;
 }
 
 static void HandleBindShaderProgram(const uint8_t*& ptr, SceneState* scene) {
@@ -1049,6 +1207,9 @@ static void HandleBindShaderProgram(const uint8_t*& ptr, SceneState* scene) {
         slot.intensity   = cmd.intensity;
         slot.programId   = cmd.programId;
     }
+
+    // Shader state written — bump the global state version (F-04).
+    scene->shaderStateVersion++;
 }
 
 static void HandleSetShaderUniform(const uint8_t*& ptr, uint16_t payloadLen,
@@ -1093,6 +1254,9 @@ static void HandleSetShaderUniform(const uint8_t*& ptr, uint16_t payloadLen,
         }
         ptr += sizeof(float);
     }
+
+    // Shader state written — bump the global state version (F-04).
+    scene->shaderStateVersion++;
 }
 
 // ─── Memory Access Handlers (0x30 – 0x3F) ──────────────────────────────────

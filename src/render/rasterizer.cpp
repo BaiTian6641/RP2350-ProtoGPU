@@ -11,6 +11,16 @@
  *   M6:    Full 12-type material system: Simple, Normal, Depth, Gradient,
  *          Light, SimplexNoise, RainbowNoise, Image, Combine (12 blend modes),
  *          Mask, Animator, PreRendered.
+ *   V9-G4: PGL_BLEND_ALPHA materials render in a deferred translucent pass
+ *          (source-over blend over the finished opaque scene, painter's
+ *          algorithm — no OIT; alpha == 1.0f is bit-identical to opaque).
+ *   V9-G6: bilinear texture filtering for PGL_MAT_IMAGE (opt-in per
+ *          material via PglParamImage::filterFlags; nearest stays default).
+ *   V9-G3/G7: multi-camera + render-to-layer.  PrepareFrame keeps the v8
+ *          legacy binding (first valid back-buffer camera) so an unchanged
+ *          caller renders bit-identically; PrepareNextCameraPass iterates
+ *          the remaining active cameras, each into its own target (layer FB
+ *          or back buffer) with a viewport scissor on the tile loop.
  */
 
 #include "rasterizer.h"
@@ -58,6 +68,13 @@ static uint16_t   trianglePoolUsed = 0;
 // We transform into this buffer before projecting, then discard.
 static PglVec3 transformedVerts[GpuConfig::MAX_VERTICES];
 
+// G5: view-space depth (z) per transformed vertex, filled per draw call for
+// perspective cameras.  Used to classify triangles against the near plane
+// before projection (see PrepareFrame).  Same op sequence as the view
+// transform inside PglMath::PerspectiveProject, so these depths are
+// bit-identical to the za/zb/zc the projection itself produces.
+static float viewZScratch[GpuConfig::MAX_VERTICES];
+
 // QuadTree instance — rebuilt every frame by PrepareFrame().
 static QuadTree quadTree;
 
@@ -93,6 +110,30 @@ static inline void UnpackRGB565(uint16_t c, uint8_t& r, uint8_t& g, uint8_t& b) 
     r = static_cast<uint8_t>(((c >> 11) & 0x1F) << 3);
     g = static_cast<uint8_t>(((c >> 5)  & 0x3F) << 2);
     b = static_cast<uint8_t>((c & 0x1F) << 3);
+}
+
+// ─── V9 (G4): Source-Over Alpha Blend for the 3D ROP ───────────────────────
+// dst = src·a + dst·(1−a) per RGB channel in float, truncated back to RGB565
+// (same quantisation convention as the material evaluators).
+//
+// alpha == 1.0f is BIT-IDENTICAL to the opaque write path: src·1.0f == src
+// exactly in IEEE-754, dst·0.0f == +0.0f (channels are non-negative), the
+// sum is exact, and PackRGB565(UnpackRGB565(c)) == c for every RGB565 value
+// (unpack shifts up / pack shifts down, no rounding).  The blend branch is
+// only reachable from the translucent pass in RasterizeTile, so existing
+// materials never execute it.
+static inline uint16_t BlendAlphaRGB565(uint16_t src, uint16_t dst, float alpha) {
+    uint8_t sr, sg, sb, dr, dg, db;
+    UnpackRGB565(src, sr, sg, sb);
+    UnpackRGB565(dst, dr, dg, db);
+    const float inv = 1.0f - alpha;   // parser clamps alpha to [0,1] → inv ∈ [0,1]
+    const uint8_t r = static_cast<uint8_t>(
+        static_cast<float>(sr) * alpha + static_cast<float>(dr) * inv);
+    const uint8_t g = static_cast<uint8_t>(
+        static_cast<float>(sg) * alpha + static_cast<float>(dg) * inv);
+    const uint8_t b = static_cast<uint8_t>(
+        static_cast<float>(sb) * alpha + static_cast<float>(db) * inv);
+    return PackRGB565(r, g, b);
 }
 
 // ─── Cortex-M33 DSP/SIMD Optimized RGB565 Blend ────────────────────────────
@@ -408,19 +449,13 @@ static uint16_t BlendRGB565(uint16_t colorA, uint16_t colorB,
 }
 
 // ─── Texture Sampling ──────────────────────────────────────────────────────
-// Nearest-neighbour sampling from a TextureSlot.  UV clamped to [0, 1].
+// Nearest-neighbour sampling from a TextureSlot (default everywhere; the only
+// v8 path).  V9 (G6) adds an opt-in bilinear 4-tap mode, selected per
+// material via PglParamImage::filterFlags bit0.  UV clamped to [0, 1].
 
-static uint16_t SampleTexture(const TextureSlot& tex, float u, float v) {
-    if (!tex.active || !tex.pixels || tex.width == 0 || tex.height == 0) {
-        return 0xF81F;  // magenta = missing texture
-    }
-
-    // Clamp UV to [0, 1)
-    u = PglMath::Clamp(u, 0.0f, 0.9999f);
-    v = PglMath::Clamp(v, 0.0f, 0.9999f);
-
-    uint16_t px = static_cast<uint16_t>(u * tex.width);
-    uint16_t py = static_cast<uint16_t>(v * tex.height);
+/// Fetch one texel as RGB565 (bounds-checked against the uploaded byte count).
+static inline uint16_t FetchTexelRGB565(const TextureSlot& tex,
+                                        uint16_t px, uint16_t py) {
     uint32_t idx = static_cast<uint32_t>(py) * tex.width + px;
 
     if (tex.format == PGL_TEX_RGB565) {
@@ -434,6 +469,71 @@ static uint16_t SampleTexture(const TextureSlot& tex, float u, float v) {
         return PackRGB565(tex.pixels[byteIdx], tex.pixels[byteIdx + 1],
                           tex.pixels[byteIdx + 2]);
     }
+}
+
+static uint16_t SampleTexture(const TextureSlot& tex, float u, float v,
+                              bool bilinear) {
+    if (!tex.active || !tex.pixels || tex.width == 0 || tex.height == 0) {
+        return 0xF81F;  // magenta = missing texture
+    }
+
+    // Clamp UV to [0, 1)
+    u = PglMath::Clamp(u, 0.0f, 0.9999f);
+    v = PglMath::Clamp(v, 0.0f, 0.9999f);
+
+    if (!bilinear) {
+        // Nearest-neighbour — unchanged v8 semantics.
+        uint16_t px = static_cast<uint16_t>(u * tex.width);
+        uint16_t py = static_cast<uint16_t>(v * tex.height);
+        return FetchTexelRGB565(tex, px, py);
+    }
+
+    // ── V9 (G6): bilinear 4-tap, texel-centre mapping ─────────────────────
+    // Sample position in texel space is u·width − 0.5 so that integer
+    // coordinates sit exactly on texel centres; edge taps clamp (no
+    // wraparound, no mip — mip is explicitly out of scope for G6).  Each tap
+    // is unpacked from RGB565, lerped per channel in float, and truncated
+    // back — the same conventions as the material evaluators.
+    const float fx = u * static_cast<float>(tex.width)  - 0.5f;
+    const float fy = v * static_cast<float>(tex.height) - 0.5f;
+    const int x0 = static_cast<int>(floorf(fx));
+    const int y0 = static_cast<int>(floorf(fy));
+    const float tx = fx - static_cast<float>(x0);
+    const float ty = fy - static_cast<float>(y0);
+
+    const int tw = static_cast<int>(tex.width);
+    const int th = static_cast<int>(tex.height);
+    const int xa = PglMath::Min(PglMath::Max(x0,     0), tw - 1);
+    const int xb = PglMath::Min(PglMath::Max(x0 + 1, 0), tw - 1);
+    const int ya = PglMath::Min(PglMath::Max(y0,     0), th - 1);
+    const int yb = PglMath::Min(PglMath::Max(y0 + 1, 0), th - 1);
+
+    uint8_t r00, g00, b00, r10, g10, b10, r01, g01, b01, r11, g11, b11;
+    UnpackRGB565(FetchTexelRGB565(tex, static_cast<uint16_t>(xa),
+                                      static_cast<uint16_t>(ya)),
+                 r00, g00, b00);
+    UnpackRGB565(FetchTexelRGB565(tex, static_cast<uint16_t>(xb),
+                                      static_cast<uint16_t>(ya)),
+                 r10, g10, b10);
+    UnpackRGB565(FetchTexelRGB565(tex, static_cast<uint16_t>(xa),
+                                      static_cast<uint16_t>(yb)),
+                 r01, g01, b01);
+    UnpackRGB565(FetchTexelRGB565(tex, static_cast<uint16_t>(xb),
+                                      static_cast<uint16_t>(yb)),
+                 r11, g11, b11);
+
+    // Lerp horizontal pairs, then the two rows vertically (per channel).
+    const float rTop = PglMath::Lerp(r00, r10, tx);
+    const float rBot = PglMath::Lerp(r01, r11, tx);
+    const float gTop = PglMath::Lerp(g00, g10, tx);
+    const float gBot = PglMath::Lerp(g01, g11, tx);
+    const float bTop = PglMath::Lerp(b00, b10, tx);
+    const float bBot = PglMath::Lerp(b01, b11, tx);
+
+    return PackRGB565(
+        static_cast<uint8_t>(PglMath::Lerp(rTop, rBot, ty)),
+        static_cast<uint8_t>(PglMath::Lerp(gTop, gBot, ty)),
+        static_cast<uint8_t>(PglMath::Lerp(bTop, bBot, ty)));
 }
 
 // ─── Material Evaluation — Full M6 (12 Types) ──────────────────────────────
@@ -607,7 +707,12 @@ static uint16_t EvaluateMaterial(const MaterialSlot& mat,
 
         float su = uv.x * p->scaleX + p->offsetX;
         float sv = uv.y * p->scaleY + p->offsetY;
-        return SampleTexture(scene->textures[p->textureId], su, sv);
+        // V9 (G6): filterFlags bit0 selects bilinear when UV-mapped.  It
+        // reads 0 (nearest) for hosts that sent the frozen 18-byte v8 form —
+        // the parser zeroes the params tail.  With no UVs the constant
+        // uv={0,0} resolves both filters to texel (0,0) identically.
+        return SampleTexture(scene->textures[p->textureId], su, sv,
+                             (p->filterFlags & PGL_IMAGE_FILTER_BILINEAR) != 0);
     }
 
     // ── PGL_MAT_COMBINE (0x50): Blend two materials ────────────────────
@@ -693,7 +798,8 @@ static uint16_t EvaluateMaterial(const MaterialSlot& mat,
     case PGL_MAT_PRERENDERED: {
         const auto* p = reinterpret_cast<const PglParamPreRendered*>(mat.params);
         if (p->textureId >= GpuConfig::MAX_TEXTURES) return 0x8410;  // mid-grey fallback
-        return SampleTexture(scene->textures[p->textureId], uv.x, uv.y);
+        return SampleTexture(scene->textures[p->textureId], uv.x, uv.y,
+                             false);  // nearest — G6 filtering is IMAGE-only
     }
 
     // ── Unknown material type ──────────────────────────────────────────
@@ -759,6 +865,16 @@ uint32_t Rasterizer::ComputeFrameSignature(const SceneState* s) const {
             h = fnv1a_hash(&cam.rotation,     sizeof(cam.rotation),     h);
             h = fnv1a_hash(&cam.baseRotation, sizeof(cam.baseRotation), h);
             h = fnv1a_hash(&cam.is2D,         sizeof(cam.is2D),         h);
+            // V9 (G3/G7): render target + viewport are camera state too —
+            // folded exactly like the transform fields, so a
+            // SET_CAMERA_TARGET write invalidates the skip-cache with no
+            // version counter (mirrors how SET_CAMERA has always worked).
+            h = fnv1a_hash(&cam.targetLayer,  sizeof(cam.targetLayer),  h);
+            h = fnv1a_hash(&cam.vpX,          sizeof(cam.vpX),          h);
+            h = fnv1a_hash(&cam.vpY,          sizeof(cam.vpY),          h);
+            h = fnv1a_hash(&cam.vpW,          sizeof(cam.vpW),          h);
+            h = fnv1a_hash(&cam.vpH,          sizeof(cam.vpH),          h);
+            h = fnv1a_hash(&cam.vpFlags,      sizeof(cam.vpFlags),      h);
         }
     }
 
@@ -776,12 +892,213 @@ uint32_t Rasterizer::ComputeFrameSignature(const SceneState* s) const {
         }
     }
 
+    // Hash material content versions for all ACTIVE material slots (F-04
+    // extension — the ROP reads material params that the draw-list hash
+    // above cannot see; a param update on an otherwise static scene used to
+    // be frame-skipped stale).  All-active, not referenced-only: materials
+    // reached indirectly through Combine/Mask/Animator have no draw-call
+    // reference chain, so — like textures below — every active slot is
+    // folded in (editing any material forces one safe re-render).  The
+    // active guard means a destroy/re-create transition changes the hash
+    // stream exactly like the mesh case.
+    for (uint16_t m = 0; m < GpuConfig::MAX_MATERIALS; ++m) {
+        if (s->materials[m].active) {
+            h = fnv1a_hash(&s->materialVersion[m],
+                           sizeof(s->materialVersion[m]), h);
+        }
+    }
+
+    // Hash texture content versions for all ACTIVE texture slots (F-04
+    // extension).  Unlike meshes/materials there is no draw-call reference
+    // chain to follow (textures are reached indirectly through IMAGE/
+    // PRERENDERED materials, possibly via Combine/Mask/Animator), so all
+    // active versions are folded in — conservative: an upload to an
+    // unreferenced texture forces one safe re-render.  The active guard
+    // again makes destroy/create transitions change the signature.
+    for (uint16_t t = 0; t < GpuConfig::MAX_TEXTURES; ++t) {
+        if (s->textures[t].active) {
+            h = fnv1a_hash(&s->textureVersion[t],
+                           sizeof(s->textureVersion[t]), h);
+        }
+    }
+
+    // Global shader-state version (F-04 extension): screen-space post-FX
+    // state (bound programs, builtin slot configs, PSB uniforms) is skipped
+    // together with the raster on a signature hit, so any shader-state
+    // write must invalidate — otherwise uniform-only animation on a static
+    // scene freezes.  Folded unconditionally (it is a single global clock).
+    h = fnv1a_hash(&s->shaderStateVersion, sizeof(s->shaderStateVersion), h);
+
     return h;
+}
+
+// ─── G5 (V9): Near-plane clipping ───────────────────────────────────────────
+//
+// Perspective triangles crossing the view-space near plane
+// (z = PglMath::kNearPlaneZ) used to be MIS-PROJECTED, not culled:
+// PglMath::PerspectiveProject clamped z to 0.001 before dividing, so a
+// crossing triangle's behind-camera vertices projected to ±~64k px and the
+// triangle rasterized as a giant flat sliver whose clamped depth (~0.001)
+// won the Z test against real geometry.  G5 replaces that with a true
+// Sutherland–Hodgman clip of the 3-vertex view-space polygon against
+// z = kNearPlaneZ, emitting 1–2 triangles, with per-vertex attributes
+// (position and UV) linearly interpolated at the intersection points using
+// the same float math the rasterizer uses elsewhere.  The face normal is a
+// per-face attribute and is NOT interpolated.
+//
+// Per-triangle classification in PrepareFrame (after the world transform,
+// before projection):
+//   all 3 vertices in front (z > near)  → unchanged projection path
+//   all 3 behind (z ≤ near)             → drop the triangle
+//   crossing                            → clip + emit the 1–2 sub-triangles
+//
+// After clipping, every emitted vertex has z ≥ kNearPlaneZ > 0, so the
+// depths fed to the Z-buffer stay strictly positive (FloatZToU16 is
+// order-preserving only for positive floats).
+
+/// One polygon corner for the near-plane clip: view-space position plus the
+/// per-corner UV carried through the clip (only meaningful when the source
+/// mesh provides UVs for the triangle).
+struct NearClipVert {
+    PglVec3 view;
+    PglVec2 uv;
+};
+
+/// Project an already view-space point to screen space.  Same expression
+/// tree as the projection stage of PglMath::PerspectiveProject
+/// (invZ = fovFactor / z; x·invZ + centre) — used for clipped vertices,
+/// which have no world-space counterpart to feed through PerspectiveProject.
+/// Caller guarantees view.z ≥ kNearPlaneZ (true for clip output), so no
+/// division guard is needed here.
+static PglVec2 ProjectViewPoint(const PglVec3& view, float fovFactor,
+                                float screenW, float screenH) {
+    float invZ = fovFactor / view.z;
+    return {
+        view.x * invZ + screenW * 0.5f,
+        view.y * invZ + screenH * 0.5f
+    };
+}
+
+/// Sutherland–Hodgman clip of a view-space triangle against the near plane
+/// z = PglMath::kNearPlaneZ, keeping the z > near half-space.  `in` is the
+/// source triangle (3 corners); `out` receives up to 4 corners in the same
+/// winding order (output is a triangle or a quad).  Returns the output
+/// corner count.  Along a crossing edge a→b the intersection parameter is
+///   t = (a.z − near) / (a.z − b.z)     (0 at a, 1 at b)
+/// and x/y/uv are interpolated with that same t; the intersection's z is set
+/// to kNearPlaneZ exactly (the point lies ON the plane by construction).
+static uint8_t ClipTriangleNearPlane(const NearClipVert in[3], NearClipVert out[4]) {
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < 3; ++i) {
+        const NearClipVert& a = in[i];
+        const NearClipVert& b = in[(i + 1) % 3];
+        const bool aIn = a.view.z > PglMath::kNearPlaneZ;
+        const bool bIn = b.view.z > PglMath::kNearPlaneZ;
+        if (aIn) {
+            out[n++] = a;
+        }
+        if (aIn != bIn) {
+            const float t = (a.view.z - PglMath::kNearPlaneZ) /
+                            (a.view.z - b.view.z);
+            NearClipVert isect;
+            isect.view.x = a.view.x + t * (b.view.x - a.view.x);
+            isect.view.y = a.view.y + t * (b.view.y - a.view.y);
+            isect.view.z = PglMath::kNearPlaneZ;
+            isect.uv.x   = a.uv.x + t * (b.uv.x - a.uv.x);
+            isect.uv.y   = a.uv.y + t * (b.uv.y - a.uv.y);
+            out[n++] = isect;
+        }
+    }
+    return n;
+}
+
+/// Resolve a triangle's three corner UVs (same lookup rules the emit tail
+/// has always used).  Returns false when the mesh has no usable UVs.
+static bool ResolveCornerUVs(const MeshSlot& mesh, uint16_t triIndex, PglVec2 out[3]) {
+    if (!mesh.uvVertices || !mesh.uvIndices || triIndex >= mesh.triangleCount)
+        return false;
+    const PglIndex3& uvIdx = mesh.uvIndices[triIndex];
+    if (uvIdx.a >= mesh.uvVertexCount ||
+        uvIdx.b >= mesh.uvVertexCount ||
+        uvIdx.c >= mesh.uvVertexCount)
+        return false;
+    out[0] = mesh.uvVertices[uvIdx.a];
+    out[1] = mesh.uvVertices[uvIdx.b];
+    out[2] = mesh.uvVertices[uvIdx.c];
+    return true;
+}
+
+/// Shared emit tail for PrepareFrame: back-face cull → screen-AABB cull →
+/// pool allocate → Setup → face normal / UV → clamp AABB → QuadTree insert.
+/// Used by both the unchanged (fully-in-front) path and the G5 clip output.
+/// Silently drops the triangle when it is back-facing, entirely off-screen,
+/// degenerate, or the triangle pool is full (fail-safe: a full pool drops
+/// ONLY the extra triangle — no out-of-bounds write, no corruption).
+/// nva/nvb/nvc are the UNCLIPPED transformed vertices (face normal is a
+/// per-face attribute); uvs is the 3 corner UVs or nullptr.
+static void EmitProjectedTriangle(const PglVec2& sa, const PglVec2& sb, const PglVec2& sc,
+                                  float za, float zb, float zc,
+                                  const PglVec3& nva, const PglVec3& nvb, const PglVec3& nvc,
+                                  const PglVec2* uvs,
+                                  uint16_t drawCallIndex, uint16_t meshTriIndex,
+                                  uint16_t screenW, uint16_t screenH) {
+    // Back-face culling: skip if triangle has zero or negative area
+    float area2d = PglMath::TriangleArea2D(sa, sb, sc);
+    if (area2d <= 0.0f) return;
+
+    // Frustum cull: skip if entirely off-screen
+    PglMath::AABB2D bounds = PglMath::TriangleBounds2D(sa, sb, sc);
+    if (bounds.maxX < 0.0f || bounds.minX >= static_cast<float>(screenW) ||
+        bounds.maxY < 0.0f || bounds.minY >= static_cast<float>(screenH)) {
+        return;
+    }
+
+    // ── Allocate Triangle2D from pool ──
+    if (trianglePoolUsed >= GpuConfig::MAX_TRIANGLES) return;
+    Triangle2D& tri = trianglePool[trianglePoolUsed];
+    if (!tri.Setup(sa, sb, sc, za, zb, zc)) {
+        return;  // degenerate triangle (slot is reused by the next candidate)
+    }
+
+    tri.drawCallIndex = drawCallIndex;
+    tri.meshTriIndex  = meshTriIndex;
+
+    // Compute and store face normal from the unclipped transformed 3D
+    // vertices.  Used by NormalMaterial and LightMaterial for shading.
+    PglVec3 faceNorm = PglMath::TriangleNormal(nva, nvb, nvc);
+    tri.faceNormal = PglMath::Normalize(faceNorm);
+
+    // Set UV data if available (clip output receives interpolated UVs)
+    if (uvs) {
+        tri.uv0 = uvs[0];
+        tri.uv1 = uvs[1];
+        tri.uv2 = uvs[2];
+        tri.hasUV = true;
+    }
+
+    // Clamp AABB to screen bounds before QuadTree insertion.
+    // Prevents oversized nodes from large triangles extending off-screen.
+    bounds.minX = (bounds.minX > 0.0f) ? bounds.minX : 0.0f;
+    bounds.minY = (bounds.minY > 0.0f) ? bounds.minY : 0.0f;
+    bounds.maxX = (bounds.maxX < static_cast<float>(screenW))  ? bounds.maxX : static_cast<float>(screenW);
+    bounds.maxY = (bounds.maxY < static_cast<float>(screenH)) ? bounds.maxY : static_cast<float>(screenH);
+
+    // Insert into QuadTree
+    quadTree.Insert(trianglePoolUsed, bounds);
+    trianglePoolUsed++;
 }
 
 // ─── PrepareFrame (Core 0, single-threaded) ─────────────────────────────────
 //
-// For each enabled DrawCall:
+// Frame-level entry: frame-signature check (identical scene → skip), reset of
+// the per-frame pipeline state, then the v8-compatible legacy binding — the
+// FIRST active camera whose target resolves to the back buffer gets its pass
+// prepared (transform → clip → project → QuadTree).  An unchanged caller that
+// runs one tile pass into the back buffer therefore renders exactly the v8
+// image.  Multi-camera callers (G3/G7) loop PrepareNextCameraPass() for the
+// remaining cameras.
+//
+// Per-camera pass work lives in PrepareCameraPass():
 //   1. Look up MeshSlot → get vertex/index data
 //   2. Look up CameraSlot → get camera transform + projection params
 //   3. Transform vertices by DrawCall.transform (via PglMath::TransformVertex)
@@ -804,32 +1121,106 @@ void Rasterizer::PrepareFrame(SceneState* scene) {
     }
     prevFrameSignature = sig;
 
-    // Clear Z-buffer to far plane (uint16_t representation)
-    const uint32_t pixelCount = static_cast<uint32_t>(width) * height;
-    std::memset(zBuffer, 0xFF, pixelCount * sizeof(uint16_t));  // 0xFFFF > Z_FAR_U16
+    // Default pass state: full-frame scissor, panel FB stride, empty pool.
+    // With no valid camera pass the caller's tile pass reproduces the v8
+    // no-camera behaviour exactly (frame clears to black).
+    fbStride       = width;
+    scX0 = 0; scY0 = 0; scX1 = width; scY1 = height;
+    preparedCamIdx = -1;
+    nextCamCursor  = 0;
 
     // Clear and re-initialize QuadTree for this frame
     quadTree.Clear();
     quadTree.Initialize(width, height);
 
-    // Find the active camera (use camera 0 by default)
-    const CameraSlot* activeCam = nullptr;
+    // ── Legacy binding: first ACTIVE camera with a valid BACK-BUFFER ────
+    // target.  Cameras targeting layers are deliberately NOT prepared here —
+    // an unchanged caller renders the prepared pass into the back buffer,
+    // and a layer-bound pass would corrupt it with the wrong stride
+    // (fail-closed).  PrepareNextCameraPass() covers every valid camera.
     for (uint8_t c = 0; c < PGL_MAX_CAMERAS; ++c) {
-        if (scene->cameras[c].active) {
-            activeCam = &scene->cameras[c];
-            break;
+        if (!scene->cameras[c].active) continue;
+        if (scene->cameras[c].targetLayer != PGL_LAYER_3D) {
+            continue;                        // layer-bound → deferred to G3 loop
         }
+        CameraTargetInfo ti =
+            scene->ResolveCameraTarget(c, nullptr, width, height);
+        if (!ti.valid) continue;             // destroyed target → fail-closed
+        PrepareCameraPass(scene, c, ti);
+        preparedCamIdx = c;
+        break;
     }
-    if (!activeCam) {
-        // No camera set — nothing to render
-        return;
+}
+
+// ─── PrepareNextCameraPass (V9 G3/G7) ───────────────────────────────────────
+//
+// Iterates the remaining ACTIVE cameras in slot order, skipping the one
+// PrepareFrame already bound and cameras whose target no longer resolves
+// (fail-closed).  Each accepted camera gets a freshly prepared pass: its own
+// Z clear + QuadTree + projection, its own viewport scissor + FB stride.
+// The caller runs a tile pass into the camera's resolved target FB.
+
+bool Rasterizer::PrepareNextCameraPass(SceneState* scene, uint8_t* outCamIdx) {
+    if (frameSkipped) return false;
+
+    for (uint8_t c = nextCamCursor; c < PGL_MAX_CAMERAS; ++c) {
+        nextCamCursor = static_cast<uint8_t>(c + 1);
+        if (c == static_cast<uint8_t>(preparedCamIdx)) continue;  // already bound
+        if (!scene->cameras[c].active) continue;
+        CameraTargetInfo ti =
+            scene->ResolveCameraTarget(c, nullptr, width, height);
+        if (!ti.valid) continue;             // destroyed target → fail-closed
+        PrepareCameraPass(scene, c, ti);
+        if (outCamIdx) *outCamIdx = c;
+        return true;
     }
+    return false;
+}
+
+// ─── PrepareCameraPass (per-camera: transform → clip → project → QuadTree) ──
+//
+// Binds the pass's target geometry (FB stride + viewport scissor), clears the
+// shared panel-addressed Z buffer (sequential passes make sharing safe — each
+// pass starts from far-plane), rebuilds the QuadTree, and runs the full
+// projection pipeline for this camera.  Cameras render strictly one-after-
+// another (the tile pass between passes drains both cores), so the static
+// triangle pool + QuadTree are safely reused per pass.
+
+void Rasterizer::PrepareCameraPass(SceneState* scene, uint8_t camIdx,
+                                   const CameraTargetInfo& target) {
+    this->scene = scene;
+
+    // ── Bind pass state: target FB stride + viewport scissor ────────────
+    // The scissor is a clip, not a projection change: all projection and
+    // QuadTree math below stays full-frame panel space; RasterizeTile
+    // intersects each tile rect with this scissor.
+    fbStride = target.width;
+    scX0 = target.scX0; scY0 = target.scY0;
+    scX1 = target.scX1; scY1 = target.scY1;
+
+    // Clear Z-buffer to far plane (uint16_t representation) — panel-sized,
+    // per pass.  Z addressing in the tile loop is panel-strided for every
+    // target, so the clear region matches exactly what a pass can touch.
+    const uint32_t pixelCount = static_cast<uint32_t>(width) * height;
+    std::memset(zBuffer, 0xFF, pixelCount * sizeof(uint16_t));  // 0xFFFF > Z_FAR_U16
+
+    // Clear and re-initialize QuadTree for this pass
+    quadTree.Clear();
+    quadTree.Initialize(width, height);
+
+    const CameraSlot* activeCam = &scene->cameras[camIdx];
 
     // Camera parameters
     const PglVec3& camPos = activeCam->position;
     const PglQuat  camRot = PglMath::QuatMul(activeCam->rotation,
                                               activeCam->baseRotation);
     const bool     is2D   = activeCam->is2D;
+
+    // G5: conjugate of the camera rotation, hoisted for the view-space depth
+    // scratch and the near-plane clip.  QuatConjugate is exact (sign flips
+    // only), so this is bit-identical to the per-call conjugate inside
+    // PglMath::PerspectiveProject.
+    const PglQuat  camRotConj = PglMath::QuatConjugate(camRot);
 
     // FOV factor for perspective projection.
     // ProtoTracer uses a fovFactor that relates pixel units to world units.
@@ -896,7 +1287,10 @@ void Rasterizer::PrepareFrame(SceneState* scene) {
                     sp = PglMath::PerspectiveProject(tv, camPos, camRot, fovFactor,
                              static_cast<float>(width), static_cast<float>(height), &cz);
                 }
-                if (cz > 0.0f) {
+                // G5: cz is now the TRUE view-space z (no projection clamp),
+                // so this in-front test finally works as intended — corners
+                // at/behind the near plane are excluded from the AABB.
+                if (cz > PglMath::kNearPlaneZ) {
                     anyInFront = true;
                     if (sp.x < sMinX) sMinX = sp.x;
                     if (sp.y < sMinY) sMinY = sp.y;
@@ -917,6 +1311,17 @@ void Rasterizer::PrepareFrame(SceneState* scene) {
         // then translation.  This matches ProtoTracer's Transform pipeline.
         for (uint16_t v = 0; v < vertCount; ++v) {
             transformedVerts[v] = PglMath::TransformVertex(xform, drawFullRot, srcVerts[v]);
+        }
+
+        // G5: view-space depth per vertex for near-plane classification
+        // (perspective only).  Sub → QuatRotate(conjugate) is exactly the
+        // view transform PerspectiveProject performs internally, so these
+        // depths are bit-identical to the za/zb/zc it writes below.
+        if (!is2D) {
+            for (uint16_t v = 0; v < vertCount; ++v) {
+                viewZScratch[v] = PglMath::QuatRotate(
+                    camRotConj, PglMath::Sub(transformedVerts[v], camPos)).z;
+            }
         }
 
         // ── Step 2: Project each triangle to 2D and insert into QuadTree ──
@@ -948,7 +1353,70 @@ void Rasterizer::PrepareFrame(SceneState* scene) {
                                            static_cast<float>(width),
                                            static_cast<float>(height));
                 za = va.z; zb = vb.z; zc = vc.z;
+
+                // Behind-camera cull for the 2D path — unchanged by G5
+                // (always live here: OrthoProject never clamped z).  The
+                // perspective path classifies against the near plane instead.
+                if (za <= 0.0f || zb <= 0.0f || zc <= 0.0f) continue;
             } else {
+                // ── G5: classify against the near plane in view space ──
+                const int frontCount =
+                    (viewZScratch[idx.a] > PglMath::kNearPlaneZ ? 1 : 0) +
+                    (viewZScratch[idx.b] > PglMath::kNearPlaneZ ? 1 : 0) +
+                    (viewZScratch[idx.c] > PglMath::kNearPlaneZ ? 1 : 0);
+
+                if (frontCount == 0) {
+                    continue;  // fully behind the near plane — drop
+                }
+
+                if (frontCount < 3) {
+                    // Crossing: Sutherland–Hodgman clip of the view-space
+                    // polygon against z = kNearPlaneZ, emitting 1–2
+                    // sub-triangles.  Full view coordinates are recomputed
+                    // only for these (rare) triangles — same op sequence as
+                    // the PerspectiveProject internals, so untouched front
+                    // corners still project identically.
+                    NearClipVert inV[3];
+                    inV[0].view = PglMath::QuatRotate(camRotConj, PglMath::Sub(va, camPos));
+                    inV[1].view = PglMath::QuatRotate(camRotConj, PglMath::Sub(vb, camPos));
+                    inV[2].view = PglMath::QuatRotate(camRotConj, PglMath::Sub(vc, camPos));
+
+                    PglVec2 cornerUV[3] = {};
+                    const bool hasUV = ResolveCornerUVs(mesh, t, cornerUV);
+                    inV[0].uv = cornerUV[0];
+                    inV[1].uv = cornerUV[1];
+                    inV[2].uv = cornerUV[2];
+
+                    NearClipVert outV[4];
+                    const uint8_t outN = ClipTriangleNearPlane(inV, outV);
+
+                    // Fan-triangulate the clipped polygon (3 or 4 corners),
+                    // preserving the original winding.  Pool capacity is
+                    // checked per emit — a full pool drops the EXTRA
+                    // triangle only, never corrupts.
+                    const float w = static_cast<float>(width);
+                    const float h = static_cast<float>(height);
+                    for (uint8_t k = 0; k + 2 < outN; ++k) {
+                        const NearClipVert& p0 = outV[0];
+                        const NearClipVert& p1 = outV[k + 1];
+                        const NearClipVert& p2 = outV[k + 2];
+                        const PglVec2 cuv[3] = { p0.uv, p1.uv, p2.uv };
+                        EmitProjectedTriangle(
+                            ProjectViewPoint(p0.view, fovFactor, w, h),
+                            ProjectViewPoint(p1.view, fovFactor, w, h),
+                            ProjectViewPoint(p2.view, fovFactor, w, h),
+                            p0.view.z, p1.view.z, p2.view.z,
+                            va, vb, vc,
+                            hasUV ? cuv : nullptr,
+                            d, t, width, height);
+                    }
+                    continue;
+                }
+
+                // Fully in front — unchanged projection path.  outZ now
+                // carries the true view z (all three > kNearPlaneZ by the
+                // classification above), so the old dead `za <= 0` near-cull
+                // is subsumed and removed.
                 sa = PglMath::PerspectiveProject(va, camPos, camRot, fovFactor,
                          static_cast<float>(width),
                          static_cast<float>(height), &za);
@@ -960,57 +1428,12 @@ void Rasterizer::PrepareFrame(SceneState* scene) {
                          static_cast<float>(height), &zc);
             }
 
-            // Back-face culling: skip if triangle has zero or negative area
-            float area2d = PglMath::TriangleArea2D(sa, sb, sc);
-            if (area2d <= 0.0f) continue;
-
-            // Frustum cull: skip if entirely off-screen
-            PglMath::AABB2D bounds = PglMath::TriangleBounds2D(sa, sb, sc);
-            if (bounds.maxX < 0.0f || bounds.minX >= static_cast<float>(width) ||
-                bounds.maxY < 0.0f || bounds.minY >= static_cast<float>(height)) {
-                continue;
-            }
-
-            // Near-plane cull: skip if any vertex is behind camera
-            if (za <= 0.0f || zb <= 0.0f || zc <= 0.0f) continue;
-
-            // ── Allocate Triangle2D from pool ──
-            Triangle2D& tri = trianglePool[trianglePoolUsed];
-            if (!tri.Setup(sa, sb, sc, za, zb, zc)) {
-                continue;  // degenerate triangle
-            }
-
-            tri.drawCallIndex = d;
-            tri.meshTriIndex  = t;
-
-            // Compute and store face normal from transformed 3D vertices.
-            // Used by NormalMaterial and LightMaterial for shading.
-            PglVec3 faceNorm = PglMath::TriangleNormal(va, vb, vc);
-            tri.faceNormal = PglMath::Normalize(faceNorm);
-
-            // Set UV data if available
-            if (mesh.uvVertices && mesh.uvIndices && t < mesh.triangleCount) {
-                const PglIndex3& uvIdx = mesh.uvIndices[t];
-                if (uvIdx.a < mesh.uvVertexCount &&
-                    uvIdx.b < mesh.uvVertexCount &&
-                    uvIdx.c < mesh.uvVertexCount) {
-                    tri.uv0 = mesh.uvVertices[uvIdx.a];
-                    tri.uv1 = mesh.uvVertices[uvIdx.b];
-                    tri.uv2 = mesh.uvVertices[uvIdx.c];
-                    tri.hasUV = true;
-                }
-            }
-
-            // Clamp AABB to screen bounds before QuadTree insertion.
-            // Prevents oversized nodes from large triangles extending off-screen.
-            bounds.minX = (bounds.minX > 0.0f) ? bounds.minX : 0.0f;
-            bounds.minY = (bounds.minY > 0.0f) ? bounds.minY : 0.0f;
-            bounds.maxX = (bounds.maxX < static_cast<float>(width))  ? bounds.maxX : static_cast<float>(width);
-            bounds.maxY = (bounds.maxY < static_cast<float>(height)) ? bounds.maxY : static_cast<float>(height);
-
-            // Insert into QuadTree
-            quadTree.Insert(trianglePoolUsed, bounds);
-            trianglePoolUsed++;
+            // Shared emit tail: back-face cull → screen-AABB cull → pool →
+            // Setup → face normal/UV → clamp → QuadTree insert.
+            PglVec2 cornerUVs[3];
+            EmitProjectedTriangle(sa, sb, sc, za, zb, zc, va, vb, vc,
+                                  ResolveCornerUVs(mesh, t, cornerUVs) ? cornerUVs : nullptr,
+                                  d, t, width, height);
         }
 
         projectedTriCount += mesh.triangleCount;
@@ -1037,6 +1460,11 @@ void Rasterizer::PrepareFrame(SceneState* scene) {
 //      d. If closer, evaluate material → write RGB565
 //
 // Each core writes a distinct Y band, so no synchronization is needed.
+//
+// NOTE: this legacy band path has no callers (kept for backward
+// compatibility).  V9 (G4) alpha blending and the two-pass translucent ROP
+// are implemented in RasterizeTile() only — the production 3D path; alpha
+// materials render opaque here.
 
 void Rasterizer::RasterizeRange(uint16_t* framebuffer,
                                 uint16_t yStart, uint16_t yEnd) {
@@ -1161,15 +1589,28 @@ void Rasterizer::RasterizeTile(uint16_t* framebuffer, uint16_t* zBuf,
                                 uint16_t tileX, uint16_t tileY,
                                 uint16_t tileW, uint16_t tileH) {
     // Convert tile coords to pixel coords
-    const uint16_t px0 = tileX * tileW;
-    const uint16_t py0 = tileY * tileH;
-    const uint16_t px1 = (px0 + tileW < width)  ? (px0 + tileW) : width;
-    const uint16_t py1 = (py0 + tileH < height) ? (py0 + tileH) : height;
+    const uint16_t tx0 = tileX * tileW;
+    const uint16_t ty0 = tileY * tileH;
+    const uint16_t tx1 = (tx0 + tileW < width)  ? (tx0 + tileW) : width;
+    const uint16_t ty1 = (ty0 + tileH < height) ? (ty0 + tileH) : height;
 
-    // Early out: no triangles this frame — clear tile to black
+    // V9 (G3/G7): intersect with the pass viewport scissor.  Tiles fully
+    // outside are skipped WITHOUT clearing — target pixels outside the
+    // viewport belong to other cameras / the host UI (the scissor is a
+    // clip, not a projection change).  With the default full-frame scissor
+    // this is exactly the v8 tile rect.
+    const uint16_t px0 = (tx0 > scX0) ? tx0 : scX0;
+    const uint16_t py0 = (ty0 > scY0) ? ty0 : scY0;
+    const uint16_t px1 = (tx1 < scX1) ? tx1 : scX1;
+    const uint16_t py1 = (ty1 < scY1) ? ty1 : scY1;
+    if (px0 >= px1 || py0 >= py1) return;
+
+    // Early out: no triangles this frame — clear the scissored tile rect
+    // to black.  FB rows use the pass target stride (fbStride); the v8
+    // default (stride = panel width) is unchanged.
     if (trianglePoolUsed == 0) {
         for (uint16_t y = py0; y < py1; ++y) {
-            uint32_t rowStart = static_cast<uint32_t>(y) * width;
+            uint32_t rowStart = static_cast<uint32_t>(y) * fbStride;
             std::memset(&framebuffer[rowStart + px0], 0,
                         (px1 - px0) * sizeof(uint16_t));
         }
@@ -1188,10 +1629,10 @@ void Rasterizer::RasterizeTile(uint16_t* framebuffer, uint16_t* zBuf,
         static_cast<float>(py1),
         candidates, MAX_QUERY_RESULTS);
 
-    // ── Step 2: If no candidates, clear tile to black ────────────────
+    // ── Step 2: If no candidates, clear the scissored rect to black ────
     if (hitCount == 0) {
         for (uint16_t y = py0; y < py1; ++y) {
-            uint32_t rowStart = static_cast<uint32_t>(y) * width;
+            uint32_t rowStart = static_cast<uint32_t>(y) * fbStride;
             std::memset(&framebuffer[rowStart + px0], 0,
                         (px1 - px0) * sizeof(uint16_t));
         }
@@ -1223,83 +1664,221 @@ void Rasterizer::RasterizeTile(uint16_t* framebuffer, uint16_t* zBuf,
     }
 
     // ── Step 3: Rasterize pixels, testing only the cached candidates ─
+    //
+    // S-01: triangle-outer loop with row-invariant edge evaluation.  The
+    // per-pixel barycentric test uses the SAME float expression tree as
+    // Triangle2D::Barycentric(), so every computed value is bit-identical
+    // to the previous pixel-outer loop:
+    //   * dy = py - v2.y, rowU = e21x*dy, rowV = e02x*dy are invariant
+    //     along a scanline row — computing them once per (triangle, row)
+    //     instead of per pixel does not change any bit pattern.
+    //   * Per-pixel state evolution is unchanged: candidates are processed
+    //     in the same front-to-back sorted order and a winning triangle
+    //     writes zBuf[pixelIdx] immediately.  The old loop's per-pixel
+    //     bestZU16 mirrored exactly this state machine (same initial value,
+    //     same transition conditions, same winning values), so final
+    //     framebuffer and z-buffer contents are identical.  The old hi-Z
+    //     `break` becomes a per-triangle per-pixel skip: candidates are
+    //     sorted by minZ and FloatZToU16() is monotone for the (strictly
+    //     positive) depths in the pool, so a triangle skipped by hi-Z could
+    //     never have won the pixel anyway.
+    //   * The tile's framebuffer is cleared to black up front — identical
+    //     to the old per-pixel !hit write; winners overwrite their pixels.
+    //
+    // Triangle-outer also hoists every pixel-invariant per-triangle
+    // quantity (min-Z hi-Z bound + FloatZToU16 conversion, material
+    // lookup) out of the pixel loop, and keeps the row edge terms in
+    // registers — no scratch arrays, no extra stack (core 1 has 2 KB).
+
+    // Clear the scissored rect to black (background) — covered pixels are
+    // overwritten below.
     for (uint16_t y = py0; y < py1; ++y) {
-        uint32_t rowStart = static_cast<uint32_t>(y) * width;
-        float fy = static_cast<float>(y) + 0.5f;  // pixel centre
+        uint32_t rowStart = static_cast<uint32_t>(y) * fbStride;
+        std::memset(&framebuffer[rowStart + px0], 0,
+                    (px1 - px0) * sizeof(uint16_t));
+    }
 
-        for (uint16_t x = px0; x < px1; ++x) {
-            float fx = static_cast<float>(x) + 0.5f;  // pixel centre
+    // V9 (G4): set when any candidate carries a PGL_BLEND_ALPHA material.
+    // Those triangles are deferred to the translucent pass below; when no
+    // alpha materials are present the flag stays false and this tile runs
+    // EXACTLY the old single pass (existing materials never reach the blend
+    // branch — alpha == 1.0f would be bit-identical to it anyway).
+    bool sawAlpha = false;
 
-            uint32_t pixelIdx = rowStart + x;
-            uint16_t bestZU16 = zBuf[pixelIdx];
-            float    bestZ    = 1e30f;  // float z kept for material evaluation
-            uint16_t bestColor = 0x0000;
-            bool     hit = false;
+    for (uint16_t h = 0; h < hitCount; ++h) {
+        TriHandle handle = candidates[h];
+        if (handle >= trianglePoolUsed) continue;
 
-            for (uint16_t h = 0; h < hitCount; ++h) {
-                TriHandle handle = candidates[h];
-                if (handle >= trianglePoolUsed) continue;
+        const Triangle2D& tri = trianglePool[handle];
 
-                const Triangle2D& tri = trianglePool[handle];
+        // Hi-Z bound: this triangle's closest vertex depth in z-buffer
+        // units.  Hoisted out of the pixel loop (was recomputed per pixel).
+        float triMinZ = tri.z0;
+        if (tri.z1 < triMinZ) triMinZ = tri.z1;
+        if (tri.z2 < triMinZ) triMinZ = tri.z2;
+        const uint16_t triMinZU16 = FloatZToU16(triMinZ);
 
-                // Hi-Z early-out: if this triangle's closest vertex is
-                // behind the current best Z for this pixel, skip it.
-                // Candidates are sorted front-to-back, so once we fail
-                // this test all remaining candidates are also behind.
-                {
-                    float triMinZ = tri.z0;
-                    if (tri.z1 < triMinZ) triMinZ = tri.z1;
-                    if (tri.z2 < triMinZ) triMinZ = tri.z2;
-                    uint16_t triMinZU16 = FloatZToU16(triMinZ);
-                    if (triMinZU16 >= bestZU16) break;  // all remaining are farther
-                }
+        // Material lookup is pixel-invariant — hoist it too.  A triangle
+        // with an invalid material id never wins a pixel (skipped after
+        // the z-test in the old loop, without touching the z-buffer).
+        const DrawCall& dc = scene->drawList[tri.drawCallIndex];
+        const uint16_t matId = dc.materialId;
+        if (matId >= GpuConfig::MAX_MATERIALS) continue;
+        const MaterialSlot& mat = scene->materials[matId];
 
-                // Barycentric test
-                float u, v, w;
-                if (!tri.Barycentric(fx, fy, u, v, w)) continue;
+        // V9 (G4): translucent materials (PGL_BLEND_ALPHA) defer to the
+        // second pass so they blend OVER the finished opaque scene instead
+        // of hard-overwriting it (and before farther opaque geometry gets a
+        // chance to Z-fail against them).
+        if (mat.active && mat.blendMode == PGL_BLEND_ALPHA) {
+            sawAlpha = true;
+            continue;
+        }
+
+        for (uint16_t y = py0; y < py1; ++y) {
+            // FB rows use the pass target stride; Z rows are always
+            // panel-strided (identical in the v8 default: fbStride == width).
+            const uint32_t fbRow = static_cast<uint32_t>(y) * fbStride;
+            const uint32_t zRow  = static_cast<uint32_t>(y) * width;
+            float py = static_cast<float>(y) + 0.5f;  // pixel centre
+
+            // Row-invariant edge terms — identical expressions (and hence
+            // identical results) to Triangle2D::Barycentric().
+            float dy   = py - tri.v2.y;
+            float rowU = tri.e21x * dy;
+            float rowV = tri.e02x * dy;
+
+            for (uint16_t x = px0; x < px1; ++x) {
+                // Hi-Z early-out against the current z-buffer value.
+                const uint16_t curZU16 = zBuf[zRow + x];
+                if (triMinZU16 >= curZU16) continue;
+
+                float px = static_cast<float>(x) + 0.5f;  // pixel centre
+                float dx = px - tri.v2.x;
+
+                // Barycentric test — same expression tree as Barycentric().
+                float u = fmaf(tri.e10y, dx, rowU) * tri.invDenom;
+                float v = fmaf(tri.e20y, dx, rowV) * tri.invDenom;
+                float w = 1.0f - u - v;
+                if (u < 0.0f || v < 0.0f || w < 0.0f) continue;
 
                 // Interpolate depth
                 float z = tri.InterpolateZ(u, v, w);
                 uint16_t zU16 = FloatZToU16(z);
-                if (zU16 >= bestZU16) continue;  // behind existing pixel
+                if (zU16 >= curZU16) continue;  // behind existing pixel
 
-                // Material lookup
-                const DrawCall& dc = scene->drawList[tri.drawCallIndex];
-                uint16_t matId = dc.materialId;
-                if (matId >= GpuConfig::MAX_MATERIALS) continue;
-
-                const MaterialSlot& mat = scene->materials[matId];
+                uint16_t color;
                 if (!mat.active) {
-                    bestZ = z;
-                    bestZU16 = zU16;
-                    bestColor = 0xFFFF;  // no material → solid white
-                    hit = true;
-                    continue;
-                }
+                    color = 0xFFFF;  // no material → solid white
+                } else {
+                    // Interpolate UV (if available)
+                    PglVec2 uv = {0.0f, 0.0f};
+                    if (tri.hasUV) {
+                        uv = tri.InterpolateUV(u, v, w);
+                    }
 
-                // Interpolate UV
-                PglVec2 uv = {0.0f, 0.0f};
-                if (tri.hasUV) {
-                    uv = tri.InterpolateUV(u, v, w);
-                }
+                    // Evaluate material — noise/gradient use the screen-space
+                    // position, Light/Normal use the stored face normal.
+                    PglVec3 intersectionPoint = {px, py, z};
+                    PglVec3 normal = tri.faceNormal;
 
-                // Evaluate material
-                PglVec3 intersectionPoint = {fx, fy, z};
-                PglVec3 normal = tri.faceNormal;
-
-                bestColor = EvaluateMaterial(mat, intersectionPoint, normal, uv,
+                    color = EvaluateMaterial(mat, intersectionPoint, normal, uv,
                                              scene, elapsedTimeS, 0);
-                bestZ = z;
-                bestZU16 = zU16;
-                hit = true;
-            }
+                }
 
-            // Write pixel
-            if (hit) {
-                framebuffer[pixelIdx] = bestColor;
-                zBuf[pixelIdx] = bestZU16;
-            } else {
-                framebuffer[pixelIdx] = 0x0000;
+                framebuffer[fbRow + x] = color;
+                zBuf[zRow + x] = zU16;
+            }
+        }
+    }
+
+    // ── Pass 2 (V9/G4): translucent triangles — PGL_BLEND_ALPHA ─────────
+    //
+    // Runs only when pass 1 deferred at least one alpha-material candidate.
+    // The candidate order (front-to-back by min-Z) and all per-pixel math
+    // are identical to pass 1, but the Z-test now runs against the FINISHED
+    // opaque depth buffer, so translucent surfaces behind opaque geometry
+    // are occluded exactly like opaque ones, and the blend destination is
+    // the completed opaque scene (or background).  A winning pixel blends
+    //
+    //     dst = src·alpha + dst·(1−alpha)     per RGB channel in float,
+    //
+    // quantised back to RGB565, and writes its depth — so among stacked
+    // translucent surfaces the NEAREST blends exactly once.  There is NO
+    // order-independent transparency: hosts must draw translucent geometry
+    // back-to-front (painter's algorithm, see PglTypes.h).  alpha == 1.0f
+    // is bit-identical to the opaque write (src·1 + dst·0 == src exactly in
+    // IEEE-754); non-alpha materials never enter this pass.
+    if (sawAlpha) {
+        for (uint16_t h = 0; h < hitCount; ++h) {
+            TriHandle handle = candidates[h];
+            if (handle >= trianglePoolUsed) continue;
+
+            const Triangle2D& tri = trianglePool[handle];
+
+            // Hi-Z bound — same hoisted computation as pass 1.
+            float triMinZ = tri.z0;
+            if (tri.z1 < triMinZ) triMinZ = tri.z1;
+            if (tri.z2 < triMinZ) triMinZ = tri.z2;
+            const uint16_t triMinZU16 = FloatZToU16(triMinZ);
+
+            const DrawCall& dc = scene->drawList[tri.drawCallIndex];
+            const uint16_t matId = dc.materialId;
+            if (matId >= GpuConfig::MAX_MATERIALS) continue;
+            const MaterialSlot& mat = scene->materials[matId];
+
+            // Pass 2 is the exact complement of the pass-1 deferral filter.
+            if (!(mat.active && mat.blendMode == PGL_BLEND_ALPHA)) continue;
+            const float alpha = mat.alpha;   // pixel-invariant — hoisted
+
+            for (uint16_t y = py0; y < py1; ++y) {
+                // Same dual-stride addressing as pass 1 (FB stride / panel Z).
+                const uint32_t fbRow = static_cast<uint32_t>(y) * fbStride;
+                const uint32_t zRow  = static_cast<uint32_t>(y) * width;
+                float py = static_cast<float>(y) + 0.5f;  // pixel centre
+
+                // Row-invariant edge terms — identical to pass 1.
+                float dy   = py - tri.v2.y;
+                float rowU = tri.e21x * dy;
+                float rowV = tri.e02x * dy;
+
+                for (uint16_t x = px0; x < px1; ++x) {
+                    // Hi-Z early-out against the opaque pass's depth.
+                    const uint16_t curZU16 = zBuf[zRow + x];
+                    if (triMinZU16 >= curZU16) continue;
+
+                    float px = static_cast<float>(x) + 0.5f;  // pixel centre
+                    float dx = px - tri.v2.x;
+
+                    // Barycentric test — same expression tree as pass 1.
+                    float u = fmaf(tri.e10y, dx, rowU) * tri.invDenom;
+                    float v = fmaf(tri.e20y, dx, rowV) * tri.invDenom;
+                    float w = 1.0f - u - v;
+                    if (u < 0.0f || v < 0.0f || w < 0.0f) continue;
+
+                    // Z-test against the finished opaque depth buffer.
+                    float z = tri.InterpolateZ(u, v, w);
+                    uint16_t zU16 = FloatZToU16(z);
+                    if (zU16 >= curZU16) continue;  // occluded by nearer surface
+
+                    // mat is guaranteed active by the pass-2 filter above.
+                    PglVec2 uv = {0.0f, 0.0f};
+                    if (tri.hasUV) {
+                        uv = tri.InterpolateUV(u, v, w);
+                    }
+                    PglVec3 intersectionPoint = {px, py, z};
+                    PglVec3 normal = tri.faceNormal;
+
+                    const uint16_t src = EvaluateMaterial(
+                        mat, intersectionPoint, normal, uv,
+                        scene, elapsedTimeS, 0);
+
+                    // Source-over blend against the current destination
+                    // (opaque scene or background), then take the depth.
+                    framebuffer[fbRow + x] =
+                        BlendAlphaRGB565(src, framebuffer[fbRow + x], alpha);
+                    zBuf[zRow + x] = zU16;
+                }
             }
         }
     }

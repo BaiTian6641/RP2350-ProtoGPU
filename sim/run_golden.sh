@@ -35,7 +35,9 @@ FRAMES_DIR="$BUILD_DIR/frames"
 COMPARE="$SCRIPT_DIR/ppm_compare.py"
 
 # Benchmark scenes (registry names; B5_lvgl is a placeholder — no frames yet).
-SCENES=(cube B1_teapot B2_2d_layers B3_textures B4_psb_postfx B6_empty)
+# B7_alpha3d (V9/G4) and B8_bilinear (V9/G6) were added with those features.
+# B9_multicam (V9 G3+G7) was added with multi-camera / render-to-layer.
+SCENES=(cube B1_teapot B2_2d_layers B3_textures B4_psb_postfx B6_empty B7_alpha3d B8_bilinear B9_multicam)
 
 # ─── Per-scene bounded-diff overrides (default: pixel-identical 0/0) ────────
 declare -A MAX_DIFF_PIXELS MAX_CHANNEL_DELTA

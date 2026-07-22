@@ -110,9 +110,17 @@ static void BuildCapabilityResponse() {
 
     // v8 extension: logical capability bits 8–23 (PGL_CAP_* u32 space >> 8).
     // The PSB shader VM exists; HANDLE_GEN and ERROR_BITMASK land with v8.
-    // V9/V10 planned bits stay 0.
+    // NEAR_CLIP ships with V9/G5 (view-space near-plane triangle clipping in
+    // Rasterizer::PrepareFrame).  ALPHA_BLEND_3D ships with V9/G4 (deferred
+    // translucent pass in Rasterizer::RasterizeTile) and BILINEAR with
+    // V9/G6 (PglParamImage::filterFlags).  MULTI_CAMERA + RENDER_TO_LAYER
+    // ship with V9 G3/G7 (PGL_CMD_SET_CAMERA_TARGET: per-camera target FB +
+    // viewport scissor; PrepareNextCameraPass).  Other V9/V10 planned bits
+    // stay 0.
     capabilityResponse.flags16 = static_cast<uint16_t>(
-        (PGL_CAP_SHADER_VM | PGL_CAP_HANDLE_GEN | PGL_CAP_ERROR_BITMASK) >> 8);
+        (PGL_CAP_SHADER_VM | PGL_CAP_HANDLE_GEN | PGL_CAP_ERROR_BITMASK |
+         PGL_CAP_NEAR_CLIP | PGL_CAP_MULTI_CAMERA | PGL_CAP_ALPHA_BLEND_3D |
+         PGL_CAP_BILINEAR | PGL_CAP_RENDER_TO_LAYER) >> 8);
     capabilityResponse.reserved0 = 0;
 }
 
