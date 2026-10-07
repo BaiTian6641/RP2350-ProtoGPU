@@ -1,512 +1,565 @@
 /**
  * @file hub75_driver.cpp
- * @brief PIO-driven HUB75 display driver implementation for RP2350.
+ * @brief HUB75 backend — autonomous whole-scan PIO/DMA engine (P07).
  *
- * Architecture:
- *   SM0 (hub75_data) — shifts out pixel data with side-set CLK
- *   SM1 (hub75_row)  — controls LAT, OE, row address (A-E)
- *   DMA channel 0    — feeds SM0 from BCM plane buffer (pixel data)
- *   DMA channel 1    — auto-chains to restart after each row (control channel)
+ * Ownership model (docs plan §display-buffer ownership):
+ *   RGB source     : FREE -> BORROWED(Present) -> CONVERTING -> released
+ *   Encoded scan   : FREE -> BUILDING -> ARMED -> ACTIVE (repeats) -> FREE
  *
- * BCM (Binary Code Modulation):
- *   For COLOR_DEPTH bits of color depth, we make COLOR_DEPTH passes per row pair.
- *   Each pass shifts the bit-plane for that BCM weight, then OE is held for
- *   2^bit_weight PIO cycles.  This gives perceived brightness proportional to
- *   the binary value.
- *
- * Refresh loop:
- *   For each row pair (0..SCAN_ROWS-1):
- *     For each BCM bit (0..COLOR_DEPTH-1):
- *       1. Extract bit-plane data from RGB565 framebuffer
- *       2. DMA the bit-plane to SM0 (hub75_data)
- *       3. SM1 (hub75_row): blank → latch → set row addr → OE for 2^bit cycles
- *
- * The refresh runs from a PIO IRQ handler to be essentially zero-CPU once
- * started.  At frame swap, only the framebuffer pointer is updated atomically.
+ * The engine scans the ACTIVE bank continuously with no per-record CPU work:
+ * the data SM paces from a DREQ-driven DMA channel, the row SM handshakes
+ * data-ready/latch via PIO IRQ flags 1/2, and one whole-scan-complete flag
+ * (0) reaches the CPU, whose shared handler re-arms both DMA channels and
+ * applies armed bank switches at that exact gate.  Flag 3 is the quiesce
+ * park request (IRQ_FORCE): the row SM stalls blank at the scan boundary so
+ * ClockQuiesce gates with OE high; Resume() recomputes all dividers/dwells.
  */
 
 #include "hub75_driver.h"
-#include "../gpu_config.h"
 
-#include "pico/stdlib.h"
-#include "hardware/pio.h"
+#if defined(PICO_ON_DEVICE)
+
+#include "hardware/clocks.h"
 #include "hardware/dma.h"
 #include "hardware/gpio.h"
-#include "hardware/clocks.h"
 #include "hardware/irq.h"
+#include "pico/time.h"
 
-// Generated PIO headers (from hub75.pio via pico_generate_pio_header)
 #include "hub75.pio.h"
 
+#include "hardware/sync.h"
+#include "pico/stdlib.h"
 #include <cstring>
-#include <cstdio>
+#include <new>
 
-// ─── Constants ──────────────────────────────────────────────────────────────
+namespace {
+Hub75PanelDriver* g_hub75Instance = nullptr;
 
-static constexpr uint16_t PANEL_W     = GpuConfig::PANEL_WIDTH;   // 128
-static constexpr uint16_t PANEL_H     = GpuConfig::PANEL_HEIGHT;  // 64
-static constexpr uint8_t  SCAN_ROWS   = GpuConfig::SCAN_ROWS;     // 32
-static constexpr uint8_t  COLOR_DEPTH = GpuConfig::COLOR_DEPTH;   // 8
+/// Pico2-safe HUB75 pin group: RGB 6..11, CLK 12, LAT 13, OE 14, ADDR 15..19.
+constexpr uint64_t kGpioMask =
+    (uint64_t(0x3fff) << GpuConfig::HUB75_R1_PIN);  // pins 6..19
 
-/// One pixel = one 32-bit word with 6 data bits [5:0] = R1 G1 B1 R2 G2 B2
-/// Row-pair buffer: PANEL_W pixels × 4 bytes = 512 bytes per row per BCM bit
-static uint32_t bcmRowBuffer[PANEL_W];
+/// Bounded wait for one scan boundary during Quiesce (worst-case scan at the
+/// lowest supported clock is a few ms; 20 ms is generous but finite).
+constexpr uint32_t kQuiesceTimeoutUs = 20000;
+} // namespace
 
-// ─── PIO / DMA State ────────────────────────────────────────────────────────
+// ─── IRQ ────────────────────────────────────────────────────────────────────
 
-static PIO   pio_hw_inst      = pio0;
-static uint  sm_data          = 0;        // SM index for hub75_data
-static uint  sm_row           = 1;        // SM index for hub75_row
-static uint  data_prog_offset = 0;
-static uint  row_prog_offset  = 0;
-static int   dma_data_chan     = -1;      // DMA channel feeding SM0
-
-static volatile const uint16_t* active_framebuffer = nullptr;
-static uint8_t  currentBrightness = 255;
-
-// ─── Refresh State (driven from main-loop poll or timer) ────────────────────
-
-static volatile uint8_t  currentRow   = 0;   // 0..SCAN_ROWS-1
-static volatile uint8_t  currentBit   = 0;   // 0..COLOR_DEPTH-1
-static volatile uint32_t refreshCount = 0;
-static volatile uint32_t lastRefreshUs = 0;
-static volatile uint32_t measuredRefreshHz = 0;
-
-/// When true, all HUB75 driver functions are no-ops (no panel connected).
-static bool hub75Disabled = false;
-
-// ─── BCM Bit-Plane Extraction ───────────────────────────────────────────────
-
-/**
- * @brief Extract a single BCM bit plane from the RGB565 framebuffer.
- *
- * For a given row pair (topRow and bottomRow = topRow + SCAN_ROWS) and
- * a given BCM bit index, produce PANEL_W 32-bit words where bits [5:0] are:
- *   bit 0 = R1 (top row red, this BCM bit)
- *   bit 1 = G1 (top row green)
- *   bit 2 = B1 (top row blue)
- *   bit 3 = R2 (bottom row red)
- *   bit 4 = G2 (bottom row green)
- *   bit 5 = B2 (bottom row blue)
- *
- * RGB565 layout: RRRRR GGGGGG BBBBB
- *   R = bits[15:11] (5 bits → map to BCM bits 0-7 by shifting)
- *   G = bits[10:5]  (6 bits → map to BCM bits 0-7 by shifting)
- *   B = bits[4:0]   (5 bits → map to BCM bits 0-7 by shifting)
- *
- * For 5-bit channels → 8-bit BCM: replicate top bits (5→8 by shift + OR top 3)
- * For 6-bit green → 8-bit BCM:    replicate top bits (6→8 by shift + OR top 2)
- */
-static void ExtractBcmPlane(const uint16_t* fb, uint8_t row, uint8_t bit,
-                            uint32_t* dest) {
-    const uint16_t* topRowPtr = fb + (row * PANEL_W);
-    const uint16_t* botRowPtr = fb + ((row + SCAN_ROWS) * PANEL_W);
-
-    for (uint16_t x = 0; x < PANEL_W; x++) {
-        uint16_t topPx = topRowPtr[x];
-        uint16_t botPx = botRowPtr[x];
-
-        // Extract 8-bit channels from RGB565
-        // R: bits[15:11] → 5 bits, shift left 3 for 8-bit
-        // G: bits[10:5]  → 6 bits, shift left 2 for 8-bit
-        // B: bits[4:0]   → 5 bits, shift left 3 for 8-bit
-        uint8_t tr = (topPx >> 8) & 0xF8;  // top row red (top 5 bits → 8-bit)
-        uint8_t tg = (topPx >> 3) & 0xFC;  // top row green (top 6 bits → 8-bit)
-        uint8_t tb = (topPx << 3) & 0xF8;  // top row blue (top 5 bits → 8-bit)
-
-        uint8_t br = (botPx >> 8) & 0xF8;
-        uint8_t bg = (botPx >> 3) & 0xFC;
-        uint8_t bb = (botPx << 3) & 0xF8;
-
-        // Apply brightness scaling (linear scale, not gamma corrected here)
-        if (currentBrightness < 255) {
-            tr = (uint16_t)tr * currentBrightness >> 8;
-            tg = (uint16_t)tg * currentBrightness >> 8;
-            tb = (uint16_t)tb * currentBrightness >> 8;
-            br = (uint16_t)br * currentBrightness >> 8;
-            bg = (uint16_t)bg * currentBrightness >> 8;
-            bb = (uint16_t)bb * currentBrightness >> 8;
-        }
-
-        // Extract the specific BCM bit from each 8-bit channel
-        uint32_t pixel = 0;
-        pixel |= ((tr >> bit) & 1) << 0;  // R1
-        pixel |= ((tg >> bit) & 1) << 1;  // G1
-        pixel |= ((tb >> bit) & 1) << 2;  // B1
-        pixel |= ((br >> bit) & 1) << 3;  // R2
-        pixel |= ((bg >> bit) & 1) << 4;  // G2
-        pixel |= ((bb >> bit) & 1) << 5;  // B2
-
-        dest[x] = pixel;
-    }
+void Hub75PanelDriver::ScanIrqHandler() {
+    Hub75PanelDriver* self = g_hub75Instance;
+    if (!self || !self->dataLease_.pio) return;
+    // Shared handler: acknowledge only our leased flag, never others.
+    if (!pio_interrupt_get(self->dataLease_.pio, 0)) return;
+    pio_interrupt_clear(self->dataLease_.pio, 0);
+    self->OnScanComplete();
 }
 
-// ─── PIO Initialization Helpers ─────────────────────────────────────────────
+void Hub75PanelDriver::OnScanComplete() {
+    const uint64_t now = time_us_64();
+    lastScanUs_ = now;
+    ++scanCount_;
+    if (faulted_ || quiesced_) return;  // DMA/SMs stopped; nothing to re-arm
 
-static void InitDataSM() {
-    // Load hub75_data PIO program
-    data_prog_offset = pio_add_program(pio_hw_inst, &hub75_data_program);
-    sm_data = pio_claim_unused_sm(pio_hw_inst, true);
-
-    pio_sm_config c = hub75_data_program_get_default_config(data_prog_offset);
-
-    // OUT pins: R1, G1, B1, R2, G2, B2 (6 consecutive starting at R1_PIN)
-    sm_config_set_out_pins(&c, GpuConfig::HUB75_R1_PIN, 6);
-
-    // Side-set pin: CLK (1 pin)
-    sm_config_set_sideset_pins(&c, GpuConfig::HUB75_CLK_PIN);
-
-    // OUT shift: shift right, autopull at 32 bits (one pixel per word)
-    sm_config_set_out_shift(&c, true, true, 32);
-
-    // FIFO: join to TX for deeper buffer (8 entries instead of 4)
-    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
-
-    // Clock divider: 150 MHz / 2 = 75 MHz pixel clock
-    // (each pixel = pull + out + nop = 3 PIO cycles at 75 MHz ≈ 25 Mpixel/s)
-    // Divide by 2 for safety at startup; can reduce for faster refresh.
-    float clkdiv = 2.0f;
-    sm_config_set_clkdiv(&c, clkdiv);
-
-    // Configure pin directions for PIO control
-    pio_sm_set_consecutive_pindirs(pio_hw_inst, sm_data,
-                                   GpuConfig::HUB75_R1_PIN, 6, true);  // data out
-    pio_sm_set_consecutive_pindirs(pio_hw_inst, sm_data,
-                                   GpuConfig::HUB75_CLK_PIN, 1, true); // CLK out
-
-    // Assign PIO function to GPIO pins
-    for (int i = 0; i < 6; i++) {
-        pio_gpio_init(pio_hw_inst, GpuConfig::HUB75_R1_PIN + i);
+    // ── Whole-scan gate ──────────────────────────────────────────────────
+    // The data channel completed its count and the data SM consumed every
+    // byte of the finished scan (it now stalls on autopull with CLK low);
+    // the row SM consumed all 256 control words.  Neither a prefetched FIFO
+    // word nor a DMA descriptor can reference the retiring bank after this
+    // point, so the switch below can never mix rows/planes of two frames.
+    // Completion belongs to the scan that just finished, not the new bank
+    // about to start. Keep the source lease until every new row was latched.
+    if (phase_ == Phase::Scanning) {
+        PushEvent(PglRuntime::Completion::Displayed, PglRuntime::Result::Ok, now, true);
+        phase_ = Phase::Idle;
     }
-    pio_gpio_init(pio_hw_inst, GpuConfig::HUB75_CLK_PIN);
+    uint8_t dataBank = activeDataBank_;
+    if (armedDataBank_ != 0xff) {
+        dataBank = armedDataBank_;
+        armedDataBank_ = 0xff;
+        phase_ = Phase::Scanning;
+    }
+    uint8_t ctrlBank = activeCtrlBank_;
+    if (armedCtrlBank_ != 0xff) {
+        ctrlBank = armedCtrlBank_;
+        armedCtrlBank_ = 0xff;
+    }
+    activeDataBank_ = dataBank;
+    activeCtrlBank_ = ctrlBank;
 
-    // Initialize but don't start yet
-    pio_sm_init(pio_hw_inst, sm_data, data_prog_offset +
-                hub75_data_offset_entry_point, &c);
+    // Re-arm both channels for the next scan (bounded, constant work).
+    dma_channel_set_read_addr(dmaData_, DataBank(dataBank), false);
+    dma_channel_set_trans_count(dmaData_, scanBytes_, true);
+    dma_channel_set_read_addr(dmaCtrl_, CtrlBank(ctrlBank), false);
+    dma_channel_set_trans_count(dmaCtrl_, Hub75::kRecordCount, true);
+    ++totalScans_;
+
 }
 
-static void InitRowSM() {
-    // Load hub75_row PIO program
-    row_prog_offset = pio_add_program(pio_hw_inst, &hub75_row_program);
-    sm_row = pio_claim_unused_sm(pio_hw_inst, true);
+// ─── Helpers ────────────────────────────────────────────────────────────────
 
-    pio_sm_config c = hub75_row_program_get_default_config(row_prog_offset);
-
-    // SET pins: LAT, OE (2 consecutive pins)
-    sm_config_set_set_pins(&c, GpuConfig::HUB75_LAT_PIN, 2);
-
-    // OUT pins: Address A-E (5 consecutive pins)
-    sm_config_set_out_pins(&c, GpuConfig::HUB75_ADDR_A, 5);
-
-    // OUT shift: shift right, no autopull (manual PULL in PIO program)
-    sm_config_set_out_shift(&c, true, false, 32);
-
-    // Same clock as data SM
-    float clkdiv = 2.0f;
-    sm_config_set_clkdiv(&c, clkdiv);
-
-    // Configure pin directions
-    pio_sm_set_consecutive_pindirs(pio_hw_inst, sm_row,
-                                   GpuConfig::HUB75_LAT_PIN, 2, true);  // LAT, OE
-    pio_sm_set_consecutive_pindirs(pio_hw_inst, sm_row,
-                                   GpuConfig::HUB75_ADDR_A, 5, true);   // ADDR A-E
-
-    // Assign PIO function to GPIO pins
-    pio_gpio_init(pio_hw_inst, GpuConfig::HUB75_LAT_PIN);
-    pio_gpio_init(pio_hw_inst, GpuConfig::HUB75_OE_PIN);
-    for (int i = 0; i < 5; i++) {
-        pio_gpio_init(pio_hw_inst, GpuConfig::HUB75_ADDR_A + i);
-    }
-
-    // Initialize but don't start yet
-    pio_sm_init(pio_hw_inst, sm_row, row_prog_offset +
-                hub75_row_offset_entry_point, &c);
+void Hub75PanelDriver::PushEvent(PglRuntime::Completion completion,
+                                 PglRuntime::Result result, uint64_t timestampUs,
+                                 bool sourceReleased) {
+    const uint32_t irqState = save_and_disable_interrupts();  // main+ISR safe
+    const uint8_t next = uint8_t((eventHead_ + 1) & 3u);
+    if (next == eventTail_) eventTail_ = uint8_t((eventTail_ + 1) & 3u);  // drop oldest
+    DisplayEvent& e = events_[eventHead_];
+    e.frame = pendingFrame_;
+    e.completion = completion;
+    e.result = result;
+    e.timestampUs = timestampUs;
+    e.sourceReleased = sourceReleased;
+    eventHead_ = next;
+    restore_interrupts(irqState);
 }
 
-// ─── DMA Setup ──────────────────────────────────────────────────────────────
-
-static void InitDMA() {
-    dma_data_chan = dma_claim_unused_channel(true);
-
-    dma_channel_config c = dma_channel_get_default_config(dma_data_chan);
-
-    // 32-bit transfers
-    channel_config_set_transfer_data_size(&c, DMA_SIZE_32);
-
-    // DREQ: pace to PIO TX FIFO of SM0
-    channel_config_set_dreq(&c, pio_get_dreq(pio_hw_inst, sm_data, true));
-
-    // Read from RAM (increment), write to PIO TX FIFO (no increment)
-    channel_config_set_read_increment(&c, true);
-    channel_config_set_write_increment(&c, false);
-
-    // Configure channel (but don't start — we trigger per row)
-    dma_channel_configure(
-        dma_data_chan,
-        &c,
-        &pio_hw_inst->txf[sm_data],   // write to PIO TX FIFO
-        bcmRowBuffer,                    // read from BCM row buffer
-        PANEL_W,                         // transfer PANEL_W words per row
-        false                            // don't start yet
-    );
-}
-
-// ─── Refresh Engine ─────────────────────────────────────────────────────────
-
-/**
- * @brief Drive one BCM plane for one row pair.
- *
- * Called from the polling loop or IRQ. Sequence:
- *   1. Extract BCM bit-plane from framebuffer into bcmRowBuffer
- *   2. Trigger DMA → SM0 (shifts out pixel data)
- *   3. Feed SM1 (row address + OE delay)
- *   4. Wait for DMA completion
- *   5. Wait for SM1 OE cycle to complete (IRQ 0)
- */
-static void DriveOnePlane(uint8_t row, uint8_t bit) {
-    const uint16_t* fb = const_cast<const uint16_t*>(active_framebuffer);
-    if (!fb) return;
-
-    // 1. Extract bit-plane
-    ExtractBcmPlane(fb, row, bit, bcmRowBuffer);
-
-    // 2. Start DMA transfer to SM0
-    dma_channel_set_read_addr(dma_data_chan, bcmRowBuffer, false);
-    dma_channel_set_trans_count(dma_data_chan, PANEL_W, true);  // start
-
-    // 3. Feed SM1: row address
-    pio_sm_put_blocking(pio_hw_inst, sm_row, row);
-
-    // 4. Feed SM1: OE delay count (BCM weighting)
-    // Higher bits get exponentially longer OE time.
-    // Bit 0 → 1 cycle, bit 1 → 2, bit 2 → 4, ..., bit 7 → 128 cycles.
-    // Scale up for visible brightness. Base unit = 4 PIO cycles.
-    uint32_t oe_delay = (1u << bit) * 4;
-    if (oe_delay > 0) oe_delay--;  // loop is X+1 iterations
-    pio_sm_put_blocking(pio_hw_inst, sm_row, oe_delay);
-
-    // 5. Wait for DMA to finish feeding SM0
-    dma_channel_wait_for_finish_blocking(dma_data_chan);
-
-    // 6. Wait for SM1 to finish OE cycle (IRQ 0)
-    // Clear IRQ 0 flag first, then wait
-    pio_interrupt_clear(pio_hw_inst, 0);
-    // The IRQ may already be set if the OE loop was short.
-    // Spin-wait for IRQ 0 to be set by hub75_row SM.
-    while (!(pio_hw_inst->irq & (1u << 0))) {
-        tight_loop_contents();
-    }
-    pio_interrupt_clear(pio_hw_inst, 0);
-}
-
-/**
- * @brief Run one complete refresh of the entire panel.
- *
- * Iterates all SCAN_ROWS row pairs × COLOR_DEPTH BCM bits.
- * Total operations: 32 × 8 = 256 plane transfers per refresh.
- *
- * This should be called in a tight loop or from a timer interrupt.
- * At 150 MHz with clkdiv=2: ~75 MHz PIO clock.
- * Per row: 128 pixels × 3 clocks = 384 PIO cycles = ~5.1 µs shift time.
- * Plus OE time: average across 8 BCM bits ≈ 128 cycles × 4 = 512 cycles ≈ 6.8 µs
- * Per scan row (8 planes): ~95 µs
- * Full refresh (32 rows): ~3.0 ms → ~333 Hz refresh rate.
- */
-static void RefreshEntirePanel() {
-    for (uint8_t row = 0; row < SCAN_ROWS; row++) {
-        for (uint8_t bit = 0; bit < COLOR_DEPTH; bit++) {
-            DriveOnePlane(row, bit);
-        }
-    }
-
-    refreshCount++;
-
-    // Measure refresh rate every 32 refreshes
-    if ((refreshCount & 0x1F) == 0) {
-        uint32_t now = time_us_32();
-        if (lastRefreshUs != 0) {
-            uint32_t elapsed = now - lastRefreshUs;
-            // 32 refreshes in 'elapsed' microseconds
-            measuredRefreshHz = 32000000u / elapsed;
-        }
-        lastRefreshUs = now;
-    }
-}
-
-// ─── Public API ─────────────────────────────────────────────────────────────
-
-bool Hub75Driver::Initialize(const uint16_t* initialFramebuffer) {
-    // ── Guard: skip PIO/DMA setup when HUB75 pins are disabled (0xFF) ──
-    if (GpuConfig::HUB75_R1_PIN == 0xFF) {
-        hub75Disabled = true;
-        printf("[HUB75] Disabled (no pins assigned — headless mode)\n");
-        return true;
-    }
-
-    active_framebuffer = initialFramebuffer;
-
-    // --- GPIO setup (direct control for pins not managed by PIO) ---
-    // Address pins A-E are set up later by PIO
-    // LAT, OE initially via GPIO to hold display off
-    gpio_init(GpuConfig::HUB75_OE_PIN);
+void Hub75PanelDriver::ForceBlank() {
+    faulted_ = true;
+    PIO pio = dataLease_.pio;
+    if (!pio) return;
+    const uint32_t irqState = save_and_disable_interrupts();
+    pio_set_irqn_source_enabled(pio, 0, pis_interrupt0, false);
+    if (dmaData_ >= 0) hw_clear_bits(&dma_hw->ch[dmaData_].al1_ctrl, DMA_CH0_CTRL_TRIG_EN_BITS);
+    if (dmaCtrl_ >= 0) hw_clear_bits(&dma_hw->ch[dmaCtrl_].al1_ctrl, DMA_CH0_CTRL_TRIG_EN_BITS);
+    if (dmaData_ >= 0) dma_channel_abort(dmaData_);
+    if (dmaCtrl_ >= 0) dma_channel_abort(dmaCtrl_);
+    pio_sm_set_enabled(pio, dataLease_.sm, false);
+    pio_sm_set_enabled(pio, rowLease_.sm, false);
+    // Abort must blank independently of stalled SM execution: the frozen SM
+    // pin levels are untrusted, so drive OE high / CLK / LAT low via SIO.
+    gpio_set_function(GpuConfig::HUB75_OE_PIN, GPIO_FUNC_SIO);
     gpio_set_dir(GpuConfig::HUB75_OE_PIN, GPIO_OUT);
-    gpio_put(GpuConfig::HUB75_OE_PIN, 1);  // OE active low → start disabled
-
-    gpio_init(GpuConfig::HUB75_LAT_PIN);
+    gpio_put(GpuConfig::HUB75_OE_PIN, 1);
+    gpio_set_function(GpuConfig::HUB75_CLK_PIN, GPIO_FUNC_SIO);
+    gpio_set_dir(GpuConfig::HUB75_CLK_PIN, GPIO_OUT);
+    gpio_put(GpuConfig::HUB75_CLK_PIN, 0);
+    gpio_set_function(GpuConfig::HUB75_LAT_PIN, GPIO_FUNC_SIO);
     gpio_set_dir(GpuConfig::HUB75_LAT_PIN, GPIO_OUT);
     gpio_put(GpuConfig::HUB75_LAT_PIN, 0);
-
-    // --- PIO setup ---
-    InitDataSM();
-    InitRowSM();
-
-    // --- DMA setup ---
-    InitDMA();
-
-    // -- Start both SMs ---
-    pio_sm_set_enabled(pio_hw_inst, sm_data, true);
-    pio_sm_set_enabled(pio_hw_inst, sm_row, true);
-
-    printf("[HUB75] Initialized: %ux%u, 1/%u scan, %u-bit BCM, PIO0 SM%u+SM%u\n",
-           PANEL_W, PANEL_H, SCAN_ROWS, COLOR_DEPTH, sm_data, sm_row);
-
-    return true;
+    restore_interrupts(irqState);
 }
 
-void Hub75Driver::SetFramebuffer(const uint16_t* framebuffer) {
-    if (hub75Disabled) return;
-    // Atomic pointer update — picked up at next row-0 / bit-0 boundary
-    active_framebuffer = framebuffer;
-}
-
-void Hub75Driver::SetBrightness(uint8_t b) {
-    if (hub75Disabled) return;
-    currentBrightness = b;
-    // Brightness is applied per-pixel during ExtractBcmPlane().
-    // No PIO reconfiguration needed.
-}
-
-uint32_t Hub75Driver::GetRefreshRate() {
-    return measuredRefreshHz;
-}
-
-void Hub75Driver::Shutdown() {
-    if (hub75Disabled) return;
-    // Stop state machines
-    pio_sm_set_enabled(pio_hw_inst, sm_data, false);
-    pio_sm_set_enabled(pio_hw_inst, sm_row, false);
-
-    // Stop DMA
-    if (dma_data_chan >= 0) {
-        dma_channel_abort(dma_data_chan);
-        dma_channel_unclaim(dma_data_chan);
-        dma_data_chan = -1;
+void Hub75PanelDriver::ReleaseAllClaims() {
+    if (!resources_) return;
+    if (dmaData_ >= 0) hw_clear_bits(&dma_hw->ch[dmaData_].al1_ctrl, DMA_CH0_CTRL_TRIG_EN_BITS);
+    if (dmaCtrl_ >= 0) hw_clear_bits(&dma_hw->ch[dmaCtrl_].al1_ctrl, DMA_CH0_CTRL_TRIG_EN_BITS);
+    if (dataLease_.pio) {
+        pio_interrupt_clear(dataLease_.pio, 0);
+        pio_interrupt_clear(dataLease_.pio, 1);
+        pio_interrupt_clear(dataLease_.pio, 2);
+        pio_interrupt_clear(dataLease_.pio, 3);
     }
+    if (dmaData_ >= 0) resources_->ReleaseDma(dmaData_, HardwareResources::Owner::Display);
+    if (dmaCtrl_ >= 0) resources_->ReleaseDma(dmaCtrl_, HardwareResources::Owner::Display);
+    resources_->ReleasePioIrqs(pioBlock_, kIrqFlagMask, HardwareResources::Owner::Display);
+    resources_->ReleasePio(dataLease_);
+    resources_->ReleasePio(rowLease_);
+    resources_->ReleaseGpios(kGpioMask, HardwareResources::Owner::Display);
+}
 
-    // Unclaim SMs
-    pio_sm_unclaim(pio_hw_inst, sm_data);
-    pio_sm_unclaim(pio_hw_inst, sm_row);
+// ─── Init / Shutdown ────────────────────────────────────────────────────────
 
-    // Remove PIO programs
-    pio_remove_program(pio_hw_inst, &hub75_data_program, data_prog_offset);
-    pio_remove_program(pio_hw_inst, &hub75_row_program, row_prog_offset);
+PglRuntime::Result Hub75PanelDriver::Init(HardwareResources& resources,
+                                          const DisplayConfig& config,
+                                          void* workspace, size_t bytes) {
+    using Result = PglRuntime::Result;
+    using Owner = HardwareResources::Owner;
+    if (inited_) return Result::BadState;
+    if (!Hub75::SupportedWidth(config.width) || config.height != Hub75::kPanelHeight)
+        return Result::Unsupported;
+    if (!workspace || (reinterpret_cast<uintptr_t>(workspace) & 3u)) return Result::InvalidValue;
+    if (config.type != DisplayType::Hub75) return Result::InvalidValue;
+    if (bytes < Hub75::RequiredWorkspaceBytes(config.width)) return Result::Capacity;
 
-    // Blank display
+    resources_ = &resources;
+    config_ = config;
+    brightness_ = config.brightness;
+    scanBytes_ = Hub75::ScanDataBytes(config.width);
+    dataBanks_ = static_cast<uint8_t*>(workspace);
+    ctrlBanks_ = dataBanks_ + 2 * scanBytes_;
+    clockHz_ = clock_get_hz(clk_sys);
+
+    // ── Dynamic leases with full rollback on any failure ────────────────
+    Result r = resources_->ClaimGpios(kGpioMask, Owner::Display);
+    if (r != Result::Ok) { resources_ = nullptr; return r; }
     gpio_init(GpuConfig::HUB75_OE_PIN);
+    gpio_put(GpuConfig::HUB75_OE_PIN, 1);
     gpio_set_dir(GpuConfig::HUB75_OE_PIN, GPIO_OUT);
-    gpio_put(GpuConfig::HUB75_OE_PIN, 1);  // OE high = display off
+    r = resources_->ClaimPioIrqs(pioBlock_, kIrqFlagMask, Owner::Display);
+    if (r != Result::Ok) { ReleaseAllClaims(); resources_ = nullptr; return r; }
+    r = resources_->ClaimPio(pioBlock_, &hub75_data_program, Owner::Display, dataLease_);
+    if (r != Result::Ok) { ReleaseAllClaims(); resources_ = nullptr; return r; }
+    r = resources_->ClaimPio(pioBlock_, &hub75_row_program, Owner::Display, rowLease_);
+    if (r != Result::Ok) { ReleaseAllClaims(); resources_ = nullptr; return r; }
+    if (dataLease_.pio != rowLease_.pio) {  // both SMs must share one block
+        ReleaseAllClaims(); resources_ = nullptr; return Result::Capacity;
+    }
+    r = resources_->ClaimDma(Owner::Display, dmaData_);
+    if (r != Result::Ok) { ReleaseAllClaims(); resources_ = nullptr; return r; }
+    r = resources_->ClaimDma(Owner::Display, dmaCtrl_);
+    if (r != Result::Ok) { ReleaseAllClaims(); resources_ = nullptr; return r; }
 
-    printf("[HUB75] Shutdown complete\n");
+    PIO pio = dataLease_.pio;
+
+    // Immutable initial content: black data banks, current-brightness dwells.
+    std::memset(dataBanks_, 0, 2 * scanBytes_);
+    Hub75::EncodeControlBank(CtrlBank(0), brightness_, clockHz_);
+    Hub75::EncodeControlBank(CtrlBank(1), brightness_, clockHz_);
+
+    // ── Data SM: byte stream -> RGB pins, CLK side-set ──────────────────
+    {
+        pio_sm_config c = hub75_data_program_get_default_config(dataLease_.offset);
+        sm_config_set_wrap(&c, dataLease_.offset + hub75_data_wrap_target,
+                           dataLease_.offset + hub75_data_wrap);
+        sm_config_set_sideset_pins(&c, GpuConfig::HUB75_CLK_PIN);
+        sm_config_set_out_pins(&c, GpuConfig::HUB75_R1_PIN, 6);
+        sm_config_set_set_pins(&c, GpuConfig::HUB75_CLK_PIN, 1);
+        sm_config_set_out_shift(&c, true, true, 6);  // right, autopull threshold 6
+        sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+        const uint32_t div = Hub75::PixelClockDivFrac8(clockHz_);
+        sm_config_set_clkdiv_int_frac8(&c, uint16_t(div >> 8), uint8_t(div & 0xff));
+        pio_sm_init(pio, dataLease_.sm, dataLease_.offset, &c);
+        pio_sm_set_pins_with_mask(pio, dataLease_.sm, 0,
+                                 0x7fu << GpuConfig::HUB75_R1_PIN);
+        pio_sm_set_consecutive_pindirs(pio, dataLease_.sm, GpuConfig::HUB75_R1_PIN, 7, true);
+    }
+    // ── Row SM: address/latch/OE ─────────────────────────────────────────
+    {
+        pio_sm_config c = hub75_row_program_get_default_config(rowLease_.offset);
+        sm_config_set_wrap(&c, rowLease_.offset + hub75_row_wrap_target,
+                           rowLease_.offset + hub75_row_wrap);
+        sm_config_set_sideset_pins(&c, GpuConfig::HUB75_LAT_PIN);  // 2 pins: LAT, OE
+        sm_config_set_out_pins(&c, GpuConfig::HUB75_ADDR_A, 5);
+        sm_config_set_set_pins(&c, GpuConfig::HUB75_LAT_PIN, 2);
+        sm_config_set_out_shift(&c, true, false, 32);  // right, explicit pull
+        sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+        sm_config_set_clkdiv(&c, 1.0f);                // dwell counts = clk_sys cycles
+        pio_sm_init(pio, rowLease_.sm, rowLease_.offset, &c);
+        // PIO's own OE value is blank BEFORE its outputs are connected.
+        pio_sm_set_pins_with_mask(pio, rowLease_.sm, 1u << GpuConfig::HUB75_OE_PIN,
+                                 (3u << GpuConfig::HUB75_LAT_PIN) |
+                                 (31u << GpuConfig::HUB75_ADDR_A));
+        pio_sm_set_consecutive_pindirs(pio, rowLease_.sm, GpuConfig::HUB75_LAT_PIN, 7, true);
+    }
+    // Only connect the pads once each SM's own output state is safely set.
+    for (uint8_t pin = GpuConfig::HUB75_R1_PIN; pin <= GpuConfig::HUB75_ADDR_E; ++pin)
+        pio_gpio_init(pio, pin);
+
+    pio_sm_clear_fifos(pio, dataLease_.sm);
+    pio_sm_clear_fifos(pio, rowLease_.sm);
+    for (uint8_t f = 0; f < 4; ++f) pio_interrupt_clear(pio, f);
+
+    // Preload count headers (consumed once by each program's entry pull).
+    pio_sm_put(pio, dataLease_.sm, config_.width - 1);        // pixels-1
+    pio_sm_put(pio, rowLease_.sm, Hub75::kRecordCount - 1);   // records-1 = 255
+
+    // ── DMA: byte data stream + 32-bit control stream, DREQ-paced ───────
+    {
+        dma_channel_config c = dma_channel_get_default_config(dmaData_);
+        channel_config_set_chain_to(&c, dmaData_);   // self = chaining disabled
+        channel_config_set_read_increment(&c, true);
+        channel_config_set_write_increment(&c, false);
+        channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
+        channel_config_set_dreq(&c, pio_get_dreq(pio, dataLease_.sm, true));
+        dma_channel_configure(dmaData_, &c, &pio->txf[dataLease_.sm],
+                              DataBank(0), scanBytes_, false);
+    }
+    {
+        dma_channel_config c = dma_channel_get_default_config(dmaCtrl_);
+        channel_config_set_chain_to(&c, dmaCtrl_);   // self = chaining disabled
+        channel_config_set_read_increment(&c, true);
+        channel_config_set_write_increment(&c, false);
+        channel_config_set_transfer_data_size(&c, DMA_SIZE_32);
+        channel_config_set_dreq(&c, pio_get_dreq(pio, rowLease_.sm, true));
+        dma_channel_configure(dmaCtrl_, &c, &pio->txf[rowLease_.sm],
+                              CtrlBank(0), Hub75::kRecordCount, false);
+    }
+
+    // ── Shared CPU handler for the whole-scan-complete flag ─────────────
+    g_hub75Instance = this;
+    const uint irqNum = pio_get_irq_num(pio, 0);
+    irq_add_shared_handler(irqNum, &Hub75PanelDriver::ScanIrqHandler,
+                           PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY);
+    irq_set_enabled(irqNum, true);
+    pio_set_irqn_source_enabled(pio, 0, pis_interrupt0, true);
+
+    inited_ = true;
+    quiesced_ = false;
+    faulted_ = false;
+    phase_ = Phase::Idle;
+    activeDataBank_ = activeCtrlBank_ = 0;
+    armedDataBank_ = armedCtrlBank_ = 0xff;
+    eventHead_ = eventTail_ = 0;
+
+    // DMA first so the FIFOs fill, then both SMs phase-aligned.
+    dma_start_channel_mask((1u << dmaData_) | (1u << dmaCtrl_));
+    pio_enable_sm_mask_in_sync(pio, (1u << dataLease_.sm) | (1u << rowLease_.sm));
+    lastScanUs_ = time_us_64();
+    return Result::Ok;
 }
 
-// ─── Refresh Poll (called from Core 0 or Core 1 between renders) ───────────
+void Hub75PanelDriver::Shutdown() {
+    if (!inited_) return;
+    Quiesce();
+    PIO pio = dataLease_.pio;
+    irq_remove_handler(pio_get_irq_num(pio, 0), &Hub75PanelDriver::ScanIrqHandler);
+    g_hub75Instance = nullptr;
+    if (sampler_) { sampler_->~DisplayPixelSampler(); sampler_ = nullptr; }
+    const bool borrowed = phase_ != Phase::Idle;
+    phase_ = Phase::Idle;
+    if (borrowed)
+        PushEvent(PglRuntime::Completion::Cancelled, PglRuntime::Result::Cancelled,
+                  time_us_64(), true);
+    ReleaseAllClaims();
+    resources_ = nullptr;
+    dataBanks_ = ctrlBanks_ = nullptr;
+    inited_ = quiesced_ = faulted_ = false;
+    scanCount_ = 0;
+}
 
-/**
- * @brief Non-blocking refresh. Call this frequently from the main loop.
- *
- * Each call drives one BCM plane for one row pair, then returns.
- * After SCAN_ROWS × COLOR_DEPTH calls, one full refresh is complete.
- * This approach avoids blocking the main loop for the full refresh.
- */
-void Hub75Driver::PollRefresh() {
-    if (hub75Disabled) return;
-    DriveOnePlane(currentRow, currentBit);
+// ─── Present / conversion ───────────────────────────────────────────────────
 
-    currentBit++;
-    if (currentBit >= COLOR_DEPTH) {
-        currentBit = 0;
-        currentRow++;
-        if (currentRow >= SCAN_ROWS) {
-            currentRow = 0;
-            refreshCount++;
+PglRuntime::Result Hub75PanelDriver::Present(const DisplaySurface& surface,
+                                             const DisplayMapping& mapping) {
+    using Result = PglRuntime::Result;
+    if (!inited_) return Result::NotReady;
+    if (quiesced_ || faulted_) return Result::BadState;
+    if (phase_ != Phase::Idle || eventHead_ != eventTail_) return Result::Busy;
 
-            // Measure refresh rate
-            if ((refreshCount & 0x1F) == 0) {
-                uint32_t now = time_us_32();
-                if (lastRefreshUs != 0) {
-                    uint32_t elapsed = now - lastRefreshUs;
-                    measuredRefreshHz = 32000000u / elapsed;
-                }
-                lastRefreshUs = now;
-            }
+    surface_ = surface;
+    mapping_ = mapping;
+    // One sampler, validated once for the whole conversion.
+    sampler_ = new (samplerStorage_) DisplayPixelSampler(surface_, mapping_, config_);
+    if (!sampler_->Valid()) {
+        sampler_->~DisplayPixelSampler();
+        sampler_ = nullptr;
+        return Result::InvalidValue;
+    }
+    cursor_ = Hub75::EncodeCursor{};
+    pendingFrame_ = surface.frame;
+    phase_ = Phase::Encoding;
+    return Result::Ok;
+}
+
+void Hub75PanelDriver::PollRefresh() {
+    if (!inited_ || quiesced_ || faulted_) return;
+
+    if (phase_ == Phase::Encoding) {
+        // Bounded conversion slice: kEncodeSliceRecords records (<= 1 KiB)
+        // per call; no per-plane CPU dwell, no blocking.
+        const uint8_t bank = activeDataBank_ ^ 1;
+        Hub75::EncodeSlice(*sampler_, config_.width, DataBank(bank), cursor_,
+                           kEncodeSliceRecords);
+        if (cursor_.Done()) {
+            sampler_->~DisplayPixelSampler();
+            sampler_ = nullptr;             // RGB source fully consumed here
+            const uint32_t irqState = save_and_disable_interrupts();
+            phase_ = Phase::Armed;
+            __dmb();                        // publish fully written immutable bank
+            armedDataBank_ = bank;
+            restore_interrupts(irqState);
+        }
+    }
+
+    // Watchdog: a stalled scan must blank, never hold a lit row.
+    const uint32_t irqState = save_and_disable_interrupts();
+    const uint64_t lastScan = lastScanUs_;
+    restore_interrupts(irqState);
+    if (time_us_64() - lastScan > kScanWatchdogUs) {
+        ++forcedBlanks_;
+        ForceBlank();
+        armedDataBank_ = 0xff;
+        if (phase_ == Phase::Armed || phase_ == Phase::Scanning) {
+            PushEvent(PglRuntime::Completion::Failed, PglRuntime::Result::Io,
+                      time_us_64(), true);
+            phase_ = Phase::Idle;
+        } else if (phase_ == Phase::Encoding) {
+            if (sampler_) { sampler_->~DisplayPixelSampler(); sampler_ = nullptr; }
+            PushEvent(PglRuntime::Completion::Failed, PglRuntime::Result::Io,
+                      time_us_64(), true);
+            phase_ = Phase::Idle;
         }
     }
 }
 
-// ─── Test Patterns ──────────────────────────────────────────────────────────
-
-void Hub75Driver::FillTestPattern(uint16_t* fb, uint8_t pattern) {
-    switch (pattern) {
-        case 0: {
-            // Solid red
-            for (uint32_t i = 0; i < PANEL_W * PANEL_H; i++) {
-                fb[i] = 0xF800;  // RGB565 red
-            }
-            break;
-        }
-        case 1: {
-            // RGB gradient: R varies with X, G with Y, B with X+Y
-            for (uint16_t y = 0; y < PANEL_H; y++) {
-                for (uint16_t x = 0; x < PANEL_W; x++) {
-                    uint8_t r = (x * 255) / PANEL_W;
-                    uint8_t g = (y * 255) / PANEL_H;
-                    uint8_t b = ((x + y) * 255) / (PANEL_W + PANEL_H);
-                    fb[y * PANEL_W + x] = ((r >> 3) << 11)
-                                        | ((g >> 2) << 5)
-                                        | (b >> 3);
-                }
-            }
-            break;
-        }
-        case 2: {
-            // Checkerboard (8x8 tiles)
-            for (uint16_t y = 0; y < PANEL_H; y++) {
-                for (uint16_t x = 0; x < PANEL_W; x++) {
-                    bool black = ((x / 8) + (y / 8)) & 1;
-                    fb[y * PANEL_W + x] = black ? 0x0000 : 0xFFFF;
-                }
-            }
-            break;
-        }
-        case 3: {
-            // Color bars: 8 vertical bars (R, G, B, Y, C, M, W, BLK)
-            uint16_t colors[8] = {
-                0xF800, 0x07E0, 0x001F, 0xFFE0,
-                0x07FF, 0xF81F, 0xFFFF, 0x0000
-            };
-            uint16_t barWidth = PANEL_W / 8;
-            for (uint16_t y = 0; y < PANEL_H; y++) {
-                for (uint16_t x = 0; x < PANEL_W; x++) {
-                    uint8_t bar = x / barWidth;
-                    if (bar > 7) bar = 7;
-                    fb[y * PANEL_W + x] = colors[bar];
-                }
-            }
-            break;
-        }
-        default:
-            // Black
-            memset(fb, 0, PANEL_W * PANEL_H * 2);
-            break;
+bool Hub75PanelDriver::PopEvent(DisplayEvent& event) {
+    const uint32_t irqState = save_and_disable_interrupts();
+    const bool available = eventTail_ != eventHead_;
+    if (available) {
+        event = events_[eventTail_];
+        eventTail_ = uint8_t((eventTail_ + 1) & 3u);
     }
+    restore_interrupts(irqState);
+    return available;
 }
+
+// ─── Clock quiesce / resume ─────────────────────────────────────────────────
+
+PglRuntime::Result Hub75PanelDriver::Quiesce() {
+    using Result = PglRuntime::Result;
+    if (!inited_) return Result::BadState;
+    if (quiesced_) return Result::Ok;
+
+    PIO pio = dataLease_.pio;
+    // Park request: the row SM stalls at WAIT 0 IRQ 3 (side 2 = OE high) at
+    // the next whole-scan boundary and cannot advance past it, so the OE
+    // gate is race-free even if this context is preempted afterwards.
+    const uint32_t irqState = save_and_disable_interrupts();
+    const uint32_t startScan = scanCount_;
+    pio->irq_force = (1u << 3);
+    restore_interrupts(irqState);
+    const absolute_time_t deadline = make_timeout_time_us(kQuiesceTimeoutUs);
+    while (scanCount_ == startScan) {
+        if (time_reached(deadline)) {
+            ++forcedBlanks_;
+            ForceBlank();        // fault path: abort + SIO blank
+            quiesced_ = true;
+            return Result::Timeout;  // safe blank is not a successful scan drain
+        }
+        tight_loop_contents();
+    }
+    pio_set_irqn_source_enabled(pio, 0, pis_interrupt0, false);
+    hw_clear_bits(&dma_hw->ch[dmaData_].al1_ctrl, DMA_CH0_CTRL_TRIG_EN_BITS);
+    hw_clear_bits(&dma_hw->ch[dmaCtrl_].al1_ctrl, DMA_CH0_CTRL_TRIG_EN_BITS);
+    dma_channel_abort(dmaData_);
+    dma_channel_abort(dmaCtrl_);
+    pio_sm_set_enabled(pio, dataLease_.sm, false);
+    pio_sm_set_enabled(pio, rowLease_.sm, false);
+    pio_interrupt_clear(pio, 0);
+    quiesced_ = true;
+    return Result::Ok;
+}
+
+PglRuntime::Result Hub75PanelDriver::Resume(uint32_t systemClockHz) {
+    using Result = PglRuntime::Result;
+    if (!inited_) return Result::BadState;
+    if (!quiesced_ && !faulted_) return Result::BadState;  // Quiesce() must gate first
+    const uint32_t divider = Hub75::PixelClockDivFrac8(systemClockHz);
+    if (!systemClockHz || divider < 256u || divider > 0xffffffu)
+        return Result::InvalidValue;
+
+    clockHz_ = systemClockHz;
+    PIO pio = dataLease_.pio;
+
+    // If a fault blank drove pins via SIO, hand them back to the PIO block.
+    for (uint8_t f = 0; f < 4; ++f) pio_interrupt_clear(pio, f);
+
+    // Fresh SM state (PC at program offset) with recomputed dividers.
+    {
+        pio_sm_config c = hub75_data_program_get_default_config(dataLease_.offset);
+        sm_config_set_wrap(&c, dataLease_.offset + hub75_data_wrap_target,
+                           dataLease_.offset + hub75_data_wrap);
+        sm_config_set_sideset_pins(&c, GpuConfig::HUB75_CLK_PIN);
+        sm_config_set_out_pins(&c, GpuConfig::HUB75_R1_PIN, 6);
+        sm_config_set_set_pins(&c, GpuConfig::HUB75_CLK_PIN, 1);
+        sm_config_set_out_shift(&c, true, true, 6);
+        sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+        const uint32_t div = Hub75::PixelClockDivFrac8(systemClockHz);
+        sm_config_set_clkdiv_int_frac8(&c, uint16_t(div >> 8), uint8_t(div & 0xff));
+        pio_sm_init(pio, dataLease_.sm, dataLease_.offset, &c);
+        pio_sm_set_pins_with_mask(pio, dataLease_.sm, 0,
+                                 0x7fu << GpuConfig::HUB75_R1_PIN);
+        pio_sm_set_consecutive_pindirs(pio, dataLease_.sm, GpuConfig::HUB75_R1_PIN, 7, true);
+    }
+    {
+        pio_sm_config c = hub75_row_program_get_default_config(rowLease_.offset);
+        sm_config_set_wrap(&c, rowLease_.offset + hub75_row_wrap_target,
+                           rowLease_.offset + hub75_row_wrap);
+        sm_config_set_sideset_pins(&c, GpuConfig::HUB75_LAT_PIN);
+        sm_config_set_out_pins(&c, GpuConfig::HUB75_ADDR_A, 5);
+        sm_config_set_set_pins(&c, GpuConfig::HUB75_LAT_PIN, 2);
+        sm_config_set_out_shift(&c, true, false, 32);
+        sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+        sm_config_set_clkdiv(&c, 1.0f);
+        pio_sm_init(pio, rowLease_.sm, rowLease_.offset, &c);
+        pio_sm_set_pins_with_mask(pio, rowLease_.sm, 1u << GpuConfig::HUB75_OE_PIN,
+                                 (3u << GpuConfig::HUB75_LAT_PIN) |
+                                 (31u << GpuConfig::HUB75_ADDR_A));
+        pio_sm_set_consecutive_pindirs(pio, rowLease_.sm, GpuConfig::HUB75_LAT_PIN, 7, true);
+    }
+    for (uint8_t pin = GpuConfig::HUB75_R1_PIN; pin <= GpuConfig::HUB75_ADDR_E; ++pin)
+        pio_gpio_init(pio, pin);
+
+    // Dwell banks are content-free plane weights: rebuild both at the new
+    // clock (data banks are clock-independent and stay valid).
+    Hub75::EncodeControlBank(CtrlBank(0), brightness_, systemClockHz);
+    Hub75::EncodeControlBank(CtrlBank(1), brightness_, systemClockHz);
+
+    pio_sm_clear_fifos(pio, dataLease_.sm);
+    pio_sm_clear_fifos(pio, rowLease_.sm);
+    pio_sm_put(pio, dataLease_.sm, config_.width - 1);
+    pio_sm_put(pio, rowLease_.sm, Hub75::kRecordCount - 1);
+
+    {
+        dma_channel_config c = dma_channel_get_default_config(dmaData_);
+        channel_config_set_chain_to(&c, dmaData_);   // self = chaining disabled
+        channel_config_set_read_increment(&c, true);
+        channel_config_set_write_increment(&c, false);
+        channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
+        channel_config_set_dreq(&c, pio_get_dreq(pio, dataLease_.sm, true));
+        dma_channel_configure(dmaData_, &c, &pio->txf[dataLease_.sm],
+                              DataBank(activeDataBank_), scanBytes_, false);
+    }
+    {
+        dma_channel_config c = dma_channel_get_default_config(dmaCtrl_);
+        channel_config_set_chain_to(&c, dmaCtrl_);   // self = chaining disabled
+        channel_config_set_read_increment(&c, true);
+        channel_config_set_write_increment(&c, false);
+        channel_config_set_transfer_data_size(&c, DMA_SIZE_32);
+        channel_config_set_dreq(&c, pio_get_dreq(pio, rowLease_.sm, true));
+        dma_channel_configure(dmaCtrl_, &c, &pio->txf[rowLease_.sm],
+                              CtrlBank(activeCtrlBank_), Hub75::kRecordCount, false);
+    }
+
+    faulted_ = false;
+    quiesced_ = false;
+    pio_set_irqn_source_enabled(pio, 0, pis_interrupt0, true);
+    dma_start_channel_mask((1u << dmaData_) | (1u << dmaCtrl_));
+    pio_enable_sm_mask_in_sync(pio, (1u << dataLease_.sm) | (1u << rowLease_.sm));
+    lastScanUs_ = time_us_64();
+    return Result::Ok;
+}
+
+// ─── Brightness / caps ──────────────────────────────────────────────────────
+
+PglRuntime::Result Hub75PanelDriver::SetBrightness(uint8_t brightness) {
+    using Result = PglRuntime::Result;
+    if (!inited_) return Result::BadState;
+    const uint32_t irqState = save_and_disable_interrupts();
+    brightness_ = brightness;
+    if (!quiesced_ && !faulted_) {
+        // An already armed bank may become active in the ISR. Protect the
+        // bounded rebuild and publication together, including repeated calls.
+        const uint8_t freeBank = activeCtrlBank_ ^ 1;
+        Hub75::EncodeControlBank(CtrlBank(freeBank), brightness_, clockHz_);
+        __dmb();
+        armedCtrlBank_ = freeBank;
+    }
+    restore_interrupts(irqState);
+    return Result::Ok;
+}
+
+DisplayCapabilities Hub75PanelDriver::GetCaps() const {
+    DisplayCapabilities caps = {};
+    caps.type = DisplayType::Hub75;
+    if (inited_) {   // disabled: zero resource claims
+        caps.width = config_.width;
+        caps.height = config_.height;
+        caps.displayCompletion = true;   // whole-scan activation is observed
+        caps.pioStateMachines = 2;
+        caps.dmaChannels = 2;
+        caps.pioInstructions = 22;       // hub75_data 9 + hub75_row 13
+        caps.workspaceBytes = Hub75::RequiredWorkspaceBytes(config_.width);
+    }
+    return caps;
+}
+
+// ─── Factory ────────────────────────────────────────────────────────────────
+
+DisplayDriver& Hub75Backend() {
+    static Hub75PanelDriver instance;
+    return instance;
+}
+
+#endif // PICO_ON_DEVICE

@@ -207,47 +207,10 @@ PglVec3 TransformVertex(const PglTransform& t, const PglVec3& v) {
 }
 
 // ─── Projection ─────────────────────────────────────────────────────────────
-
-PglVec2 PerspectiveProject(const PglVec3& worldPos,
-                           const PglVec3& camPos,
-                           const PglQuat& camRot,
-                           float fovFactor,
-                           float screenW, float screenH,
-                           float* outZ) {
-    // Camera-relative position
-    PglVec3 rel = Sub(worldPos, camPos);
-    PglVec3 view = QuatRotate(QuatConjugate(camRot), rel);
-
-    // G5: outZ receives the TRUE view-space z.  The old code clamped z to
-    // 0.001 BEFORE writing outZ — that corrupted the depth fed to the
-    // Z-buffer and made the rasterizer's `z <= 0` near-cull dead code, so
-    // near-plane-crossing triangles survived as giant flat slivers.
-    // Rasterizer::PrepareFrame now clips against z = kNearPlaneZ before
-    // projection, so rasterized vertices always arrive with z > kNearPlaneZ.
-    const float z = view.z;
-    if (outZ) *outZ = z;
-
-    // Division guard ONLY: clamp the divisor for degenerate inputs that
-    // bypass clipping (mesh-AABB probe corners at/behind the camera) so the
-    // projection cannot produce inf/NaN screen coordinates.  This preserves
-    // the old screen-space result for those inputs; the callers reject them
-    // via the true outZ (AABB in-front test) or the near-plane clip.
-    const float zDiv = (z < kNearPlaneZ) ? kNearPlaneZ : z;
-    float invZ = fovFactor / zDiv;
-    return {
-        view.x * invZ + screenW * 0.5f,
-        view.y * invZ + screenH * 0.5f
-    };
-}
-
-PglVec2 OrthoProject(const PglVec3& worldPos,
-                     const PglVec3& camPos,
-                     float screenW, float screenH) {
-    return {
-        (worldPos.x - camPos.x) + screenW * 0.5f,
-        (worldPos.y - camPos.y) + screenH * 0.5f
-    };
-}
+// Projection now lives in the rasterizer (rasterizer.cpp: ViewSpacePoint /
+// ProjectViewZ / OrthoProjectScaled), which needs the full view-space vertex
+// for near-plane classification, camera scale, and perspective-correct
+// interpolation.  kNearPlaneZ (header) remains the declared near-plane constant.
 
 // ─── Triangle Utilities ─────────────────────────────────────────────────────
 

@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "protocol_major": 9,
+  "firmware_base": "c5897aad19974be64eda31d677506fe0cab842a4",
+  "sources": {
+    "ProtoGL": {
+      "path": "ProtoGL",
+      "remote": "git@github.com:BaiTian6641/ProtoGL.git",
+      "base_commit": "c0570d8dee80c06325f14b91ef262e471fa440ee"
+    },
+    "ProtoGC": {
+      "path": "ProtoGC",
+      "remote": "git@github.com:BaiTian6641/ProtoGC.git",
+      "base_commit": "f20373fbff86b0c84e8309c3f99cde2e97c27399"
+    },
+    "pico_sdk": {
+      "path": "third_party/pico-sdk",
+      "remote": "https://github.com/raspberrypi/pico-sdk.git",
+      "version": "2.3.1",
+      "commit": "079c6f39023649b154152db30f1d781e884879bc"
+    }
+  },
+  "toolchains": {
+    "arm_gcc": "14.2.1",
+    "native_gcc": "15.2.0",
+    "arduino_esp32": "3.3.6",
+    "esp_idf": "5.5.2"
+  },
+  "evidence": {
+    "native_baseline": "cube smoke, nine pixel-identical golden scenes, allocator lifecycle checks passed before semantic changes",
+    "rp_baseline": "current source compiled through LTO, then original inline assembly failed with offset out of range; no passing baseline ELF claimed",
+    "hardware": "no accessible serial devices or supplied board/application capture; physical qualification remains open"
+  }
+}

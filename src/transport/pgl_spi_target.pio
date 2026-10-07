@@ -1,0 +1,132 @@
+; ─── pgl_spi_target.pio ───────────────────────────────────────────────────────
+; PIO mode-0 SPI target for the ProtoGL runtime link (protocol v9).
+;
+; Pin map (GpuConfig, Pico2-safe): D0..D3 = GPIO0..3, SCK = GPIO4, CS = GPIO5.
+; Both programs use absolute WAIT pin indices (block GPIO base 0), JMP pin =
+; D0 (GPIO0). Every GPIO input is visible to every PIO block regardless of the
+; pad's output mux, so PIO1 samples D0..D3/SCK/CS while GPIO1 (MISO) is muxed
+; to PIO2 for output.
+;
+; pgl_spi_rx (30 words, PIO1, 1 SM, FIFO joined RX = 8 words):
+;   Host→RP receiver. Samples the single-lane prefix and pushes it as stream
+;   word 0 for EVERY transaction kind (a chained 1-transfer DMA channel parks
+;   it in a driver-owned scratch, so the prefix is never written into the
+;   payload). The last prefix bit then selects the following data width:
+;   0 → control (in pins,1), 1 → the reserved bulk program (the JMP at index
+;   10 is patched while the SM is idle: single-lane byte loop / quad byte loop
+;   / unarmed drain). Each byte is framed by a sentinel 1 bit shifted in FIRST
+;   (Y is preloaded with 1), followed by 8 single bits or 2 quad nibbles, then
+;   a manual push. Every complete-byte word therefore equals (1<<8)|byte; an
+;   8-bit DMA read drains the low byte. On CS rise the CPU disables the SM and
+;   exec-pushes the ISR residue: residue 0 or 1 → clean byte boundary; any
+;   larger value — including (1<<k) from k all-zero partial bits — is a
+;   partial bit cell. There is no per-bit or per-byte CPU ISR and no
+;   synchronizer bypass.
+;
+;   Instruction indices (pgl_spi_target.h checks the layout at Init):
+;     0 wait 0 pin 5          transaction start: CS low
+;     1 in y, 1               prefix sentinel
+;     2 set x, 6              7 remaining prefix bits
+;     3 wait 0 pin 4          prefix_bit:
+;     4 wait 1 pin 4          rising SCK (mode 0 sample edge)
+;     5 in pins, 1            sample D0
+;     6 jmp x--, prefix_bit
+;     7 push                  word 0 = (1<<8)|prefix (all kinds)
+;     8 jmp pin, bulk_prefix  D0 = last prefix bit: 1 → bulk dispatch
+;     9 jmp byte_single       control/read: single-lane byte loop
+;    10 jmp <patched>         bulk_prefix: PATCHED WHILE IDLE → 11 single /
+;                             19 quad / 27 drain
+;    11 in y, 1               byte_single: sentinel
+;    12 set x, 7
+;    13 wait 0 pin 4          single_bit:
+;    14 wait 1 pin 4
+;    15 in pins, 1
+;    16 jmp x--, single_bit
+;    17 push
+;    18 jmp byte_single
+;    19 in y, 1               byte_quad: sentinel
+;    20 set x, 1              2 nibbles
+;    21 wait 0 pin 4          quad_nibble:
+;    22 wait 1 pin 4
+;    23 in pins, 4            D3..D0 → nibble bits 3..0; first clock = high
+;                             nibble (bits7..4: D3=bit7 … D0=bit4)
+;    24 jmp x--, quad_nibble
+;    25 push
+;    26 jmp byte_quad
+;    27 wait 0 pin 4          drain: unarmed bulk — consume clocks, push nothing
+;    28 wait 1 pin 4
+;    29 jmp drain
+
+.program pgl_spi_rx
+    wait 0 pin 5
+    in y, 1
+    set x, 6
+prefix_bit:
+    wait 0 pin 4
+    wait 1 pin 4
+    in pins, 1
+    jmp x--, prefix_bit
+    push                    ; word 0 = (1<<8)|prefix for every transaction kind
+    jmp pin, bulk_prefix    ; D0 = last prefix bit: 1 -> bulk dispatch
+    jmp byte_single         ; control/read: single-lane byte loop
+bulk_prefix:
+    jmp byte_single         ; patched while idle: byte_single / byte_quad / drain
+byte_single:
+    in y, 1
+    set x, 7
+single_bit:
+    wait 0 pin 4
+    wait 1 pin 4
+    in pins, 1
+    jmp x--, single_bit
+    push
+    jmp byte_single
+byte_quad:
+    in y, 1
+    set x, 1
+quad_nibble:
+    wait 0 pin 4
+    wait 1 pin 4
+    in pins, 4
+    jmp x--, quad_nibble
+    push
+    jmp byte_quad
+drain:
+    wait 0 pin 4
+    wait 1 pin 4
+    jmp drain
+
+; pgl_spi_tx (17 words, PIO2, 1 SM, default 4+4 FIFOs):
+;   Status/read transmitter. Samples the first command bit (MSB) to decide:
+;   1 (0x80/0x81 write) → never drive MISO, park until CS high; 0 (0x00 read)
+;   → ignore exactly the remaining 7 command clocks, push one marker word into
+;   its own RX FIFO (a read cross-check for finalize; the captured wire prefix
+;   remains authoritative), enable
+;   the MISO driver only after the command phase, then stream prepacked
+;   byte<<24 words MSB first with autopull 8 (32-bit DMA, no per-byte ISR, no
+;   bounce copy). The 64-word DMA count enforces the record length; if the
+;   host stops early the CPU restarts the SM at CS rise, which clears the OSR
+;   shift counter, so the next read starts bit-aligned. CS rise also execs
+;   `set pindirs, 0`, releasing MISO.
+.program pgl_spi_tx
+tx_entry:
+    pull block              ; fresh prepacked word; TX FIFO is prefilled before READY
+    wait 0 pin 5            ; CS low
+    wait 0 pin 4            ; mode 0: SCK idles low
+    wait 1 pin 4            ; rising edge of command bit 7
+    jmp pin, write_mode     ; MSB=1 → host write: never drive MISO
+    set x, 6                ; ignore exactly the remaining 7 command clocks
+cmd_rest:
+    wait 0 pin 4
+    wait 1 pin 4
+    jmp x--, cmd_rest
+    push                    ; RX-FIFO marker: this transaction drove MISO
+    set pindirs, 1          ; drive MISO only after the command phase
+miso_bit:
+    wait 0 pin 4            ; falling edge → change MISO while SCK is low
+    out pins, 1             ; MSB first, autopull 8
+    wait 1 pin 4            ; host samples on the rising edge
+    jmp miso_bit
+write_mode:
+    wait 1 pin 5            ; park until CS high
+    jmp tx_entry

@@ -1,115 +1,23 @@
-/**
- * @file command_parser.h
- * @brief ProtoGL command buffer parser for the RP2350 GPU.
- *
- * Deserializes a ProtoGL frame (sync word → commands → CRC) received via
- * Octal SPI and updates the GPU's local SceneState (resource tables, draw list).
- *
- * Uses PglParser.h for alignment-safe reads — safe on both ARM Cortex-M33
- * (which supports unaligned access) and RISC-V Hazard3 (which may not).
- */
-
 #pragma once
-
+#include <cstddef>
 #include <cstdint>
-
-#include <PglTypes.h>  // PglParserErrorFlags (protocol v8 error accounting)
-
-// Forward declarations
+#include <PglRuntimeProtocol.h>
 struct SceneState;
-class QspiVramDriver;
-using OpiPsramDriver  = QspiVramDriver;  // legacy alias (mem_qspi_vram.h)
-using QspiPsramDriver = QspiVramDriver;  // legacy alias (mem_qspi_vram.h)
-class MemTierManager;
-class MemPoolManager;
-class DisplayManager;
 
 namespace CommandParser {
-
-/// Parse result codes
-enum class ParseResult : uint8_t {
-    Ok              = 0,  // Frame parsed successfully
-    CrcError        = 1,  // CRC-16 mismatch
-    InvalidSync     = 2,  // Missing or wrong sync word
-    TruncatedFrame  = 3,  // totalLength exceeds available data
-    UnknownOpcode   = 4,  // Encountered unrecognized opcode (non-fatal, skipped)
-    ResourceFull    = 5,  // Mesh/material table full, create command rejected
+struct BatchInfo {
+    uint32_t frameNumber = 0;
+    uint32_t frameTimeUs = 0;
+    uint16_t commands = 0;
+    bool resourceOnly = false;
 };
 
-/**
- * @brief Initialize the memory subsystem pointers used by memory opcodes.
- *
- * Must be called after memory drivers are initialized, before any frames
- * containing memory commands (0x30–0x3F) are parsed.
- *
- * @param opi    Unified QSPI VRAM driver — used for Channel A (Tier 1)
- *               access (may be nullptr if no external VRAM present).
- * @param qspi   Same unified driver — used for Channel B (Tier 2) access.
- *               GpuCore passes one QspiVramDriver instance for both.
- * @param tier   Tiered memory manager.
- * @param frontBuf  Pointer to the front (display) framebuffer.
- * @param backBuf   Pointer to the back (render) framebuffer.
- * @param fbPixels  Number of pixels per framebuffer.
- */
-void InitMemory(OpiPsramDriver* opi, QspiPsramDriver* qspi,
-                MemTierManager* tier,
-                const uint16_t* frontBuf, const uint16_t* backBuf,
-                uint32_t fbPixels);
-
-/**
- * @brief Update the framebuffer pointers after a swap.
- *
- * Called by gpu_core.cpp each frame after the buffer swap so that
- * CMD_FRAMEBUFFER_CAPTURE captures the correct buffer.
- */
-void UpdateFramebufferPtrs(const uint16_t* frontBuf, const uint16_t* backBuf);
-
-/**
- * @brief Initialize M11 display and pool subsystem pointers.
- *
- * Must be called after DisplayManager and MemPoolManager are created.
- *
- * @param displayMgr  Display manager singleton.
- * @param poolMgr     Memory pool manager.
- */
-void InitDisplayAndPools(DisplayManager* displayMgr, MemPoolManager* poolMgr);
-
-/**
- * @brief Parse a complete ProtoGL frame and update the scene state.
- *
- * Steps:
- *  1. Validate sync word (0x55AA)
- *  2. Read frame header (frameNumber, totalLength, commandCount)
- *  3. Validate CRC-16 over entire frame
- *  4. Iterate commands: switch on opcode → dispatch to handler
- *  5. Return result
- *
- * @param frameData   Pointer to the start of the frame (sync word).
- * @param frameLength Total frame length (from frame header's totalLength).
- * @param scene       Scene state to update with parsed commands.
- * @return ParseResult::Ok on success.
- */
-ParseResult Parse(const uint8_t* frameData, uint32_t frameLength,
-                  SceneState* scene);
-
-/**
- * @brief Latch a parser/command error (protocol v8).
- *
- * ORs `bit` into the latched error mask and increments the cumulative error
- * counter (saturating at 0xFFFF).  Call this on every fail-closed rejection:
- * the offending command/frame is skipped, never partially executed.
- * Surfaced to the host via PglExtendedStatusResponse (PGL_REG_EXTENDED_STATUS).
- */
-void NoteParserError(PglParserErrorFlags bit);
-
-/**
- * @brief Cumulative parser/command error count since boot (v8).
- */
+// Core0 only, after prior CPU/conversion readers retire. Entire batch is
+// decoded/validated/reserved before persistent metadata changes. Failure frees
+// only new reservations and preserves the previous scene and visible output.
+PglRuntime::Result Parse(const uint8_t* bytes, size_t length, SceneState* scene,
+                         BatchInfo& info, bool resourceOnly = false);
 uint16_t GetParserErrorCount();
-
-/**
- * @brief Latched PglParserErrorFlags bitmask since boot (v8).
- */
-uint16_t GetParserErrorMask();
-
-}  // namespace CommandParser
+uint32_t GetParserErrorMask();
+void ClearErrors();
+} // namespace CommandParser

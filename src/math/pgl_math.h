@@ -79,28 +79,18 @@ PglVec3 TransformVertex(const PglTransform& t, const PglVec3& v);
 
 // ─── Projection ─────────────────────────────────────────────────────────────
 
-/// View-space near plane (V9/G5).  Rasterizer::PrepareFrame clips every
+/// View-space near plane (declared convention).  The rasterizer clips every
 /// perspective triangle against the plane z = kNearPlaneZ before projection
 /// (Sutherland–Hodgman, 1–2 output triangles), so rasterized vertices always
-/// have view z > kNearPlaneZ.  PerspectiveProject keeps the value only as a
-/// division guard for degenerate inputs that bypass clipping (AABB probe
-/// corners).  The value preserves the historical de-facto near plane — the
-/// old 0.001 projection clamp.
+/// have view z >= kNearPlaneZ (crossing vertices lie on the plane).
+/// The value preserves the historical near plane (0.001 projection clamp).
+///
+/// The projection itself lives in the rasterizer (ViewSpacePoint /
+/// ProjectViewZ / OrthoProjectScaled in rasterizer.cpp): it needs the full
+/// view-space vertex for near-plane classification, camera scale, and
+/// perspective-correct interpolation — the old free functions here were
+/// removed with their last caller.
 inline constexpr float kNearPlaneZ = 0.001f;
-
-/// Perspective project: returns screen-space XY.  The TRUE view-space z is
-/// stored in *outZ (G5: no longer clamped — it feeds the Z-buffer).
-PglVec2 PerspectiveProject(const PglVec3& worldPos,
-                           const PglVec3& camPos,
-                           const PglQuat& camRot,
-                           float fovFactor,
-                           float screenW, float screenH,
-                           float* outZ);
-
-/// Orthographic project for 2D cameras.
-PglVec2 OrthoProject(const PglVec3& worldPos,
-                     const PglVec3& camPos,
-                     float screenW, float screenH);
 
 // ─── Triangle Utilities ─────────────────────────────────────────────────────
 

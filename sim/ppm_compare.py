@@ -4,6 +4,7 @@
 Compares two binary PPM images pixel-by-pixel and reports diff stats:
   - pixels differed (count of pixels where any RGB channel differs)
   - max per-channel delta (0-255)
+  - difference bounding box and first differing coordinate/RGB values
 
 Default mode is PIXEL-IDENTICAL (0 differing pixels).  Bounded-diff escape
 hatch for toolchain float variance (goldens are pinned to native g++ x86-64,
@@ -12,7 +13,8 @@ hatch for toolchain float variance (goldens are pinned to native g++ x86-64,
   ppm_compare.py A.ppm B.ppm [--max-diff-pixels N] [--max-channel-delta D]
 
 Exit codes: 0 = PASS (within bounds), 1 = FAIL, 2 = usage/parse error.
-Output (one line, consumed by run_golden.sh):
+Output includes a DIFF bounding box/first-pixel diagnostic when pixels differ,
+followed by one summary line (exit status is consumed by run_golden.sh):
   PASS pixels_differed=0 max_channel_delta=0 (of 8192 px)
   FAIL pixels_differed=17 max_channel_delta=23 (of 8192 px; limits: 0 px, 0 delta)
 """
@@ -81,6 +83,8 @@ def main(argv):
     total = wA * hA
     diff_pixels = 0
     max_delta = 0
+    min_x, min_y, max_x, max_y = wA, hA, -1, -1
+    first = None
     for px in range(total):
         o = px * 3
         d0 = abs(rasA[o] - rasB[o])
@@ -88,12 +92,21 @@ def main(argv):
         d2 = abs(rasA[o + 2] - rasB[o + 2])
         if d0 or d1 or d2:
             diff_pixels += 1
+            x, y = px % wA, px // wA
+            min_x, min_y = min(min_x, x), min(min_y, y)
+            max_x, max_y = max(max_x, x), max(max_y, y)
+            if first is None:
+                first = (x, y, tuple(rasA[o:o + 3]), tuple(rasB[o:o + 3]))
             m = d0 if d0 > d1 else d1
             if d2 > m:
                 m = d2
             if m > max_delta:
                 max_delta = m
 
+    if first is not None:
+        print("DIFF bbox=x[%d..%d] y[%d..%d] first=(%d,%d) actual=%s reference=%s"
+              % (min_x, max_x, min_y, max_y, first[0], first[1],
+                 first[2], first[3]))
     ok = (diff_pixels <= opts["--max-diff-pixels"]
           and max_delta <= opts["--max-channel-delta"])
     if ok:

@@ -1,0 +1,30 @@
+; ─── custom_array.pio ────────────────────────────────────────────────────────
+; Custom 8-bit parallel RGB888 byte stream for RP2350.
+;
+; Pins: DATA0..7 = GPIO6..13 (OUT group), CLK = GPIO14 (side-set).
+; LATCH (GPIO15) and OE (GPIO16) are CPU-driven SIO: the CPU pulses LATCH only
+; after the final clock of the complete stream has actually completed
+; (rearmed FDEBUG TXSTALL at the stalled `out`, CLK low), and asserts OE
+; (active low) only after that latch. OE stays blanked for the whole transfer
+; and during every blocked wait, so starvation/abort can never show a partial
+; frame.
+;
+; One byte per 2 SM cycles: `out` drives DATA with CLK low, `nop` raises CLK;
+; the receiver samples on the rising edge. Byte clock = SM clock / 2 =
+; 4 MHz at an 8 MHz SM clock (CUSTOM_PIXEL_CLOCK_HZ = 4 MHz).
+; clk_sys divider (int.frac8) is exact at 150/100/75 MHz
+; (18.75 / 12.5 / 9.375); the driver rejects inexact system clocks.
+;
+; Data: 32-bit FIFO words, shift-right OSR, autopull threshold 32, joined TX
+; FIFO. The first byte on the wire is the least significant byte of each word
+; (explicit little-endian packing, see CustomArray::PackStreamWord). Per pixel
+; three bytes are transmitted in R, G, B order; zero pad bytes lead the stream
+; so the bytes present after the complete count are exactly the final pixel.
+
+.program custom_rgb888
+.side_set 1
+
+.wrap_target
+    out pins, 8     side 0   ; byte on DATA0..7, CLK low
+    nop             side 1   ; CLK high: receiver samples the rising edge
+.wrap

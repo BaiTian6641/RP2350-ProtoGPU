@@ -14,9 +14,8 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-WORKSPACE="$(cd "$REPO_ROOT/.." && pwd)"
-PROTOGL_SRC="$WORKSPACE/ProtoGL/src"
-PROTOGC_SRC="$WORKSPACE/ProtoGC/src"
+PROTOGL_SRC="$REPO_ROOT/ProtoGL/src"
+PROTOGC_SRC="$REPO_ROOT/ProtoGC/src"
 BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/build/scene-check}"
 CXX="${CXX:-g++}"
 
@@ -37,6 +36,7 @@ set -e
     -DPGC_BACKEND_DESKTOP -DPROTOGC_OVERRIDE_NEW=0 \
     -I "$REPO_ROOT/src" -I "$PROTOGL_SRC" -I "$PROTOGC_SRC" \
     "$PROTOGC_SRC/pgc_desktop.cpp" \
+    "$REPO_ROOT/src/memory/mem_assets.cpp" "$REPO_ROOT/src/memory/scene_assets.cpp" \
     "$SCRIPT_DIR/check_scene_state.cpp" \
     -o "$BUILD_DIR/check_scene_state"
 set +e

@@ -1,0 +1,28 @@
+; ─── spi_display.pio ──────────────────────────────────────────────────────────
+; PIO serial transmitter for the SSD1331 OLED backend (P07) on RP2350.
+;
+; Same primitive as the official SDK st7789 example (sdk-2.3.1): two
+; instructions, joined TX FIFO, left/MSB-first shift, autopull threshold 8.
+; DMA (or init-time CPU writes) deliver bytes; RP2350 replicates each narrow
+; FIFO write across the word (RP2350 datasheet §2.1.5), so OUT bit 31 is the
+; byte's MSB first — RGB565 high byte first on the wire, sampled on the SCLK
+; rising edge, mode 0.  When the FIFO runs dry the SM stalls at OUT with
+; SCLK low (side-set applies while stalled), which is the known-idle
+; instruction used with the rearmed TXSTALL bit to prove shifter completion
+; after DMA depletion — DMA finished is NOT shifter finished.
+;
+; f_SCLK = clk_sys / (2 * clkdiv); the driver uses exact integer dividers so
+; f_SCLK stays <= 4 MHz (vendor serial ceiling 6.67 MHz).
+;
+;   OUT pin    : SDIN/MOSI (GPIO7)
+;   side-set   : SCLK (GPIO6), idle low
+;   CS/DC/RES  : plain SIO, owned by the driver (>= 1 us guards)
+;
+; Assembled footprint: 2 words.
+
+.program spi_display
+.side_set 1
+.wrap_target
+    out pins, 1         side 0      ; next bit, SCLK low
+    nop                 side 1      ; SCLK high — SSD1331 samples SDIN
+.wrap

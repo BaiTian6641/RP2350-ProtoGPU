@@ -14,15 +14,19 @@
  * Design rules:
  *   - Fixed-width 4-byte instructions for fast sequential decode
  *   - Jump-table dispatch (S-03): one handler function per opcode in a
- *     256-entry constexpr table indexed directly by the opcode byte;
- *     unknown opcodes fail closed to a shared skip handler (the old flat
- *     switch's default case)
+ *     256-entry constexpr table indexed directly by the opcode byte
  *   - No heap allocation — register file is on the stack
  *   - Each handler resolves exactly the operands its opcode reads, inlined
  *     via PsbResolveOperand() — unary ops no longer decode srcB (S-03)
  *   - Read-all-then-write: every handler reads ALL of its sources (including
  *     regs[dst] for the 3-operand forms) into locals BEFORE storing the
  *     result — the PGLSL register allocator's LIFO temp scheme depends on it.
+ *
+ * Verification (P05-08): unknown opcodes, malformed operands and out-of-range
+ * vector register bases are rejected ONCE by DecodeShaderProgram() at upload;
+ * Execute() below runs only verified programs and performs no per-pixel
+ * re-validation.  The dispatch table's OpUnknown entry is retained purely as
+ * fail-closed defence in depth.
  *
  * Performance: ~8 cycles per instruction → 40-instruction shader ≈ 320 cycles/pixel
  *              8192 pixels × 320 = 2.6M cycles ≈ 0.017 ms @ 150 MHz.
@@ -36,6 +40,7 @@
 
 #include <array>
 #include <cstring>
+#include <cmath>
 
 // Namespace alias for brevity in the opcode handlers
 namespace BE = PglShaderBackend;
@@ -330,7 +335,7 @@ constexpr std::array<PsbOpHandler, 256> kPsbDispatch = PsbBuildDispatchTable();
 
 // ─── VM Execute ─────────────────────────────────────────────────────────────
 
-void PglShaderVM::Execute(const ShaderProgram& prog,
+void PglShaderVM::Execute(const ShaderProgram& prog, const float* uniforms,
                            float fragX, float fragY,
                            float inR, float inG, float inB,
                            const uint16_t* fb, uint16_t w, uint16_t h,
@@ -359,7 +364,7 @@ void PglShaderVM::Execute(const ShaderProgram& prog,
     // ── Main interpreter loop: fetch → decode → dispatch via jump table ─
     PsbVmContext ctx;
     ctx.regs      = regs_;
-    ctx.uniforms  = prog.uniforms;
+    ctx.uniforms  = uniforms;
     ctx.constants = prog.constants;
     ctx.fb        = fb;
     ctx.fbW       = w;
@@ -382,8 +387,256 @@ void PglShaderVM::Execute(const ShaderProgram& prog,
     }
 
     // ── Read output from gl_FragColor registers ─────────────────────────
-    outR = regs_[PSB_REG_OUT_R];
-    outG = regs_[PSB_REG_OUT_G];
-    outB = regs_[PSB_REG_OUT_B];
+    // Non-finite containment (P05-08): intermediate overflow (e.g. MUL of
+    // large constants, EXP(x>88)) may leave NaN/±inf in the output
+    // registers; a shader must never poison the framebuffer, so non-finite
+    // channels are contained to 0.0 here — once per pixel, not per upload.
+    outR = std::isfinite(regs_[PSB_REG_OUT_R]) ? regs_[PSB_REG_OUT_R] : 0.0f;
+    outG = std::isfinite(regs_[PSB_REG_OUT_G]) ? regs_[PSB_REG_OUT_G] : 0.0f;
+    outB = std::isfinite(regs_[PSB_REG_OUT_B]) ? regs_[PSB_REG_OUT_B] : 0.0f;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── PSB1 blob decode + verification (P05-08) ────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Per-opcode verification/cost rule.  Vector widths >1 require REGISTER
+// operands whose base + width stays inside the 32-register file.
+struct PsbOpRule {
+    uint8_t dstVec;   // 0 = no destination (operand must be UNUSED), else register vector width written
+    uint8_t srcAVec;  // 0 = operand unused, 1 = readable scalar operand, 2..4 = register vector width
+    uint8_t srcBVec;  // same encoding as srcAVec
+    uint8_t weight;   // weighted ops charged per executed pixel (frame budget accounting)
+};
+
+constexpr std::array<PsbOpRule, 256> PsbBuildRuleTable() {
+    // {dstVec, srcAVec, srcBVec, weight}; {} = invalid opcode (rejected)
+    std::array<PsbOpRule, 256> t{};
+
+    t[PSB_OP_NOP]   = {0, 0, 0, 0};
+    t[PSB_OP_END]   = {0, 0, 0, 0};
+
+    t[PSB_OP_MOV]   = {1, 1, 0, 1};
+    t[PSB_OP_ADD]   = {1, 1, 1, 2};
+    t[PSB_OP_SUB]   = {1, 1, 1, 2};
+    t[PSB_OP_MUL]   = {1, 1, 1, 2};
+    t[PSB_OP_DIV]   = {1, 1, 1, 2};
+    t[PSB_OP_FMA]   = {1, 1, 1, 2};  // also reads old dst (register dst enforced)
+    t[PSB_OP_NEG]   = {1, 1, 0, 1};
+
+    t[PSB_OP_SIN]   = {1, 1, 0, 4};
+    t[PSB_OP_COS]   = {1, 1, 0, 4};
+    t[PSB_OP_TAN]   = {1, 1, 0, 4};
+    t[PSB_OP_ASIN]  = {1, 1, 0, 4};
+    t[PSB_OP_ACOS]  = {1, 1, 0, 4};
+    t[PSB_OP_ATAN]  = {1, 1, 0, 4};
+    t[PSB_OP_ATAN2] = {1, 1, 1, 4};
+    t[PSB_OP_POW]   = {1, 1, 1, 8};
+    t[PSB_OP_EXP]   = {1, 1, 0, 4};
+    t[PSB_OP_LOG]   = {1, 1, 0, 4};
+    t[PSB_OP_SQRT]  = {1, 1, 0, 4};
+    t[PSB_OP_RSQRT] = {1, 1, 0, 4};
+    t[PSB_OP_ABS]   = {1, 1, 0, 1};
+    t[PSB_OP_SIGN]  = {1, 1, 0, 1};
+    t[PSB_OP_FLOOR] = {1, 1, 0, 1};
+    t[PSB_OP_CEIL]  = {1, 1, 0, 1};
+    t[PSB_OP_FRACT] = {1, 1, 0, 1};
+    t[PSB_OP_MOD]   = {1, 1, 1, 2};
+
+    t[PSB_OP_MIN]   = {1, 1, 1, 1};
+    t[PSB_OP_MAX]   = {1, 1, 1, 1};
+    t[PSB_OP_CLAMP] = {1, 1, 1, 3};  // reads old dst as hi
+    t[PSB_OP_MIX]   = {1, 1, 1, 3};  // reads old dst as t
+    t[PSB_OP_STEP]  = {1, 1, 1, 1};
+    t[PSB_OP_SSTEP] = {1, 1, 1, 3};  // reads old dst as x
+
+    t[PSB_OP_DOT2]  = {1, 2, 2, 3};
+    t[PSB_OP_DOT3]  = {1, 3, 3, 4};
+    t[PSB_OP_LEN2]  = {1, 2, 0, 5};
+    t[PSB_OP_LEN3]  = {1, 3, 0, 6};
+    t[PSB_OP_NORM2] = {2, 2, 0, 6};
+    t[PSB_OP_NORM3] = {3, 3, 0, 8};
+    t[PSB_OP_CROSS] = {3, 3, 3, 6};
+    t[PSB_OP_DIST2] = {1, 2, 2, 5};
+
+    t[PSB_OP_TEX2D] = {4, 2, 0, 8};
+
+    // LCONST/LUNI carry a RAW pool index in srcA (not an encoded operand);
+    // validated against the declared pool counts in the decode loop below.
+    t[PSB_OP_LCONST] = {1, 1, 0, 1};
+    t[PSB_OP_LUNI]   = {1, 1, 0, 1};
+
+    return t;
+}
+
+constexpr std::array<PsbOpRule, 256> kPsbOpRules = PsbBuildRuleTable();
+
+/// Validate a READABLE SCALAR operand byte against the declared pools.
+bool PsbValidScalarOperand(uint8_t op, uint8_t constCount) {
+    if (op <= PSB_OP_REG_END)     return true;                     // r0–r31
+    if (op <= PSB_OP_UNIFORM_END) return true;                     // u0–u15 (undeclared reads as 0.0)
+    if (op <= PSB_OP_CONST_END)   return (op - PSB_OP_CONST_BASE) < constCount;
+    if (op <= PSB_OP_LITERAL_END) return true;                     // inline literal
+    return false;                                                  // 0x60–0xFE and 0xFF: invalid to READ
+}
+
+/// Validate one operand field against its rule (0 = must be UNUSED,
+/// 1 = readable scalar, 2..4 = register vector base).
+bool PsbValidOperand(uint8_t op, uint8_t vecWidth, uint8_t constCount) {
+    if (vecWidth == 0) return op == PSB_OP_UNUSED;
+    if (vecWidth == 1) return PsbValidScalarOperand(op, constCount);
+    // Vector: must be a register whose consecutive range stays in r0–r31.
+    return op <= PSB_OP_REG_END &&
+           static_cast<uint16_t>(op) + vecWidth <= PSB_NUM_REGISTERS;
+}
+
+}  // namespace
+
+PglRuntime::Result DecodeShaderProgram(const uint8_t* blob, size_t bytes,
+                                       uint16_t programId,
+                                       ShaderProgram& destination) {
+    using R = PglRuntime::Result;
+
+    // Fail-closed: any rejection leaves an INACTIVE destination slot.
+    destination = ShaderProgram{};
+
+    if (!blob) return R::BadPacket;
+    if (programId >= GpuConfig::MAX_SHADER_PROGRAMS) return R::InvalidHandle;
+    if (bytes < sizeof(PglShaderProgramHeader) || bytes > PSB_MAX_PROGRAM_SIZE)
+        return R::BadPacket;
+
+    PglShaderProgramHeader hdr;
+    std::memcpy(&hdr, blob, sizeof(hdr));
+
+    if (hdr.magic != PSB_MAGIC || hdr.version != PSB_VERSION) return R::Incompatible;
+    if (hdr.reserved != 0) return R::InvalidValue;
+    if (hdr.flags & ~PSB_FLAG_VALID_MASK) return R::InvalidValue;
+    if (hdr.uniformCount > PSB_MAX_UNIFORMS ||
+        hdr.constCount   > PSB_MAX_CONSTANTS ||
+        hdr.instrCount   > PSB_MAX_INSTRUCTIONS ||
+        hdr.instrCount   == 0)                          return R::InvalidValue;
+
+    // Exact layout: header + uniform table + constants + instructions.
+    const size_t uniformBytes = static_cast<size_t>(hdr.uniformCount) * sizeof(PglUniformDescriptor);
+    const size_t constBytes   = static_cast<size_t>(hdr.constCount)   * sizeof(float);
+    const size_t instrBytes   = static_cast<size_t>(hdr.instrCount)   * sizeof(uint32_t);
+    if (bytes != sizeof(hdr) + uniformBytes + constBytes + instrBytes)
+        return R::BadPacket;
+
+    const uint8_t* pUniforms = blob + sizeof(hdr);
+    const uint8_t* pConsts   = pUniforms + uniformBytes;
+    const uint8_t* pInstrs   = pConsts + constBytes;
+
+    ShaderProgram tmp;  // zero-initialised (default member initialisers)
+    tmp.programId    = programId;
+    tmp.uniformCount = hdr.uniformCount;
+    tmp.constCount   = hdr.constCount;
+    tmp.instrCount   = hdr.instrCount;
+    tmp.flags        = hdr.flags;  // informational only — readsFramebuffer below is authoritative
+
+    // ── Constants pool: bounded AND finite ──────────────────────────────
+    for (uint8_t i = 0; i < hdr.constCount; ++i) {
+        float c;
+        std::memcpy(&c, pConsts + i * sizeof(float), sizeof(float));
+        if (!std::isfinite(c)) return R::InvalidValue;
+        tmp.constants[i] = c;
+    }
+
+    // ── Uniform descriptors: user slots only, typed, non-overlapping ────
+    // Slots 0–2 are runtime auto-bound (resolution/time) and may not be
+    // declared.  Declared defaults are applied to the uniform table now.
+    uint32_t usedSlots = 0x7u;  // bits 0..2 = auto-bound
+    for (uint8_t i = 0; i < hdr.uniformCount; ++i) {
+        PglUniformDescriptor desc;
+        std::memcpy(&desc, pUniforms + i * sizeof(desc), sizeof(desc));
+
+        if (desc.type > PSB_UNIFORM_VEC4) return R::InvalidValue;
+        const uint8_t comps = static_cast<uint8_t>(desc.type) + 1;
+        if (desc.slot < PSB_USER_UNIFORM_START) return R::InvalidValue;
+        if (static_cast<uint16_t>(desc.slot) + comps > PSB_MAX_UNIFORMS)
+            return R::InvalidValue;
+        const uint32_t mask = ((1u << comps) - 1u) << desc.slot;
+        if (usedSlots & mask) return R::InvalidValue;  // overlapping descriptors
+        usedSlots |= mask;
+
+        tmp.uniformNameHashes[desc.slot] = desc.nameHash;
+        tmp.uniformTypes[desc.slot]      = desc.type;
+
+        if (desc.defaultValueOffset != PSB_UNIFORM_NO_DEFAULT) {
+            const uint32_t off = desc.defaultValueOffset;
+            if ((off & 3u) != 0 ||
+                off + static_cast<uint32_t>(comps) * sizeof(float) > constBytes)
+                return R::InvalidValue;
+            std::memcpy(&tmp.uniforms[desc.slot], pConsts + off,
+                        comps * sizeof(float));  // constants already finite-checked
+        }
+        // PSB_UNIFORM_NO_DEFAULT → components stay 0.0f (defined default)
+    }
+
+    // ── Instruction stream: opcodes, operand classes, vector ranges ─────
+    uint32_t weightedCost = 0;
+    bool readsFramebuffer = false;
+
+    for (uint16_t pc = 0; pc < hdr.instrCount; ++pc) {
+        uint32_t raw;
+        std::memcpy(&raw, pInstrs + pc * sizeof(uint32_t), sizeof(uint32_t));
+
+        const uint8_t opcode = static_cast<uint8_t>(raw & 0xFF);
+        const uint8_t dst    = static_cast<uint8_t>((raw >> 8) & 0xFF);
+        const uint8_t srcA   = static_cast<uint8_t>((raw >> 16) & 0xFF);
+        const uint8_t srcB   = static_cast<uint8_t>((raw >> 24) & 0xFF);
+
+        const PsbOpRule& rule = kPsbOpRules[opcode];
+        if (rule.dstVec == 0 && rule.srcAVec == 0 && rule.srcBVec == 0 &&
+            rule.weight == 0 && opcode != PSB_OP_NOP && opcode != PSB_OP_END)
+            return R::InvalidValue;  // unknown opcode — rejected BEFORE execution
+
+        // Destination: no-dst ops require UNUSED; otherwise a register whose
+        // (possibly vector) consecutive range stays inside the register file.
+        if (rule.dstVec == 0) {
+            if (dst != PSB_OP_UNUSED) return R::InvalidValue;
+        } else {
+            if (dst > PSB_OP_REG_END ||
+                static_cast<uint16_t>(dst) + rule.dstVec > PSB_NUM_REGISTERS)
+                return R::InvalidValue;
+        }
+
+        if (!PsbValidOperand(srcA, rule.srcAVec, hdr.constCount))
+            return R::InvalidValue;
+        if (!PsbValidOperand(srcB, rule.srcBVec, hdr.constCount))
+            return R::InvalidValue;
+
+        // Raw pool-index operands (LCONST/LUNI): bounded by DECLARED counts.
+        if (opcode == PSB_OP_LCONST && srcA >= hdr.constCount) return R::InvalidValue;
+        if (opcode == PSB_OP_LUNI   && srcA >= PSB_MAX_UNIFORMS) return R::InvalidValue;
+
+        // END semantics: exactly one END, as the LAST instruction — no
+        // unreachable trailing code, no fall-off without END.
+        if (opcode == PSB_OP_END && pc != hdr.instrCount - 1) return R::InvalidValue;
+
+        if (opcode == PSB_OP_TEX2D) readsFramebuffer = true;
+        weightedCost += rule.weight;
+        tmp.instructions[pc] = raw;
+    }
+
+    if ((tmp.instructions[hdr.instrCount - 1] & 0xFF) != PSB_OP_END)
+        return R::InvalidValue;  // last instruction must be END
+
+    // Derived framebuffer-read requirement (never the host flag): a program
+    // containing TEX2D must have asked for the snapshot — TEX-without-flag
+    // is malformed and rejected at upload, not patched over at run time.
+    if (readsFramebuffer && !(hdr.flags & PSB_FLAG_NEEDS_SCRATCH_COPY))
+        return R::InvalidValue;
+
+    // ── Commit: publish only a fully verified program ───────────────────
+    tmp.active           = true;
+    tmp.verified         = true;
+    tmp.readsFramebuffer = readsFramebuffer;
+    tmp.weightedCost     = weightedCost;
+
+    destination = tmp;
+    return R::Ok;
 }
 

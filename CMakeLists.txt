@@ -1,157 +1,129 @@
 cmake_minimum_required(VERSION 3.20)
 
-# ─── Pico SDK import (must be before project()) ─────────────────────────────
+if(NOT PICO_SDK_PATH AND NOT DEFINED ENV{PICO_SDK_PATH})
+    set(PICO_SDK_PATH "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pico-sdk")
+endif()
+set(PICO_PLATFORM rp2350-arm-s CACHE STRING "RP2350 Arm platform")
 include(pico_sdk_import.cmake)
-
 project(protogl_gpu C CXX ASM)
-
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# ─── Initialize the Pico SDK ────────────────────────────────────────────────
-pico_sdk_init()
+set(BOOT_STORAGE FLASH_LOCAL CACHE STRING "RAM_HOST or FLASH_LOCAL")
+set_property(CACHE BOOT_STORAGE PROPERTY STRINGS RAM_HOST FLASH_LOCAL)
+set(DEFAULT_DISPLAY SPI CACHE STRING "SPI, HUB, LED, CUSTOM, or NONE")
+set_property(CACHE DEFAULT_DISPLAY PROPERTY STRINGS SPI HUB LED CUSTOM NONE)
+set(PSRAM OFF CACHE STRING "Selected-CS QMI optional asset RAM")
+set_property(CACHE PSRAM PROPERTY STRINGS OFF ON)
+option(HOSTLESS_DEMO "Built-in graphics-command cube diagnostic" OFF)
 
-# ─── Headless Self-Test Option ───────────────────────────────────────────────
-# When enabled, the firmware boots into a standalone SSD1331 OLED display test
-# (rotating gradient triangle with FPS + CPU usage overlay) instead of the
-# normal host-driven render pipeline.  Useful for board bringup without an
-# ESP32-S3 host connected.
-option(RP2350GPU_HEADLESS_SELFTEST
-    "Build headless self-test mode (SSD1331 OLED triangle demo)" OFF)
-
-# ─── ProtoGL shared headers (wire-format types, parser, CRC) ────────────────
-set(PROTOGL_SHARED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ProtoGL/src")
-
-# ─── ProtoGC shared memory library (scene heap allocator + pico backend) ────
-set(PROTOGC_SHARED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ProtoGC/src")
-
-# ─── Source files ────────────────────────────────────────────────────────────
-add_executable(protogl_gpu
-    src/main.cpp
-    src/gpu_core.cpp
-    src/gpu_clock.cpp
-    src/command_parser.cpp
-    src/display/hub75_driver.cpp
-    src/transport/octal_spi_rx.cpp
-    src/transport/i2c_slave.cpp
-    src/math/pgl_math.cpp
-    src/render/rasterizer.cpp
-    src/render/rasterizer_2d.cpp
-    src/render/quadtree.cpp
-    src/render/triangle2d.cpp
-    src/render/screenspace_effects.cpp
-    src/render/pgl_shader_vm.cpp
-    src/scheduler/pgl_job_scheduler_rp2350.cpp
-    src/scheduler/pgl_tile_scheduler.cpp
-    src/memory/mem_qspi_vram.cpp
-    src/memory/mem_tier.cpp
-    src/memory/flash_persist.cpp
-    src/display/display_manager.cpp
-    src/display/i2c_hud_driver.cpp
-    src/selftest/gpu_selftest.cpp
-    src/selftest/ssd1331_driver.cpp
-    src/selftest/headless_selftest.cpp
-
-    # ProtoGC platform backend (scene heap allocator is header-only)
-    ${PROTOGC_SHARED_DIR}/pgc_pico.cpp
-)
-
-target_include_directories(protogl_gpu PRIVATE
-    src
-    ${PROTOGL_SHARED_DIR}
-    ${PROTOGC_SHARED_DIR}
-)
-
-# ─── Pico SDK libraries ─────────────────────────────────────────────────────
-target_link_libraries(protogl_gpu
-    pico_stdlib
-    pico_multicore
-    pico_i2c_slave
-    hardware_pio
-    hardware_dma
-    hardware_i2c
-    hardware_gpio
-    hardware_clocks
-    hardware_adc
-    hardware_spi
-    hardware_flash
-    hardware_xip_cache)
-
-# ─── PIO programs ───────────────────────────────────────────────────────────
-pico_generate_pio_header(protogl_gpu
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/display/hub75.pio
-)
-pico_generate_pio_header(protogl_gpu
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/octal_spi_rx.pio
-)
-
-# ─── Serial output for debugging ────────────────────────────────────────────
-# UART0 TX on GPIO 16, RX on GPIO 17.
-# HUB75 is disabled, so those pins are free for UART.
-# USB stdio disabled — USB CDC caused processor hangs during PIO/DMA init.
-pico_enable_stdio_usb(protogl_gpu 0)
-pico_enable_stdio_uart(protogl_gpu 1)
-
-target_compile_definitions(protogl_gpu PRIVATE
-    PICO_DEFAULT_UART=0
-    PICO_DEFAULT_UART_TX_PIN=16
-    PICO_DEFAULT_UART_RX_PIN=17
-)
-
-# ─── Headless self-test compile flag ─────────────────────────────────────────
-if(RP2350GPU_HEADLESS_SELFTEST)
-    target_compile_definitions(protogl_gpu PRIVATE
-        RP2350GPU_HEADLESS_SELFTEST=1
-    )
-    message(STATUS "Headless self-test mode ENABLED (SSD1331 OLED)")
+if(NOT BOOT_STORAGE MATCHES "^(RAM_HOST|FLASH_LOCAL)$")
+    message(FATAL_ERROR "Invalid BOOT_STORAGE=${BOOT_STORAGE}")
+endif()
+if(NOT PSRAM MATCHES "^(OFF|ON)$")
+    message(FATAL_ERROR "PSRAM must be OFF or ON")
+endif()
+if(DEFAULT_DISPLAY STREQUAL SPI)
+    set(DISPLAY_ID 3)
+elseif(DEFAULT_DISPLAY STREQUAL HUB)
+    set(DISPLAY_ID 1)
+elseif(DEFAULT_DISPLAY STREQUAL LED)
+    set(DISPLAY_ID 6)
+elseif(DEFAULT_DISPLAY STREQUAL CUSTOM)
+    set(DISPLAY_ID 7)
+elseif(DEFAULT_DISPLAY STREQUAL NONE)
+    set(DISPLAY_ID 0)
+else()
+    message(FATAL_ERROR "Unknown DEFAULT_DISPLAY=${DEFAULT_DISPLAY}")
+endif()
+if(PSRAM STREQUAL ON AND DEFAULT_DISPLAY MATCHES "^(HUB|CUSTOM)$")
+    message(FATAL_ERROR "Reference ${DEFAULT_DISPLAY} routing consumes QMI CS8; choose a nonconflicting board/output profile")
 endif()
 
-# ─── Generate UF2 for flashing ──────────────────────────────────────────────
-pico_add_extra_outputs(protogl_gpu)
-
-# ─── Compiler warnings ──────────────────────────────────────────────────────
-target_compile_options(protogl_gpu PRIVATE
-    -Wall
-    -Wextra
-    -Wno-unused-parameter
-    -O2
-    -ffast-math            # Enables VFMA.F32 contraction from a*b+c patterns,
-                           # reciprocal sqrt approx, no-errno — safe for renderer.
-    -ffunction-sections    # Place each function in its own section for linker GC
-    -fdata-sections        # Place each data item in its own section for linker GC
-    -flto                  # F-07: link-time optimization (paired with link -flto)
+pico_sdk_init()
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_executable(protogl_gpu
+    src/main.cpp src/gpu_core.cpp src/command_parser.cpp src/gpu_clock.cpp
+    src/hardware_resources.cpp
+    src/phase_scratch.cpp
+    src/display/display_manager.cpp src/display/hub75_driver.cpp
+    src/display/spi_display.cpp src/display/led_array.cpp src/display/custom_array.cpp
+    src/transport/pgl_spi_target.cpp src/devices/device_service.cpp
+    src/math/pgl_math.cpp src/render/rasterizer.cpp src/render/triangle2d.cpp
+    src/render/rasterizer_2d.cpp src/render/pgl_shader_vm.cpp
+    src/render/screenspace_effects.cpp src/render/frame_renderer.cpp
+    src/scheduler/pgl_tile_scheduler.cpp src/scheduler/pgl_scheduler_rp2350.cpp
+    src/memory/mem_assets.cpp src/memory/scene_assets.cpp
+    ProtoGC/src/pgc_pico.cpp
 )
-
-# ─── F-06: -O3 for the hot render translation units only (global stays -O2) ──
-# Per-source COMPILE_OPTIONS are appended AFTER the target-level options, so
-# the later -O3 wins over the global -O2 (verified: "-O2 ... -O3" in build log).
-set_source_files_properties(
-    src/render/rasterizer.cpp
-    src/render/screenspace_effects.cpp
-    src/render/pgl_shader_vm.cpp
-    src/math/pgl_math.cpp
-    PROPERTIES COMPILE_OPTIONS -O3
-)
-
-# Remove unused code/data sections
-target_link_options(protogl_gpu PRIVATE
-    -flto                  # F-07: link-time optimization (paired with compile -flto)
-    -Wl,--gc-sections
-)
-
-# F-07 caveat: LTO and the Pico SDK's -Wl,--wrap=<fn> redirection (pico_stdio,
-# pico_printf, pico_float, pico_double, pico_malloc) do not mix. --wrap renames
-# references to __wrap_<fn> only at the final link — after LTO symbol
-# resolution — so LTO sees the wrapper bodies as unreferenced and discards
-# them ("undefined reference to __wrap_printf" etc.). Exclude the five
-# wrapper-defining SDK TUs from LTO so their symbols stay in regular symbol
-# tables, visible at final link. (ASM wrapper objects are never LTO'd and are
-# unaffected; all 114 active --wrap symbols are then defined, verified.)
+if(PSRAM STREQUAL ON)
+    target_sources(protogl_gpu PRIVATE src/memory/mem_qmi_psram.cpp)
+    target_link_libraries(protogl_gpu hardware_psram hardware_flash hardware_xip_cache)
+endif()
+set(PGL_GEN "${CMAKE_BINARY_DIR}/generated")
+file(MAKE_DIRECTORY "${PGL_GEN}")
+add_custom_target(pgl_build_identity ALL
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/pgl_build_identity.py
+        --repo ${CMAKE_SOURCE_DIR} --boot-storage ${BOOT_STORAGE} --display ${DEFAULT_DISPLAY}
+        --psram ${PSRAM} --diagnostic $<IF:$<BOOL:${HOSTLESS_DEMO}>,ON,OFF>
+        --header ${PGL_GEN}/pgl_build_identity.h --json ${PGL_GEN}/pgl_build_identity.json
+    BYPRODUCTS ${PGL_GEN}/pgl_build_identity.h ${PGL_GEN}/pgl_build_identity.json
+    VERBATIM)
+add_dependencies(protogl_gpu pgl_build_identity)
+target_include_directories(protogl_gpu PRIVATE src ProtoGL/src ProtoGC/src ${PGL_GEN})
+target_link_libraries(protogl_gpu
+    pico_stdlib pico_multicore hardware_pio hardware_dma hardware_gpio
+    hardware_i2c hardware_adc hardware_clocks hardware_uart hardware_pll hardware_vreg hardware_ticks)
+target_compile_definitions(protogl_gpu PRIVATE
+    PROTOGPU_RAM_HOST=$<STREQUAL:${BOOT_STORAGE},RAM_HOST>
+    PROTOGPU_ENABLE_PSRAM=$<STREQUAL:${PSRAM},ON>
+    PROTOGPU_DEFAULT_DISPLAY=${DISPLAY_ID}
+    PROTOGPU_HOSTLESS_DEMO=$<BOOL:${HOSTLESS_DEMO}>
+    PGC_BACKEND_PICO PROTOGC_OVERRIDE_NEW=0
+    PICO_DEFAULT_UART=0 PICO_DEFAULT_UART_TX_PIN=28 PICO_DEFAULT_UART_RX_PIN=-1
+    PICO_RUNTIME_SKIP_INIT_PSRAM=1 PICO_RUNTIME_NO_INIT_PSRAM=1
+    PICO_AUTO_DETECT_PSRAM=0 PICO_AUTO_DETECT_PSRAM_CS=0 PICO_AUTO_DETECT_PSRAM_SIZE=0
+    PICO_STACK_SIZE=4096 PICO_CORE1_STACK_SIZE=4096)
+if(BOOT_STORAGE STREQUAL RAM_HOST)
+    pico_set_binary_type(protogl_gpu no_flash)
+else()
+    pico_set_binary_type(protogl_gpu default)
+endif()
+foreach(PROGRAM IN ITEMS
+    src/display/hub75.pio src/display/spi_display.pio
+    src/display/led_array.pio src/display/custom_array.pio src/transport/pgl_spi_target.pio)
+    pico_generate_pio_header(protogl_gpu ${CMAKE_SOURCE_DIR}/${PROGRAM})
+endforeach()
+pico_enable_stdio_usb(protogl_gpu 0)
+pico_enable_stdio_uart(protogl_gpu 1)
+pico_set_program_name(protogl_gpu "ProtoGPU runtime")
+pico_set_program_version(protogl_gpu "9.0")
+target_compile_options(protogl_gpu PRIVATE -Wall -Wextra
+    $<IF:$<STREQUAL:${BOOT_STORAGE},RAM_HOST>,-Os,-O2>
+    -ffunction-sections -fdata-sections -flto)
+target_link_options(protogl_gpu PRIVATE -flto -Wl,--gc-sections)
+# SDK --wrap entrypoints need ordinary symbols until final link, not LTO-only definitions.
+# The SDK's naked __aeabi_read_tp uses assembler literal-pool loads. Keep its
+# translation unit separate: LTO can move the pool beyond Thumb load reach.
 set_source_files_properties(
     ${PICO_SDK_PATH}/src/rp2_common/pico_stdio/stdio.c
     ${PICO_SDK_PATH}/src/rp2_common/pico_printf/printf.c
     ${PICO_SDK_PATH}/src/rp2_common/pico_float/float_math.c
     ${PICO_SDK_PATH}/src/rp2_common/pico_double/double_math.c
     ${PICO_SDK_PATH}/src/rp2_common/pico_malloc/malloc.c
-    PROPERTIES COMPILE_OPTIONS -fno-lto
-)
+    ${PICO_SDK_PATH}/src/rp2_common/pico_thread_local/thread_local.c
+    PROPERTIES COMPILE_OPTIONS -fno-lto)
+pico_add_extra_outputs(protogl_gpu)
+add_custom_command(TARGET protogl_gpu POST_BUILD
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/pgl_image_package.py
+        --elf $<TARGET_FILE:protogl_gpu> --bin ${CMAKE_BINARY_DIR}/protogl_gpu.bin
+        --map ${CMAKE_BINARY_DIR}/protogl_gpu.elf.map --identity ${PGL_GEN}/pgl_build_identity.json
+        --boot-storage ${BOOT_STORAGE} --manifest ${CMAKE_BINARY_DIR}/pgl_image_manifest.json
+        --manifest-bin ${CMAKE_BINARY_DIR}/pgl_image_manifest.bin
+        --manifest-header ${PGL_GEN}/pgl_image_manifest.h --report ${CMAKE_BINARY_DIR}/pgl_image_report.txt
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/pgl_budget_report.py
+        --elf $<TARGET_FILE:protogl_gpu> --map ${CMAKE_BINARY_DIR}/protogl_gpu.elf.map
+        --identity ${PGL_GEN}/pgl_build_identity.json --boot-storage ${BOOT_STORAGE}
+        --json ${CMAKE_BINARY_DIR}/pgl_budget.json --report ${CMAKE_BINARY_DIR}/pgl_budget.txt
+    VERBATIM)

@@ -1,0 +1,41 @@
+; ─── led_array.pio ───────────────────────────────────────────────────────────
+; WS2812B-V5/W addressable LED stream for RP2350.
+;
+; Vendor timing (Worldsemi WS2812B-V5/W datasheet V6.1, 2022-09-08):
+;   T0H 220..380 ns, T1H 580..1000 ns, T0L/T1L 580..1000 ns, reset low > 280 us.
+; The SDK stock 3/3/4 profile produces T1L = 500 ns and violates the V5/W T1L
+; minimum, so this program uses the explicitly computed 2/2/4 profile at a
+; 6.4 MHz SM clock (156.25 ns/cycle):
+;   T0H = T1      = 2 cycles = 312.5 ns   (220..380   ok)
+;   T1H = T1 + T2 = 4 cycles = 625.0 ns   (580..1000  ok)
+;   T0L = T3 + T2 = 6 cycles = 937.5 ns   (580..1000  ok)
+;   T1L = T3      = 4 cycles = 625.0 ns   (580..1000  ok)
+;   bit period    = 8 cycles = 1.25 us (800 kbit/s)
+; clk_sys divider (int.frac8) is exact at 150/100/75 MHz
+; (23.4375 / 15.625 / 11.71875); the driver rejects inexact system clocks.
+; This waveform targets the V5/W revision only; older WS2812B parts and actual
+; LED hardware remain physically unqualified.
+;
+; Data: 24-bit GRB, MSB first, one pixel per 32-bit FIFO word in bits [31:8].
+; Shift-left OSR, autopull threshold 24, joined TX FIFO (8 words).
+; Idle: the SM stalls inside `out x, 1` with side-set 0, holding the data line
+; low. DMA completion alone is NOT completion: the driver rearms FDEBUG TXSTALL
+; and waits for the stall at this known low instruction before starting the
+; >= 300 us reset window.
+
+.program ws2812b_v5
+.side_set 1
+
+.define public T1 2
+.define public T2 2
+.define public T3 4
+
+.wrap_target
+bitloop:
+    out x, 1        side 0 [T3 - 1]  ; line low while the next bit leaves OSR
+    jmp !x, do_zero side 1 [T1 - 1]  ; line high for T1 cycles on both paths
+do_one:
+    jmp bitloop     side 1 [T2 - 1]  ; '1': hold high for T1 + T2 total
+do_zero:
+    nop             side 0 [T2 - 1]  ; '0': back low for T2 more cycles
+.wrap

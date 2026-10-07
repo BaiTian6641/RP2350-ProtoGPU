@@ -1,259 +1,150 @@
-# ProtoGL GPU Firmware — RP2350
+# ProtoGPU — RP2350 firmware and ProtoGL host API
 
-Phase 1 GPU implementation targeting the **RP2350** (dual-core ARM Cortex-M33
-@ 150 MHz, 520 KB tightly-coupled SRAM).
+RP2350 graphics-coprocessor firmware for an ESP32-S3 host. The host retains application, animation and networking work; ProtoGPU performs object/camera transforms, clipping, material evaluation, 3D rasterization, postprocessing, 2D layers and physical output. No required nonvolatile graphics RAM, external PSRAM, overclock or RP-side FreeRTOS.
 
-## Features
+## Implementation and tracking
 
-- PIO-driven HUB75 display output (zero CPU overhead)
-- PIO-driven bidirectional Octal SPI (8-bit parallel, up to 80 MHz, half-duplex) — data plane
-- I2C slave (hardware I2C0 at address 0x3C) — management / control plane (device ID, status, config)
-- Dual-core symmetric screen-space rasterizer
-- Full ProtoGL command parser with CRC-16 validation
-- Double-buffered framebuffer with atomic swap
+- [Architecture and agent handoff plan](docs/TinyGPU_Implementation_and_Agent_Handoff_Plan.md)
+- [Fine-grained implementation tracker](docs/Implementation_Tracker.md)
+- [ProtoGL API, runtime protocol and Arduino examples](ProtoGL/README.md)
+- [Protocol-9 changelog and qualification limits](CHANGELOG.md)
 
-## Hardware Requirements
+The protocol-9 software cutover is implemented. Native scenarios execute the actual firmware parser, frame renderer and two-worker scheduler. Arm builds generate both `FLASH_LOCAL` and `RAM_HOST` images, manifests and enforced SRAM ledgers. These are **software/build results, not physical qualification**: no RP/S3 board or display is connected in this environment.
 
-- RP2350-based board (Raspberry Pi Pico 2 or custom)
-- HUB75 LED matrix panel (128×64 or 64×64, 1/32 scan)
-- ESP32-S3 host connected via:
-  - Octal SPI: 8 data pins + CLK + CS + DIR (bidirectional data plane)
-  - I2C: SDA + SCL (management / control plane)
-  - Async notification: IRQ GPIO (active-low)
+Future application integration target: [`BaiTian6641/ProtoTracer-ESP32S3-Port`](https://github.com/BaiTian6641/ProtoTracer-ESP32S3-Port), SSH URL `git@github.com:BaiTian6641/ProtoTracer-ESP32S3-Port.git`. ProtoTracer adaptation is explicitly deferred; it is not cloned or modified here. Firmware/API solidity is the current scope.
 
-## Pin Assignments
+## Source dependencies
 
-> **Note:** Pin numbers are configurable in `src/gpu_config.h`.
-> Defaults below are provisional — adjust for your PCB layout.
-
-| Function | RP2350 GPIO | Direction |
-|---|---|---|
-| SPI D0–D7 | GPIO 0–7 | Input |
-| SPI CLK | GPIO 8 | Input |
-| SPI CS | GPIO 9 | Input |
-| I2C SDA | GPIO 14 | Bidir |
-| I2C SCL | GPIO 15 | Input |
-| DIR | GPIO 10 | Output |
-| IRQ | GPIO 13 | Output |
-| HUB75 R1 | GPIO 16 | Output |
-| HUB75 G1 | GPIO 17 | Output |
-| HUB75 B1 | GPIO 18 | Output |
-| HUB75 R2 | GPIO 19 | Output |
-| HUB75 G2 | GPIO 20 | Output |
-| HUB75 B2 | GPIO 21 | Output |
-| HUB75 ADDR A | GPIO 22 | Output |
-| HUB75 ADDR B | GPIO 23 | Output |
-| HUB75 ADDR C | GPIO 24 | Output |
-| HUB75 ADDR D | GPIO 25 | Output |
-| HUB75 ADDR E | GPIO 26 | Output |
-| HUB75 CLK | GPIO 27 | Output |
-| HUB75 LAT | GPIO 28 | Output |
-| HUB75 OE | GPIO 29 | Output |
-
-## Building
-
-### Prerequisites
-
-- [Pico SDK](https://github.com/raspberrypi/pico-sdk) (v2.0+ for RP2350 support)
-- CMake 3.20+
-- ARM GCC toolchain (`arm-none-eabi-gcc`)
-
-### Build Steps
+`ProtoGL/`, `ProtoGC/` and `third_party/pico-sdk/` are in-tree submodules; dependency/tool versions are recorded in [dependencies.lock.json](dependencies.lock.json). Shared firmware includes use `ProtoGL/src` and `ProtoGC/src`, not sibling checkouts.
 
 ```bash
-# Set PICO_SDK_PATH if not already in environment
-export PICO_SDK_PATH=/path/to/pico-sdk
-
-mkdir build && cd build
-cmake .. -DPICO_BOARD=pico2
-make -j$(nproc)
+git submodule update --init ProtoGL ProtoGC third_party/pico-sdk
 ```
 
-### Flashing
+Co-development edits are separate repository changes inside the ProtoGL and ProtoGC submodules. Commit/push those changes first, then record the parent firmware and submodule pointers as a compatible pair. Base revision pins do not include uncommitted API changes; the release bundler hashes and includes the actual paired host sources. Do not initialize ProtoGL's historical nested firmware entry to work on this runtime.
 
-1. Hold BOOTSEL on the RP2350 board
-2. Connect USB
-3. Drag `protogl_gpu.uf2` to the RPI-RP2 drive
+For Arduino IDE, install the `ProtoGL/` folder as the ProtoGL library; it now includes `library.properties`, `src/` and the two sketches. The exercised host compilation uses Arduino-ESP32 3.3.6/IDF5.5.2 for ESP32-S3. Example wiring/output assumptions are documented alongside each sketch.
 
-## Architecture
+## Build profiles
 
-```
-Core 0                          Core 1
-┌──────────────────┐            ┌──────────────────┐
-│ PIO Octal SPI    │            │ (idle / waiting) │
-│ (bidir, SM0+SM1) │            │                  │
-│ Ring Buffer      │            │                  │
-│       ↓          │            │                  │
-│ Command Parser   │            │                  │
-│       ↓          │            │                  │
-│ Scene State      │            │                  │
-│       ↓          │            │                  │
-│ Transform + Proj │            │                  │
-│       ↓          │            │                  │
-│ QuadTree Rebuild │            │                  │
-│       ↓          │            │       ↓          │
-│ Tile Raster      │──FIFO──→  │ Tile Raster      │
-│ (work-stealing)  │            │ (work-stealing)  │
-│   ← barrier ←   │←──FIFO──── │   → barrier →    │
-│       ↓          │            │                  │
-│ Framebuf swap    │            │                  │
-│       ↓          │            │                  │
-│ PIO HUB75 DMA   │            │                  │
-└──────────────────┘            └──────────────────┘
+Requirements: CMake 3.20+, Pico SDK 2.3.1 and Arm embedded GCC 14.2.1. Set `PICO_TOOLCHAIN_PATH` if the compiler is not on PATH.
+
+```bash
+cmake -S . -B build/flash -DPICO_BOARD=pico2 \
+  -DBOOT_STORAGE=FLASH_LOCAL -DDEFAULT_DISPLAY=SPI -DPSRAM=OFF
+cmake --build build/flash --parallel
+
+cmake -S . -B build/ram -DPICO_BOARD=pico2 \
+  -DBOOT_STORAGE=RAM_HOST -DDEFAULT_DISPLAY=SPI -DPSRAM=OFF
+cmake --build build/ram --parallel
 ```
 
-## Memory Budget (520 KB SRAM)
+| Selector | Implemented choices |
+|---|---|
+| `BOOT_STORAGE` | `FLASH_LOCAL`: SDK normal NOR boot; `RAM_HOST`: SDK `no_flash` SRAM image with RP2350 `IMAGE_DEF`, uploaded by the host ROM-UART loader |
+| `DEFAULT_DISPLAY` | `SPI`, `HUB`, `LED`, `CUSTOM`, `NONE`; one active output, runtime reconfiguration at a drained boundary |
+| `PSRAM` | `OFF` minimum; `ON` selected-CS QMI asset backing, explicit host boot-pad release before initialization |
+| `HOSTLESS_DEMO` | `OFF` normal host-controlled runtime; `ON` bounded command-encoded rotating-cube diagnostic, using the same renderer/output path |
 
-| Subsystem | Size | Notes |
-|---|---|---|
-| Framebuffer ×2 | 32 KB | 128×64 RGB565, double-buffered |
-| Z-Buffer | 16 KB | 128×64 uint16 (IEEE-754 upper bits, order-preserving) |
-| Triangle2D pool | 50 KB | 512 projected triangles × 100 B |
-| QuadTree nodes + bounds | 19 KB | 256 nodes × ~44 B + 512 entity bounds × 16 B |
-| Transform scratch | 12 KB | 1024 transformed vertices × 12 B |
-| Scene state pools | 138 KB | Vertex, index, UV, texture, layout coord pools |
-| Slot arrays | 40 KB | Mesh, material, texture, layout, camera, draw slots |
-| SPI ring buffer | 32 KB | DMA receive ring |
-| Staging buffer | 16 KB | Bulk upload staging |
-| Alloc table | 4 KB | Memory tier allocator |
-| **Subtotal** | **~359 KB** | |
-| Pico-SDK + stack | ~20 KB | Runtime, PIO, interrupts, Core 1 stack |
-| **Free** | **~133 KB** | Headroom |
-| SRAM cache arena | (64 KB) | QSPI VRAM cache (optional, reduces free to ~69 KB) |
+RAM code uses `-Os`, flash code `-O2`; LTO remains enabled except SDK wrapper/TLS translation units requiring ordinary symbols/literal-pool isolation. Every successful build emits ELF/map/bin, the appropriate SDK extra outputs, `pgl_image_manifest.json`, a 32-byte host manifest, `pgl_image_report.txt` and `pgl_budget.json`. Packaging fails if the linked profile leaves less than **32 KiB total unallocated SRAM**, including both 4 KiB stacks. This is static headroom, not measured stack high-water or contiguous scene-heap availability.
 
----
+FLASH_LOCAL UF2 installs through BOOTSEL. RAM_HOST is not a generic function-pointer jump: use ProtoGL's echo-paced RP2350 ROM-UART image loader and validate runtime build/profile identity after boot. Pico2 includes NOR; direct QSPI boot-UART wiring requires the documented reset/strap/IO isolation. A successful compilation is not proof that a board can safely use those pads.
 
-## Tiered Memory Architecture
+Final SPI-default static ledgers, bytes (both4KiB stacks included):
 
-The GPU supports up to three memory tiers for resource storage. **Rasterization-critical
-data (framebuffer, Z-buffer, QuadTree) is ALWAYS in internal SRAM.** External memory is
-only for expanding texture, material, and mesh capacity without degrading render speed.
+| Profile | Image bytes | SRAM used | Unallocated SRAM |
+|---|---:|---:|---:|
+| FLASH_LOCAL, PSRAM OFF | 158708 | 390196 | 142284 |
+| RAM_HOST, PSRAM OFF | 112860 | 496292 | 36188 |
+| FLASH_LOCAL, PSRAM ON | 163868 | 391348 | 141132 |
+| RAM_HOST, PSRAM ON | 115340 | 498828 | 33652 |
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          MEMORY TIERS                                       │
-│                                                                             │
-│  Tier 0 ─ Internal SRAM (520 KB, 1-cycle)                                  │
-│  ├── Framebuffers, Z-buffer, QuadTree       (ALWAYS here, pinned)          │
-│  ├── Active vertices/indices                 (hot mesh data)               │
-│  ├── SRAM cache arena (64 KB)                (cache lines for QSPI VRAM)  │
-│  └── Hot textures & material params          (promoted by score+weight)    │
-│                                                                             │
-│  Tier 1 ─ QSPI-A VRAM via PIO2 SM0+SM1 (up to 2 chips, RP2350B)          │
-│  ├── Large textures, texture atlases                                        │
-│  ├── Cold mesh geometry (inactive objects)                                  │
-│  ├── Material parameter banks                                               │
-│  └── DMA-prefetched into SRAM cache before rasterization                   │
-│                                                                             │
-│  Tier 2 ─ QSPI-B VRAM via PIO2 SM2+SM3 (up to 2 chips, RP2350B)          │
-│  ├── Lookup tables (gamma, CIE, noise permutation)                         │
-│  ├── Font atlases                                                           │
-│  ├── Material parameter banks, small textures                              │
-│  ┬── Animation keyframe data                                                │
-│  └── DMA-prefetched into SRAM cache before rasterization                   │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+The exact output workspace is now67,584 bytes. RAM_HOST HUB/LED/CUSTOM/NONE defaults link/package with36,172 bytes unallocated and the hostless FLASH_LOCAL diagnostic with142,268. All ledgers clear the32KiB floor; these margins are not measured runtime stack safety or power/current qualification.
 
-### Placement Policy (Score + Weight)
+## Bounded runtime contract
 
-Each resource tracks two metrics:
+| Resource | Firmware limit |
+|---|---:|
+| Logical framebuffer / depth pixels | 8192 |
+| Tile grid | 64 cells, 16×16 pixels each |
+| Transformed vertices | 1024 |
+| Source / projected triangles | 1280 / 1280, including clipping expansion |
+| Mesh / material / texture slots | 64 / 64 / 16 |
+| Cameras / 3D draws / queued 2D operations | 4 / 64 / 128 |
+| Layers / shader programs | 8 / 4 |
+| Scene allocation arena | 64 KiB |
+| Ingress slots / maximum batch | 2 / 16 KiB |
+| Weighted post-FX work per frame | 2 Mi operations |
 
-| Metric | Meaning | Updated |
-|---|---|---|
-| **weight** | Rendering pipeline impact (0–255). Higher = more critical to visual quality. | Set at resource creation (based on type) |
-| **score** | Access frequency (0–255). Higher = more accesses per frame. | Updated at runtime per frame |
+Aggregate scene/resources/layer allocation and complete external-asset staging can fail before execution; maxima are not independent promises that every resource can be filled simultaneously. Projected-pool overflow is an explicit failed frame, never missing geometry presented as success. The original 587-vertex/1166-triangle teapot and full-frame three-program post-FX workload are retained.
 
-Combined priority: `priority = α × weight + β × score` (default α=3, β=1)
+- Bare-metal event/service loop; both cores claim disjoint tiles through one tagged scheduler. Clock transitions park the worker and drain host/output/device/memory users.
+- Fresh nonzero sessions, generation-checked resources, contiguous streamed uploads and transactional preflight/commit. Rendering/conversion readers retain immutable inputs until release.
+- One executing frame and at most one queued batch; no arbitrary dropping or coalescing of mixed resource mutations. Transfer sequences and nonzero frame IDs increase within a session; start a new session before wrap. Exact retries retain the same sequence and bytes.
+- Separate accepted/rendered/transferred/displayed fences. SSD1331 has no TE: only `Transferred`, not fabricated `Displayed`. `NONE` is explicit render-only output.
+- Protocol-9 control32/read64/bulk envelopes on real PIO mode-0 SPI. Single-lane command/control, negotiated one/four-lane bulk data; initial SCK1 MHz, minimum64 µs CS gap, active-high READY before every host transaction. Control ACK and terminal bulk ACK are distinct.
+- Exact clock profiles 150/100/75/125/240/288/250/300/336 MHz. Profiles above150 MHz are explicit requests at a **1.2 V regulator setpoint** (never higher, never bypassing the voltage limit); 300 MHz records the user's board-tested reference and 336 MHz is the requested 48×7 profile. `clk_sys` varies through PLL_SYS; reference/timers stay at12 MHz and UART/SPI/USB/ADC/HSTX stay at48 MHz from PLL_USB. Optional active PSRAM remains ≤150 MHz until part-specific receive calibration is supplied. `QueryClock` and `QueryClockConfiguration` expose requested/actual state, required/actual setpoint and domain rates; qualified power/timing still requires hardware measurements.
+- Optional typed cold mesh/texture backing uses complete pinned SRAM spans consumed by the real renderer. Code, depth, active output and CPU hot reads remain internal; no per-texel PSRAM transaction or fake pointer mapping.
+- Verified shader instructions/constants stay resident and immutable; only pass uniforms are snapshotted. A rejected worker-band job fails the frame, never reports successful postprocessing.
+- Future custom-GPGPU kernels are extension work, not an advertised feature: protocol 10 can reserve a small compute capability/work budget using immutable inputs, disjoint outputs, bounded scheduler jobs and explicit cancellation. They must share the already-drained 13 KiB preparation and 16 KiB world/depth lifetimes plus scene-heap headroom, not claim a second persistent arena or bypass display/DMA/clock maintenance.
 
-| Weight | Score | Tier Assigned | Rationale |
-|---|---|---|---|
-| HIGH | HIGH | **Tier 0 — SRAM** | Hot critical path: active textures, vertices |
-| HIGH | LOW | **Tier 1 — QSPI-A + cache** | Critical but infrequent: DMA prefetch before use |
-| LOW | HIGH | **Tier 2 — QSPI-B** | Frequent reads, DMA-prefetchable |
-| LOW | LOW | **Tier 2 — QSPI-B** | Cold storage: LUTs, inactive data |
+## Pico2-safe reference wiring
 
-**Hard constraint:** Framebuffer, Z-buffer, and QuadTree are **pinned to SRAM** regardless
-of score/weight. The tier system only governs resource data (textures, materials, meshes,
-lookup tables).
+This is an engineering reference, **not an approved product PCB**. GPIO numbers below are RP pins; configure corresponding host pins explicitly in ProtoGL. Examples map S3 GPIO14 to RP GP22 READY. Ordinary GP1 is runtime MISO/D1, not the dedicated QSPI SD1 ROM-UART strap pad.
 
-### Resource Class Weights
+| Function | RP GPIO |
+|---|---|
+| Runtime host D0..D3, SCK, CS | 0..3, 4, 5 |
+| READY / IRQ (active-low record notification) | 22 / 27 |
+| Debug UART0 TX, no RX | 28 |
+| SSD1331 PIO SCK/MOSI/CS/RST/DC | 6 / 7 / 9 / 10 / 11, ≤4 MHz |
+| HUB75 R1/G1/B1/R2/G2/B2, CLK/LAT/OE, A..E | 6..11, 12/13/14, 15..19 |
+| WS2812B-V5/W GRB data | 6, calculated6.4 MHz PIO timing, ≥300 µs reset |
+| Custom RGB888 parallel data, CLK/LATCH/OE | 6..13, 14/15/16 |
+| Attached I2C0 SDA/SCL, fixed address | 20/21, `0x3D`, ≤1 ms request slice |
+| Attached explicit-drive GPIO | 26 |
+| Optional QMI CS1 | 8; conflicts with HUB and CUSTOM reference routing |
 
-| Resource Class | Base Weight | Typical Tier |
-|---|---|---|
-| `FRAMEBUFFER` | 255 (pinned) | SRAM only |
-| `Z_BUFFER` | 255 (pinned) | SRAM only |
-| `QUADTREE` | 255 (pinned) | SRAM only |
-| `VERTEX_DATA` | 200 | SRAM (active), QSPI-A (cold) |
-| `INDEX_DATA` | 200 | SRAM (active), QSPI-A (cold) |
-| `MATERIAL_PARAM` | 160 | SRAM (hot), QSPI-A (cold) |
-| `UV_DATA` | 140 | SRAM or QSPI-A |
-| `TEXTURE` | 128 | SRAM (small/hot), QSPI-A (large) |
-| `LAYOUT_COORDS` | 100 | SRAM or QSPI |
-| `LOOKUP_TABLE` | 60 | QSPI-B (best for random reads) |
-| `FONT_ATLAS` | 40 | QSPI-B (prefer MRAM) |
-| `COLD_MESH` | 20 | QSPI-B or QSPI-A |
+Pico2 GP23/24/25/29 are board-connected and excluded from external claims. Hardware leases arbitrate GPIO, PIO programs/SMs/flags, DMA, bus roles and QMI windows. HUB75/custom/PSRAM conflicts reject explicitly. Actual panel controller, logic levels, buffering, reset pulls, power gating and timing captures remain hardware prerequisites.
 
-### Prefetch Pipeline
+## Verification entrypoints
 
-External QSPI VRAM data is DMA-prefetched into SRAM cache lines **between command parsing and
-rasterization** (overlapped with QuadTree rebuild on Core 0):
-
-```
-Parse commands → Scan draw list → DMA prefetch VRAM → QuadTree rebuild → Rasterize
-                                  ^^^^^^^^^^^^^^^^    ^^^^^^^^^^^^^^^^^
-                                  (these overlap — DMA is zero-CPU)
+```bash
+bash tests/native/run_kernel_tests.sh
+bash tests/native/run_pipeline_tests.sh
+bash sim/run_2d_primitives_check.sh
+bash sim/run_f04_check.sh
+bash tests/scheduler/run_scheduler_check.sh
+bash tests/transport/run_transport_check.sh
+bash tests/memory/run_tests.sh
+bash tests/shader_vm/run_shader_checks.sh
+bash tests/display/run_tests.sh
+bash tests/clock/run_tests.sh
+bash tests/devices/run_tests.sh
+bash ProtoGL/tests/syntax_check/run_link.sh
+bash ProtoGL/tests/syntax_check/run_boot.sh
+bash sim/build_sim.sh
 ```
 
-### PIO Block Allocation
+`sim/run_golden.sh` preserves historical references and diagnoses intentional raster changes; it never automatically regenerates them. Consumer geometry/depth/alpha/rollback/lifetime oracles are the correctness gates for changed semantics. Native timing is desktop timing, not RP frame-rate/power or S3 CPU-offload evidence. Actual Arduino-ESP32 3.3.6/IDF5.5.2 example objects are cross-compiled separately; this does not establish flashing or hardware operation.
 
-| PIO Block | Usage | State Machines | DMA Channels |
-|---|---|---|---|
-| PIO0 | HUB75 display driver | SM0 (data) + SM1 (row) | 2 |
-| PIO1 | Octal SPI (bidir) | SM0 (RX) + SM1 (TX) | 2 |
-| PIO2 | QSPI VRAM (dual channel) | SM0+SM1 (Ch-A) + SM2+SM3 (Ch-B) | 4 |
-| **Total** | | **9 / 12 SM** | **8 / 12 DMA** |
+After building both final profiles:
 
-### External Memory GPIO Assignment (provisional)
+```bash
+PGL_RAM_BUILD=build/ram PGL_FLASH_BUILD=build/flash \
+  python3 -m unittest discover -s tests/packaging -v
+python3 tools/pgl_pair_bundle.py --repo . \
+  --firmware-manifest build/ram/pgl_image_manifest.json build/flash/pgl_image_manifest.json \
+  --firmware-artifacts \
+    build/ram/protogl_gpu.bin build/ram/protogl_gpu.elf build/ram/protogl_gpu.elf.map \
+    build/flash/protogl_gpu.bin build/flash/protogl_gpu.elf build/flash/protogl_gpu.elf.map \
+  --manifest-bin build/ram/pgl_image_manifest.bin build/flash/pgl_image_manifest.bin \
+  --out-dir build/release-pair
+python3 tools/pgl_asset_embed.py image --bin build/ram/protogl_gpu.bin \
+  --manifest build/ram/pgl_image_manifest.json --manifest-bin build/ram/pgl_image_manifest.bin \
+  --name ProtoGPUImage --out-dir build/embedded-image
+```
 
-| Function | RP2350 GPIO | Direction | Notes |
-|---|---|---|---|
-| QSPI-A CS0 | GPIO 11 | Output | Active low |
-| QSPI-A CLK | GPIO 12 | Output | Up to 150 MHz |
-| QSPI-A DQ0–DQ3 | GPIO 34–37 | Bidir | QFN-80 package required |
-| QSPI-A CS1 | GPIO 38 | Output | Second chip select |
-| QSPI-B DQ0–DQ3 | GPIO 39–42 | Bidir | QFN-80 package required |
-| QSPI-B CLK | GPIO 43 | Output | Up to 150 MHz |
-| QSPI-B CS0 | GPIO 44 | Output | Active low |
-| QSPI-B CS1 | GPIO 45 | Output | Second chip select |
+Release bundles include exact images, ELF/map/source hashes, the dependency lock, an Arduino-layout host library, exact firmware/allocator/tool inputs and native replay/checks with profile reproduction commands. The SDK/toolchain are pinned acquisition prerequisites, not duplicated in the bundle. Integrity is not authentication. Physical boot/output/transport/PSRAM/current/stack/sustained-load gates remain open in the tracker.
 
-> **Note:** All QSPI VRAM pins require the RP2350B QFN-80 package. The RP2350A (QFN-60)
-> only exposes GPIO 0–29 — no external VRAM support (SRAM-only operation).
-
-### Graceful Degradation
-
-External memory is **optional**. The firmware detects which tiers are present at boot
-and adjusts limits accordingly:
-
-| Configuration | Total Resources | Notes |
-|---|---|---|
-| SRAM only (default) | 256 meshes, 64 textures | Current Phase 1 target |
-| SRAM + QSPI-A (1–2 chips) | + large textures, cold meshes | RP2350B board with Channel A |
-| SRAM + QSPI-A + QSPI-B | Full expanded mode (up to 4 chips) | RP2350B board with both channels |
-
-### Host Memory Access
-
-The host can directly read/write GPU device memory across all tiers via **7 SPI commands**
-(0x30–0x3F) and **4 I2C registers** (0x0C–0x0F). This enables:
-
-- Bulk texture/data upload to QSPI VRAM (bypassing the resource command path)
-- Framebuffer capture for screenshots (via I2C readback, ~0.33 s for 16 KB at 400 kHz)
-- Runtime memory pressure monitoring (per-tier capacity/usage/cache hit rate)
-- Explicit resource tier placement and pinning
-- GPU-internal memory copying between tiers
-
-The `command_parser.cpp` includes stub handlers for all 7 memory commands. Full
-implementations depend on M8 QSPI VRAM drivers and `MemTierManager`. The `scene_state.h`
-has been extended with a 4 KB staging buffer, `lastAllocResult`, and `memTierInfo` fields.
-
-See `GPU_API_Design.md` §9 for the complete API design and `ProtoGL_API_Spec.md` §4.4–4.5
-for wire-format tables.
+The exercised working-tree bundle is `build/release-protocol9-final/`: `firmware/RAM_HOST`, `firmware/FLASH_LOCAL`, Arduino library `host/`, and exact replay/build snapshot `source/`. Both generated reproduction scripts were run against that snapshot with the pinned SDK/GCC supplied; source/build identities and SRAM ledgers match. Rebuilt image/ELF/map digests may differ with compilation paths/link layout; the manifests identify each exact artifact, not a bit-for-bit rebuild claim. Native full-frame post-FX replay also ran from the bundled sources.

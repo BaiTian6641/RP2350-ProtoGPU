@@ -1,94 +1,96 @@
 ; ─── hub75.pio ────────────────────────────────────────────────────────────────
-; PIO programs for HUB75 LED matrix panel driving on RP2350.
+; PIO programs for a conventional HUB75 LED matrix (128x64 or 64x64, 1:32 scan)
+; on RP2350.  Two state machines cooperate on one PIO block:
 ;
-; Two state machines cooperate:
-;   SM0 — hub75_data:  Shift out 6-bit RGB pixel data (R1G1B1R2G2B2)
-;                       with side-set clock toggle.  DMA feeds pixel words.
-;   SM1 — hub75_row:   Controls row latch (LAT), output enable (OE), and
-;                       row address (A-E).  Triggered by IRQ from SM0.
+;   hub75_data — shifts byte-packed pixel data: one byte per column per
+;                row-pair per BCM plane, bits [5:0] = R1 G1 B1 R2 G2 B2,
+;                bits [7:6] = pad (never shifted out).  DMA writes bytes;
+;                RP2350 replicates each narrow FIFO write across the word
+;                (RP2350 datasheet §2.1.5), right-shift OUT + autopull
+;                threshold 6 consumes exactly one replicated byte per pixel.
+;                The pixel count is a preload "header" word pushed once by
+;                the CPU (pixels-1), retained in ISR (IN is never used), and
+;                reloaded into X per record; DMA transfer counts size the
+;                whole scan and DREQ paces the FIFO.
 ;
-; BCM (Binary Code Modulation) is handled by the CPU/DMA feeding the correct
-; bit-plane data for each BCM pass.  SM1's OE pulse width is controlled by
-; writing the delay count to its TX FIFO before each BCM plane.
+;   hub75_row  — consumes one 32-bit control record per row-plane:
+;                bits [4:0] = row address, bits [31:5] = dwell (encoded as
+;                lit-cycles-minus-one, 0 = never assert OE).  Sequence per
+;                record: wait data-ready -> set address (blanked) -> latch
+;                (blanked) -> release shifter -> finite OE dwell -> blank.
 ;
-; Pin mapping (configured in *_program_init):
-;   hub75_data:
-;     OUT pins  : R1, G1, B1, R2, G2, B2 (6 consecutive, base = HUB75_R1_PIN)
-;     side-set  : CLK (1 pin, HUB75_CLK_PIN)
-;   hub75_row:
-;     SET pins  : LAT, OE (2 pins: LAT_PIN, OE_PIN consecutive)
-;     OUT pins  : ADDR A-E (5 pins, base = HUB75_ADDR_A)
+; Handshake / safety invariants:
+;   * IRQ flag 1 (data-ready) is set by hub75_data only AFTER the final CLK
+;     rising edge of a record and is consumed by hub75_row's WAIT 1 IRQ 1
+;     (WAIT 1 IRQ consumes/clears the flag — the CPU must never clear it).
+;   * IRQ flag 2 (shifter-released) is set by hub75_row after the latch so
+;     hub75_data can never overrun the shift register mid-dwell; consumed by
+;     hub75_data's WAIT 1 IRQ 2.  Strict alternation makes loss impossible.
+;   * IRQ flag 0 (scan-complete) is set once per 256 records for the CPU;
+;     the CPU clears it in its shared handler (W1C), never after a WAIT.
+;   * IRQ flag 3 (park request) is forced by the CPU (IRQ_FORCE) for a
+;     clock-quiesce gate: hub75_row stalls at WAIT 0 IRQ 3 with OE high.
+;   * Every blocking wait in hub75_row has side 2 = OE high/LAT low, so
+;     starvation can only extend blanking, never hold a lit row.
+;   * Brightness 0 encodes dwell 0; JMP !X skips the OE-low path entirely,
+;     so brightness 0 never lights a row (a zero JMP X-- counter would
+;     still pulse once).
 ;
-; The data SM shifts PANEL_WIDTH pixels (each 6 bits from a 32-bit word that
-; DMA delivers), then raises IRQ 0 to trigger the row SM.
+; Assembled footprint: hub75_data 9 words + hub75_row 13 words = 22 words of
+; the shared 32-word instruction store of one PIO block.
 
-; ═══════════════════════════════════════════════════════════════════════════════
-; hub75_data — shift RGB pixel data with CLK toggle
-; ═══════════════════════════════════════════════════════════════════════════════
+; ═══════════════════════════════════════════════════════════════════════════
+; hub75_data — byte stream -> 6 RGB pins, CLK on side-set
+;   OUT base = R1 pin (GPIO6), 6 pins (R1 G1 B1 R2 G2 B2 = GPIO6..11)
+;   side-set = CLK (GPIO12), idle low
+; Pixel rate: 3 SM cycles per pixel -> f_pixel = clk_sys / (3 * clkdiv).
+; ═══════════════════════════════════════════════════════════════════════════
 
 .program hub75_data
 .side_set 1
 
-; DMA writes 32-bit words.  OUT shifts 6 bits (R1G1B1R2G2B2) per pixel.
-; Autopull threshold = 6 bits? No — we use 32-bit words with 6-bit OUT,
-; meaning 5 pixels per word (30 bits used, 2 wasted) or we pack differently.
-;
-; Simplest approach:  Each DMA word = ONE pixel in bits [5:0].
-; This wastes DMA bandwidth but keeps the PIO program dead simple.
-; At 150 MHz / 2 clocks per pixel = 75 Mpixel/s, 128 pixels takes 1.7 µs.
-; With 32-bit transfers: 128 words × 4 B = 512 bytes per row pair.
-;
-; The CPU pre-packs each pixel's BCM bit into bits [5:0] of a uint32_t.
-
-public entry_point:
+    pull                side 0      ; preload header: pixels-per-record minus 1
+    mov isr, osr        side 0      ; ISR persists (IN never used)
+    out null, 32        side 0      ; discard preload from OSR; autopull loads
+                                    ; the first replicated data byte
 .wrap_target
-    pull block        side 0    ; pull 32-bit word from TX FIFO (stalls if empty)
-    out pins, 6       side 0    ; output R1G1B1R2G2B2 to data pins, CLK low
-    nop               side 1    ; CLK high — panel latches on rising edge
+    mov x, isr          side 0      ; reload pixel count for this record
+pixel:
+    out pins, 6         side 0      ; RGB out, CLK low; autopull (threshold 6)
+    nop                 side 1      ; CLK high — panel samples on rising edge
+    jmp x--, pixel      side 0      ; count exact pixels per record
+    irq set 1           side 0      ; data-ready: last CLK edge completed
+    wait 1 irq 2        side 0      ; row SM latched it; shifter free (consumes)
 .wrap
-    ; After DMA completes (all PANEL_WIDTH words sent), CPU/DMA fires an IRQ
-    ; to signal the row SM.
 
-
-; ═══════════════════════════════════════════════════════════════════════════════
-; hub75_row — latch, output enable, row address
-; ═══════════════════════════════════════════════════════════════════════════════
+; ═══════════════════════════════════════════════════════════════════════════
+; hub75_row — address / latch / OE dwell engine
+;   OUT base = ADDR A (GPIO15), 5 pins (A..E = GPIO15..19)
+;   SET base = LAT (GPIO13), 2 pins (LAT=bit0, OE=bit1) — used for pre-drive
+;   side-set 2 bits on the same LAT/OE pair:
+;     side 2 = OE high, LAT low  (blank)
+;     side 3 = OE high, LAT high (latch while blanked)
+;     side 0 = OE low            (row lit) — used ONLY in the finite dwell loop
+; ═══════════════════════════════════════════════════════════════════════════
 
 .program hub75_row
+.side_set 2
 
-; This SM is started after SM0 finishes shifting a row.
-; Protocol per BCM plane per row pair:
-;   1. CPU writes the row address (5-bit) to TX FIFO via OUT
-;   2. CPU writes the OE delay count (number of loop iterations) to TX FIFO
-;   3. SM: blanks OE → latches data → sets row address → asserts OE for delay
-;
-; SET pins = {LAT, OE}   (bit0 = LAT, bit1 = OE)
-;   SET 0b00 = LAT low,  OE low  (display ON)
-;   SET 0b01 = LAT high, OE low  (latch + display ON)
-;   SET 0b10 = LAT low,  OE high (display OFF / blanked)
-;   SET 0b11 = LAT high, OE high (latch + blanked)
-
-public entry_point:
-    ; --- Phase 0: Wait for row data to be ready ---
-    pull block              ; stalls until CPU signals (writes row addr)
-    out pins, 5             ; set row address A-E via OUT pins
-
-    ; --- Phase 1: Blank display before latching (prevents ghosting) ---
-    set pins, 0b10   [1]   ; OE high (blank display), LAT low
-
-    ; --- Phase 2: Latch the shift register into panel outputs ---
-    set pins, 0b11   [1]   ; LAT high + OE high (latch while blanked)
-    set pins, 0b10         ; LAT low, OE still high (end latch pulse)
-
-    ; --- Phase 3: OE on for BCM weight duration ---
-    pull block              ; get OE delay count from FIFO
-    mov x, osr              ; load delay count into X
-    set pins, 0b00          ; OE low = display ON
-
-oe_loop:
-    jmp x--, oe_loop        ; loop for X+1 cycles (BCM bit weight timing)
-
-    ; --- Phase 4: Blank and signal done ---
-    set pins, 0b10          ; OE high = blank display
-    irq set 0               ; signal completion to CPU (DMA can start next plane)
-
+    pull                side 2      ; preload header: records-per-scan minus 1
+    mov isr, osr        side 2      ; (255 for 32 rows x 8 planes); stay blank
+.wrap_target
+    mov y, isr          side 2      ; reload record counter, blanked
+record:
+    wait 1 irq 1        side 2      ; data-ready (consumes flag); blank if late
+    pull                side 2      ; control word {addr[4:0], dwell[31:5]}
+    out pins, 5         side 2 [7]  ; blanked address setup guard
+    out x, 27           side 3 [7]  ; latch pulse while blanked; X = dwell
+    irq set 2           side 2      ; LAT low: shift register released to data SM
+    jmp !x, dark        side 2      ; dwell 0 (incl. brightness 0): never light
+dwell:
+    jmp x--, dwell      side 0      ; OE low for X+1 SM cycles (finite)
+dark:
+    jmp y--, record     side 2      ; OE high; next row-plane record
+    irq set 0           side 2      ; whole scan complete -> CPU gate
+    wait 0 irq 3        side 2      ; quiesce park: stall blank until flag cleared
+.wrap
