@@ -1,0 +1,9 @@
+[submodule "ProtoGL"]
+	path = ProtoGL
+	url = git@github.com:BaiTian6641/ProtoGL.git
+[submodule "ProtoGC"]
+	path = ProtoGC
+	url = git@github.com:BaiTian6641/ProtoGC.git
+[submodule "third_party/pico-sdk"]
+	path = third_party/pico-sdk
+	url = https://github.com/raspberrypi/pico-sdk.git
